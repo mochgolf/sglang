@@ -3,10 +3,12 @@ import json
 import os
 import tempfile
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
+from sglang.srt.environ import envs
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -254,6 +256,71 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             server_args._validate_hisparse_kv_cache_dtype()
+
+
+class TestGlmSm89DsaFallback(CustomTestCase):
+    def test_glm_sm89_fallback_target_predicate(self):
+        self.assertTrue(
+            server_args_module.is_glm_dsa_sm89_fallback_target(
+                "GlmMoeDsaForCausalLM", capability=(8, 9)
+            )
+        )
+        self.assertFalse(
+            server_args_module.is_glm_dsa_sm89_fallback_target(
+                "GlmMoeDsaForCausalLM", capability=(9, 0)
+            )
+        )
+        self.assertFalse(
+            server_args_module.is_glm_dsa_sm89_fallback_target(
+                "OtherModel", capability=(8, 9)
+            )
+        )
+
+    def test_glm_sm89_fallback_defaults_avoid_flashmla_and_sgl_kernel(self):
+        server_args = ServerArgs(model_path="dummy", kv_cache_dtype="fp8_e4m3")
+
+        with ExitStack() as stack:
+            stack.enter_context(envs.SGLANG_DSA_FUSE_TOPK.override(True))
+            stack.enter_context(envs.SGLANG_OPT_USE_TOPK_V2.override(True))
+            stack.enter_context(envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False))
+
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=8,
+                minor=9,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+            self.assertEqual(server_args.dsa_prefill_backend, "fa3")
+            self.assertEqual(server_args.dsa_decode_backend, "fa3")
+            self.assertEqual(server_args.dsa_topk_backend, "torch")
+            self.assertFalse(envs.SGLANG_DSA_FUSE_TOPK.get())
+            self.assertFalse(envs.SGLANG_OPT_USE_TOPK_V2.get())
+            self.assertTrue(envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get())
+
+    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
+    @patch("sglang.srt.server_args.is_sm89_supported", return_value=True)
+    def test_glm_sm89_hisparse_fails_fast(self, _mock_is_sm89, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            kv_cache_dtype="fp8_e4m3",
+        )
+        server_args.get_model_config = lambda: SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"],
+                index_topk=64,
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "SM89"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=8,
+                minor=9,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
 
 
 class TestContextParallelServerArgs(CustomTestCase):

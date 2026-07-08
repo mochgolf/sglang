@@ -29,7 +29,7 @@ import socket
 import tempfile
 import uuid
 from functools import cached_property
-from typing import Any, Callable, Dict, List, Literal, Optional, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 from sglang.jit_kernel.kv_canary.consts import RealKvHashMode
 from sglang.srt.arg_groups.arg_utils import A, Arg, add_cli_args_from_dataclass
@@ -83,6 +83,7 @@ from sglang.srt.utils.common import (
     is_no_spec_infer_or_topk_one,
     is_npu,
     is_remote_url,
+    is_sm89_supported,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -104,6 +105,7 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+GLM_DSA_MODEL_ARCHS = frozenset({"GlmMoeDsaForCausalLM", "GlmMoeDsaModel"})
 MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM",
@@ -112,6 +114,20 @@ LLAMA4_MODEL_ARCHS = (
     "Llama4ForConditionalGeneration",
     "Llama4ForCausalLM",
 )
+
+
+def is_glm_dsa_model(model_arch: Optional[str]) -> bool:
+    return model_arch in GLM_DSA_MODEL_ARCHS
+
+
+def is_glm_dsa_sm89_fallback_target(
+    model_arch: Optional[str], capability: Optional[Tuple[int, int]] = None
+) -> bool:
+    if not is_glm_dsa_model(model_arch):
+        return False
+    if capability is not None:
+        return capability[0:2] == (8, 9)
+    return is_sm89_supported()
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 if envs.SGLANG_KV_CANARY_ENABLE_TOKEN_ORACLE.get():
@@ -3428,13 +3444,47 @@ class ServerArgs:
             "fp8_e4m3",
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
-    def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+    def _set_default_dsa_backends(
+        self,
+        kv_cache_dtype: str,
+        major: int,
+        minor: Optional[int] = None,
+        model_arch: Optional[str] = None,
+    ) -> str:
         from sglang.srt.arg_groups.hisparse_hook import (
             apply_hisparse_dsa_backend_defaults,
         )
 
         user_set_prefill = self.dsa_prefill_backend is not None
         user_set_decode = self.dsa_decode_backend is not None
+
+        if is_glm_dsa_sm89_fallback_target(
+            model_arch, capability=(major, minor) if minor is not None else None
+        ):
+            if self.enable_hisparse:
+                raise ValueError(
+                    "--enable-hisparse is not supported for GLM DSA on SM89 yet; "
+                    "it currently forces FlashMLA sparse/KV paths that are unsafe "
+                    "on RTX 4090/Ada."
+                )
+            if not user_set_prefill:
+                self.dsa_prefill_backend = "fa3"
+            if not user_set_decode:
+                self.dsa_decode_backend = "fa3"
+            if self.dsa_topk_backend == "sgl-kernel":
+                self.dsa_topk_backend = "torch"
+            envs.SGLANG_DSA_FUSE_TOPK.set(False)
+            envs.SGLANG_OPT_USE_TOPK_V2.set(False)
+            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
+            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
+            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
+            logger.warning(
+                "Set SM89 GLM DSA fallback: prefill=%s, decode=%s, topk=%s.",
+                self.dsa_prefill_backend,
+                self.dsa_decode_backend,
+                self.dsa_topk_backend,
+            )
+            return
 
         if apply_hisparse_dsa_backend_defaults(
             self, user_set_prefill, user_set_decode, kv_cache_dtype
@@ -3624,9 +3674,11 @@ class ServerArgs:
 
                     import torch
 
-                    major, _ = torch.cuda.get_device_capability()
+                    major, minor = torch.cuda.get_device_capability()
                     self._set_default_dsa_kv_cache_dtype(major, self.quantization)
-                    self._set_default_dsa_backends(self.kv_cache_dtype, major)
+                    self._set_default_dsa_backends(
+                        self.kv_cache_dtype, major, minor, model_arch
+                    )
 
                 if self.enable_prefill_cp:
                     assert (

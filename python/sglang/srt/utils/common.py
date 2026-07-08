@@ -257,6 +257,17 @@ def _check_cuda_device_version(
     )
 
 
+def _check_cuda_device_exact_version(
+    device_capability: Tuple[int, int], cuda_version: Tuple[int, int]
+):
+    if not is_cuda():
+        return False
+    return (
+        torch.cuda.get_device_capability()[0:2] == device_capability
+        and tuple(map(int, torch.version.cuda.split(".")[:2])) >= cuda_version
+    )
+
+
 is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
@@ -282,6 +293,13 @@ is_sm120_supported = lru_cache(maxsize=1)(
 is_sm100_supported = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
+    )
+)
+is_sm89_supported = lru_cache(maxsize=1)(
+    partial(
+        _check_cuda_device_exact_version,
+        device_capability=(8, 9),
+        cuda_version=(12, 0),
     )
 )
 is_sm80_supported = lru_cache(maxsize=1)(
