@@ -340,19 +340,62 @@ class TestGlmSm89DsaFallback(CustomTestCase):
             )
         )
 
-    @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
-    def test_glm_sm89_hisparse_fails_fast(self, _mock_is_hip):
+    def test_glm_sm89_fallback_indexer_uses_graph_off_forward_indexer(self):
+        from sglang.srt.layers.attention.dsa import dsa_indexer
+
+        fake_topk = object()
+        fake_q = MagicMock()
+        fake_q.contiguous.return_value = "q-contiguous"
+        fake_weights = object()
+        fake_forward_batch = object()
+        fake_indexer = SimpleNamespace(
+            index_topk=64,
+            forward_indexer=MagicMock(return_value=fake_topk),
+        )
+
+        with patch.object(
+            dsa_indexer, "is_in_tc_piecewise_cuda_graph", return_value=False
+        ), patch.object(
+            dsa_indexer,
+            "_broadcast_indexer_topk_from_rank0",
+            side_effect=lambda topk: topk,
+        ), patch.object(
+            dsa_indexer, "maybe_capture_indexer_topk", side_effect=lambda _, topk: topk
+        ):
+            self.assertIs(
+                dsa_indexer._select_glm_sm89_fallback_topk(
+                    fake_indexer, fake_q, fake_weights, fake_forward_batch, layer_id=7
+                ),
+                fake_topk,
+            )
+
+        fake_indexer.forward_indexer.assert_called_once_with(
+            "q-contiguous",
+            fake_weights,
+            fake_forward_batch,
+            topk=64,
+            layer_id=7,
+        )
+
+    def test_glm_sm89_fallback_indexer_rejects_piecewise_cuda_graph(self):
+        from sglang.srt.layers.attention.dsa import dsa_indexer
+
+        fake_indexer = SimpleNamespace(index_topk=64)
+        fake_q = MagicMock()
+
+        with patch.object(
+            dsa_indexer, "is_in_tc_piecewise_cuda_graph", return_value=True
+        ), self.assertRaisesRegex(RuntimeError, "graph-off"):
+            dsa_indexer._select_glm_sm89_fallback_topk(
+                fake_indexer, fake_q, object(), object(), layer_id=0
+            )
+
+    def test_glm_sm89_hisparse_fails_fast(self):
         server_args = ServerArgs(
             model_path="dummy",
             enable_hisparse=True,
             disable_radix_cache=True,
             kv_cache_dtype="fp8_e4m3",
-        )
-        server_args.get_model_config = lambda: SimpleNamespace(
-            hf_config=SimpleNamespace(
-                architectures=["GlmMoeDsaForCausalLM"],
-                index_topk=64,
-            )
         )
 
         with self.assertRaisesRegex(ValueError, "SM89"):

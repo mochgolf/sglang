@@ -113,6 +113,23 @@ def _use_glm_sm89_dsa_fallback() -> bool:
     return _server_args_enable_glm_sm89_dsa_fallback(server_args)
 
 
+def _select_glm_sm89_fallback_topk(indexer, q_fp8, weights, forward_batch, layer_id):
+    if is_in_tc_piecewise_cuda_graph():
+        raise RuntimeError(
+            "GLM DSA SM89 fallback uses the graph-off indexer path; "
+            "disable piecewise CUDA graph for this configuration."
+        )
+    topk_result = indexer.forward_indexer(
+        q_fp8.contiguous(),
+        weights,
+        forward_batch,
+        topk=indexer.index_topk,
+        layer_id=layer_id,
+    )
+    topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+    return maybe_capture_indexer_topk(layer_id, topk_result)
+
+
 def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
     attn_backend = get_attn_backend()
     server_args = get_global_server_args()
@@ -1557,20 +1574,9 @@ class Indexer(MultiPlatformOp):
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 
         if self.use_glm_sm89_dsa_fallback:
-            if is_in_tc_piecewise_cuda_graph():
-                raise RuntimeError(
-                    "GLM DSA SM89 fallback uses the graph-off indexer path; "
-                    "disable piecewise CUDA graph for this configuration."
-                )
-            topk_result = self.forward_indexer(
-                q_fp8.contiguous(),
-                weights,
-                forward_batch,
-                topk=self.index_topk,
-                layer_id=layer_id,
+            return _select_glm_sm89_fallback_topk(
+                self, q_fp8, weights, forward_batch, layer_id
             )
-            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
-            return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if _is_cuda or _is_hip:
             # In piecewise CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.
