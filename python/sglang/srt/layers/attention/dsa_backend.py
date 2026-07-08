@@ -597,6 +597,12 @@ class DeepseekSparseAttnBackend(
             f"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK."
         )
 
+    def _use_dsa_fuse_topk(self) -> bool:
+        return (
+            envs.SGLANG_DSA_FUSE_TOPK.get()
+            and not self.use_glm_sm89_dsa_fallback
+        )
+
     def get_device_int32_arange(self, length: int) -> torch.Tensor:
         if length > len(self._arange_buf):
             next_pow_of_2 = 1 << (length - 1).bit_length()
@@ -1628,7 +1634,7 @@ class DeepseekSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
+        if self._use_dsa_fuse_topk():
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1817,7 +1823,7 @@ class DeepseekSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
-        elif envs.SGLANG_DSA_FUSE_TOPK.get():
+        elif self._use_dsa_fuse_topk():
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         else:
             page_table_1 = transform_index_page_table_decode(
@@ -2366,7 +2372,7 @@ class DeepseekSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        if envs.SGLANG_DSA_FUSE_TOPK.get():
+        if self._use_dsa_fuse_topk():
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(

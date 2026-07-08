@@ -3489,11 +3489,6 @@ class ServerArgs:
                 self.dsa_decode_backend = "fa3"
             if self.dsa_topk_backend == "sgl-kernel":
                 self.dsa_topk_backend = "torch"
-            envs.SGLANG_DSA_FUSE_TOPK.set(False)
-            envs.SGLANG_OPT_USE_TOPK_V2.set(False)
-            envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.set(False)
-            envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.set(False)
-            envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.set(True)
             logger.warning(
                 "Set SM89 GLM DSA fallback: prefill=%s, decode=%s, topk=%s.",
                 self.dsa_prefill_backend,

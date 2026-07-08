@@ -294,10 +294,42 @@ class TestGlmSm89DsaFallback(CustomTestCase):
             self.assertEqual(server_args.dsa_prefill_backend, "fa3")
             self.assertEqual(server_args.dsa_decode_backend, "fa3")
             self.assertEqual(server_args.dsa_topk_backend, "torch")
-            self.assertFalse(envs.SGLANG_DSA_FUSE_TOPK.get())
-            self.assertFalse(envs.SGLANG_OPT_USE_TOPK_V2.get())
-            self.assertTrue(envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get())
+            self.assertTrue(envs.SGLANG_DSA_FUSE_TOPK.get())
+            self.assertTrue(envs.SGLANG_OPT_USE_TOPK_V2.get())
+            self.assertFalse(envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get())
             self.assertTrue(server_args.enable_glm_dsa_sm89_fallback)
+
+    def test_glm_sm89_fallback_does_not_leak_env_to_non_target_args(self):
+        with ExitStack() as stack:
+            stack.enter_context(envs.SGLANG_DSA_FUSE_TOPK.override(True))
+            stack.enter_context(envs.SGLANG_OPT_USE_TOPK_V2.override(True))
+            stack.enter_context(envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.override(True))
+            stack.enter_context(envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True))
+            stack.enter_context(envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(False))
+
+            target_args = ServerArgs(model_path="dummy", kv_cache_dtype="fp8_e4m3")
+            target_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=8,
+                minor=9,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+            non_target_args = ServerArgs(model_path="dummy", kv_cache_dtype="fp8_e4m3")
+            non_target_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=9,
+                minor=0,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+            self.assertTrue(envs.SGLANG_DSA_FUSE_TOPK.get())
+            self.assertTrue(envs.SGLANG_OPT_USE_TOPK_V2.get())
+            self.assertTrue(envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get())
+            self.assertTrue(envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get())
+            self.assertFalse(envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get())
+            self.assertTrue(target_args.enable_glm_dsa_sm89_fallback)
+            self.assertFalse(non_target_args.enable_glm_dsa_sm89_fallback)
 
     def test_glm_sm89_fallback_rejects_explicit_flashmla_backend(self):
         server_args = ServerArgs(
@@ -339,6 +371,17 @@ class TestGlmSm89DsaFallback(CustomTestCase):
                 server_args.enable_glm_dsa_sm89_fallback, fake_decode_mode
             )
         )
+
+    def test_glm_sm89_fallback_disables_fused_topk_per_backend_instance(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+            backend.use_glm_sm89_dsa_fallback = True
+            self.assertFalse(backend._use_dsa_fuse_topk())
+
+            backend.use_glm_sm89_dsa_fallback = False
+            self.assertTrue(backend._use_dsa_fuse_topk())
 
     def test_glm_sm89_fallback_indexer_uses_graph_off_forward_indexer(self):
         from sglang.srt.layers.attention.dsa import dsa_indexer
