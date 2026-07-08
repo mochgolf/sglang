@@ -13,6 +13,7 @@ class _DummyGpuMethod:
     def __init__(self):
         self.num_gpu_experts = None
         self.created_num_experts = None
+        self.processed_weights = False
 
     def create_weights(
         self,
@@ -24,6 +25,10 @@ class _DummyGpuMethod:
         **extra_weight_attrs,
     ):
         self.created_num_experts = num_experts
+
+    def process_weights_after_loading(self, layer):
+        self.processed_weights = True
+        raise AssertionError("GPU postprocess should not run without GPU experts")
 
 
 class _DummyLayer:
@@ -97,6 +102,35 @@ class TestKTEPWrapper(unittest.TestCase):
         self.assertIs(gpu_experts_mask.dtype, torch.bool)
         self.assertEqual(gpu_experts_mask.device.type, "cpu")
         self.assertEqual(gpu_experts_mask.sum().item(), 0)
+
+    def test_all_cpu_experts_skip_gpu_weight_postprocess(self):
+        old_available = kt_ep_wrapper.KTRANSFORMERS_AVAILABLE
+        old_get_parallel = kt_ep_wrapper.get_parallel
+        try:
+            kt_ep_wrapper.KTRANSFORMERS_AVAILABLE = True
+            kt_ep_wrapper.get_parallel = lambda: SimpleNamespace(tp_rank=1)
+
+            gpu_method = _DummyGpuMethod()
+            wrapper = kt_ep_wrapper.KTEPWrapperMethod(
+                gpu_method,
+                kt_ep_wrapper.KTConfig(
+                    layer_idx=3,
+                    num_gpu_experts=0,
+                    cpuinfer_threads=76,
+                    threadpool_count=1,
+                    weight_path="/tmp/weights",
+                    chunked_prefill_size=2048,
+                    max_deferred_experts_per_token=None,
+                    method="NVFP4",
+                ),
+            )
+
+            wrapper.process_weights_after_loading(torch.nn.Module())
+        finally:
+            kt_ep_wrapper.KTRANSFORMERS_AVAILABLE = old_available
+            kt_ep_wrapper.get_parallel = old_get_parallel
+
+        self.assertFalse(gpu_method.processed_weights)
 
 
 if __name__ == "__main__":

@@ -245,7 +245,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
         """
         # 1. Process GPU weights
-        if hasattr(self.gpu_method, "process_weights_after_loading"):
+        if self.num_gpu_experts > 0 and hasattr(
+            self.gpu_method, "process_weights_after_loading"
+        ):
             self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
