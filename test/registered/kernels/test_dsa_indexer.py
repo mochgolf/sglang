@@ -265,6 +265,51 @@ class MockModelRunner:
         self.hisparse_coordinator = None
 
 
+class TestDSATopKBackendCPU(CustomTestCase):
+    def test_torch_topk_force_unfused_overrides_fuse_env(self):
+        seq_lens = torch.tensor([4, 2], dtype=torch.int32)
+        batch_size = seq_lens.shape[0]
+        max_seq_len = int(seq_lens.max().item())
+        cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32)
+        dsa_cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32)
+        dsa_cu_seqlens_k[1:] = torch.cumsum(seq_lens, dim=0)
+        page_table_1 = (
+            torch.arange(max_seq_len, dtype=torch.int32)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+            .contiguous()
+        )
+        metadata = DSAIndexerMetadata(
+            attn_metadata=DSAMetadata(
+                page_size=1,
+                cache_seqlens_int32=seq_lens.clone(),
+                max_seq_len_q=1,
+                max_seq_len_k=max_seq_len,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_q.clone(),
+                page_table_1=page_table_1,
+                real_page_table=page_table_1,
+                dsa_cache_seqlens_int32=seq_lens.clone(),
+                dsa_cu_seqlens_q=cu_seqlens_q.clone(),
+                dsa_cu_seqlens_k=dsa_cu_seqlens_k,
+                dsa_extend_seq_lens_list=seq_lens.tolist(),
+                dsa_seqlens_expanded=seq_lens,
+            ),
+            topk_transform_method=TopkTransformMethod.PAGED,
+            topk_backend=DSATopKBackend.TORCH,
+            force_unfused_topk=True,
+        )
+        logits = torch.zeros(batch_size, max_seq_len, dtype=torch.float32)
+
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+            topk_indices = metadata.topk_transform(logits, topk=max_seq_len)
+
+        self.assertEqual(topk_indices.shape, (batch_size, max_seq_len))
+        self.assertEqual(topk_indices.dtype, torch.int32)
+        self.assertEqual((topk_indices[0] >= 0).sum().item(), 4)
+        self.assertEqual((topk_indices[1] >= 0).sum().item(), 2)
+
+
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSAIndexer(CustomTestCase):
     @classmethod
