@@ -21,6 +21,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -29,6 +31,7 @@ import torch
 # schemes package; the quantization-package-first order masks it. The isort
 # guards keep that order.
 # isort: off
+from sglang.srt.layers.quantization import modelopt_quant
 from sglang.srt.layers.quantization.modelopt_quant import _compute_gemm1_alphas
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import _compute_g1_scale_c
 
@@ -47,6 +50,16 @@ REAL_MOE_CONFIGS = [
 ]
 GATED_CONFIGS = [c for c in REAL_MOE_CONFIGS if c[-1]]
 NONGATED_CONFIG = next(c for c in REAL_MOE_CONFIGS if not c[-1])
+
+
+class _DummyMoeLayer(torch.nn.Module):
+    def __init__(self, *, num_local_experts: int, is_gated: bool = True):
+        super().__init__()
+        self.num_local_experts = num_local_experts
+        self.num_experts = num_local_experts
+        self.moe_ep_rank = 0
+        self.moe_ep_size = 1
+        self.moe_runner_config = SimpleNamespace(is_gated=is_gated)
 
 
 def _global_scales(num_experts: int, num_cols: int, seed: int) -> torch.Tensor:
@@ -223,6 +236,34 @@ class TestGemm1Alphas(CustomTestCase):
 
                 self.assertEqual(g1_alphas.dtype, torch.float32)
                 self.assertEqual(g1_alphas_up.dtype, torch.float32)
+
+
+class TestModelOptNvFp4FusedMoEWeights(CustomTestCase):
+    def test_large_gpu_weight_tensors_use_requested_expert_count(self):
+        layer = _DummyMoeLayer(num_local_experts=168)
+
+        with patch.object(modelopt_quant, "is_blackwell_supported", return_value=True):
+            method = modelopt_quant.ModelOptNvFp4FusedMoEMethod(
+                modelopt_quant.ModelOptFp4Config(
+                    is_checkpoint_nvfp4_serialized=True,
+                    group_size=16,
+                    exclude_modules=[],
+                )
+            )
+        method.enable_flashinfer_trtllm_moe = True
+
+        method.create_weights(
+            layer=layer,
+            num_experts=0,
+            hidden_size=64,
+            intermediate_size_per_partition=128,
+            params_dtype=torch.bfloat16,
+        )
+
+        self.assertEqual(layer.w13_weight.shape[0], 0)
+        self.assertEqual(layer.w2_weight.shape[0], 0)
+        self.assertEqual(layer.w13_weight_scale.shape[0], 0)
+        self.assertEqual(layer.w2_weight_scale.shape[0], 0)
 
 
 class TestG1ScaleC(CustomTestCase):
