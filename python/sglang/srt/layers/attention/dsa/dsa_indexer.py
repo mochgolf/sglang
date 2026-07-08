@@ -99,6 +99,20 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def _server_args_enable_glm_sm89_dsa_fallback(server_args) -> bool:
+    return bool(getattr(server_args, "enable_glm_dsa_sm89_fallback", False))
+
+
+def _use_glm_sm89_dsa_fallback() -> bool:
+    if not _is_cuda:
+        return False
+    try:
+        server_args = get_global_server_args()
+    except ValueError:
+        return False
+    return _server_args_enable_glm_sm89_dsa_fallback(server_args)
+
+
 def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
     attn_backend = get_attn_backend()
     server_args = get_global_server_args()
@@ -360,6 +374,7 @@ class Indexer(MultiPlatformOp):
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
+        self.use_glm_sm89_dsa_fallback = _use_glm_sm89_dsa_fallback()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_parallel().attn_cp_size
             self.cp_rank = get_parallel().attn_cp_rank
@@ -367,7 +382,12 @@ class Indexer(MultiPlatformOp):
             self.cp_size = None
             self.cp_rank = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            if self.use_glm_sm89_dsa_fallback:
+                self.sm_count = torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+            else:
+                self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_global_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -418,6 +438,9 @@ class Indexer(MultiPlatformOp):
         # request to receive the PP proxy tensor or output from the previous stage, occupying one SM resource.
         # Model execution runs in parallel with the recv operation, so the SMs available to the indexer must be reduced
         # by 1. Currently, the last rank starts the send result + recv request only after waiting for execution results.
+        if self.use_glm_sm89_dsa_fallback:
+            yield
+            return
         if self.logits_with_pp_recv:
             pp_recv_sm_count = 1
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
@@ -479,9 +502,14 @@ class Indexer(MultiPlatformOp):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
-            with deep_gemm_wrapper.configure_deep_gemm_num_sms(
-                self.half_device_sm_count
-            ):
+            sm_context = (
+                contextlib.nullcontext()
+                if self.use_glm_sm89_dsa_fallback
+                else deep_gemm_wrapper.configure_deep_gemm_num_sms(
+                    self.half_device_sm_count
+                )
+            )
+            with sm_context:
                 query, _ = self.wq_b(q_lora)
                 query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
                 q_rope, _ = torch.split(
@@ -1527,6 +1555,22 @@ class Indexer(MultiPlatformOp):
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
+
+        if self.use_glm_sm89_dsa_fallback:
+            if is_in_tc_piecewise_cuda_graph():
+                raise RuntimeError(
+                    "GLM DSA SM89 fallback uses the graph-off indexer path; "
+                    "disable piecewise CUDA graph for this configuration."
+                )
+            topk_result = self.forward_indexer(
+                q_fp8.contiguous(),
+                weights,
+                forward_batch,
+                topk=self.index_topk,
+                layer_id=layer_id,
+            )
+            topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+            return maybe_capture_indexer_topk(layer_id, topk_result)
 
         if _is_cuda or _is_hip:
             # In piecewise CUDA graph, any access to seq_lens_cpu creates a Dynamo shape guard.

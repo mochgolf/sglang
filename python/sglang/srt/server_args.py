@@ -106,6 +106,9 @@ logger = logging.getLogger(__name__)
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
 GLM_DSA_MODEL_ARCHS = frozenset({"GlmMoeDsaForCausalLM", "GlmMoeDsaModel"})
+GLM_DSA_SM89_UNSUPPORTED_BACKENDS = frozenset(
+    {"flashmla_sparse", "flashmla_kv", "flashmla_auto", "trtllm"}
+)
 MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM",
@@ -3457,16 +3460,29 @@ class ServerArgs:
 
         user_set_prefill = self.dsa_prefill_backend is not None
         user_set_decode = self.dsa_decode_backend is not None
+        self.enable_glm_dsa_sm89_fallback = False
 
         if is_glm_dsa_sm89_fallback_target(
             model_arch, capability=(major, minor) if minor is not None else None
         ):
+            explicit_unsupported = [
+                backend
+                for backend in (self.dsa_prefill_backend, self.dsa_decode_backend)
+                if backend in GLM_DSA_SM89_UNSUPPORTED_BACKENDS
+            ]
+            if explicit_unsupported:
+                raise ValueError(
+                    "GLM DSA on SM89 cannot use unsupported DSA backend(s) "
+                    f"{sorted(set(explicit_unsupported))}; use fa3 or omit the "
+                    "DSA backend flags to enable the SM89 fallback."
+                )
             if self.enable_hisparse:
                 raise ValueError(
                     "--enable-hisparse is not supported for GLM DSA on SM89 yet; "
                     "it currently forces FlashMLA sparse/KV paths that are unsafe "
                     "on RTX 4090/Ada."
                 )
+            self.enable_glm_dsa_sm89_fallback = True
             if not user_set_prefill:
                 self.dsa_prefill_backend = "fa3"
             if not user_set_decode:

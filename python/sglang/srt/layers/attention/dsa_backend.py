@@ -106,6 +106,20 @@ global_workspace_buffer = None
 _USE_FUSED_METADATA_COPY = envs.SGLANG_USE_FUSED_METADATA_COPY.get() and not _is_hip
 
 
+def _should_build_deep_gemm_mqa_metadata(
+    use_glm_sm89_fallback: bool, forward_mode: ForwardMode
+) -> bool:
+    return (
+        not use_glm_sm89_fallback
+        and is_cuda()
+        and (
+            forward_mode.is_decode_or_idle()
+            or forward_mode.is_target_verify()
+            or forward_mode.is_draft_extend_v2()
+        )
+    )
+
+
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -334,6 +348,9 @@ class DeepseekSparseAttnBackend(
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
+        )
+        self.use_glm_sm89_dsa_fallback = bool(
+            getattr(model_runner.server_args, "enable_glm_dsa_sm89_fallback", False)
         )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -841,10 +858,8 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        if _should_build_deep_gemm_mqa_metadata(
+            self.use_glm_sm89_dsa_fallback, forward_batch.forward_mode
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
@@ -1124,10 +1139,8 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+        if _should_build_deep_gemm_mqa_metadata(
+            self.use_glm_sm89_dsa_fallback, forward_mode
         ):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
@@ -1282,10 +1295,8 @@ class DeepseekSparseAttnBackend(
             )
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
+        if _should_build_deep_gemm_mqa_metadata(
+            self.use_glm_sm89_dsa_fallback, forward_mode
         ):
             if forward_mode.is_draft_extend_v2():
                 schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
@@ -1487,7 +1498,9 @@ class DeepseekSparseAttnBackend(
         # this replay (the captured graph holds stale data otherwise, which can
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
-        if is_cuda():
+        if _should_build_deep_gemm_mqa_metadata(
+            self.use_glm_sm89_dsa_fallback, forward_mode
+        ):
             if forward_mode.is_decode_or_idle():
                 seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
             else:

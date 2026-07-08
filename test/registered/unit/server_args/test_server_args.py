@@ -297,10 +297,51 @@ class TestGlmSm89DsaFallback(CustomTestCase):
             self.assertFalse(envs.SGLANG_DSA_FUSE_TOPK.get())
             self.assertFalse(envs.SGLANG_OPT_USE_TOPK_V2.get())
             self.assertTrue(envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get())
+            self.assertTrue(server_args.enable_glm_dsa_sm89_fallback)
+
+    def test_glm_sm89_fallback_rejects_explicit_flashmla_backend(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="flashmla_kv",
+        )
+
+        with self.assertRaisesRegex(ValueError, "flashmla_kv"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=8,
+                minor=9,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+    def test_glm_sm89_fallback_marks_indexer_deepgemm_disabled(self):
+        from sglang.srt.layers.attention import dsa_backend
+        from sglang.srt.layers.attention.dsa import dsa_indexer
+
+        server_args = ServerArgs(model_path="dummy", kv_cache_dtype="fp8_e4m3")
+        server_args._set_default_dsa_backends(
+            kv_cache_dtype="fp8_e4m3",
+            major=8,
+            minor=9,
+            model_arch="GlmMoeDsaForCausalLM",
+        )
+
+        fake_decode_mode = SimpleNamespace(
+            is_decode_or_idle=lambda: True,
+            is_target_verify=lambda: False,
+            is_draft_extend_v2=lambda: False,
+        )
+        self.assertTrue(
+            dsa_indexer._server_args_enable_glm_sm89_dsa_fallback(server_args)
+        )
+        self.assertFalse(
+            dsa_backend._should_build_deep_gemm_mqa_metadata(
+                server_args.enable_glm_dsa_sm89_fallback, fake_decode_mode
+            )
+        )
 
     @patch("sglang.srt.arg_groups.hisparse_hook._is_hip", return_value=False)
-    @patch("sglang.srt.server_args.is_sm89_supported", return_value=True)
-    def test_glm_sm89_hisparse_fails_fast(self, _mock_is_sm89, _mock_is_hip):
+    def test_glm_sm89_hisparse_fails_fast(self, _mock_is_hip):
         server_args = ServerArgs(
             model_path="dummy",
             enable_hisparse=True,
