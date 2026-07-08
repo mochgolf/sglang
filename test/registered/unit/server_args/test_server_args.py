@@ -383,6 +383,52 @@ class TestGlmSm89DsaFallback(CustomTestCase):
             backend.use_glm_sm89_dsa_fallback = False
             self.assertTrue(backend._use_dsa_fuse_topk())
 
+    def test_glm_sm89_fallback_indexer_metadata_forces_unfused_topk(self):
+        from sglang.srt.layers.attention import dsa_backend
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
+        backend.use_glm_sm89_dsa_fallback = True
+        backend.hisparse_coordinator = None
+        backend.forward_metadata = SimpleNamespace(
+            paged_mqa_schedule_metadata=None,
+            paged_mqa_ctx_lens_2d=None,
+        )
+        backend.dsa_topk_backend = DSATopKBackend.TORCH
+        backend.dsa_kv_cache_store_fp8 = True
+        backend.dsa_prefill_impl = "fa3"
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+            metadata = backend.get_indexer_metadata(0, forward_batch)
+
+        self.assertEqual(metadata.topk_backend, DSATopKBackend.TORCH)
+        self.assertTrue(metadata.force_unfused_topk)
+
+    def test_regular_dsa_indexer_metadata_keeps_fused_topk_enabled(self):
+        from sglang.srt.layers.attention import dsa_backend
+        from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
+        backend.use_glm_sm89_dsa_fallback = False
+        backend.hisparse_coordinator = None
+        backend.forward_metadata = SimpleNamespace(
+            paged_mqa_schedule_metadata=None,
+            paged_mqa_ctx_lens_2d=None,
+        )
+        backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+        backend.dsa_kv_cache_store_fp8 = True
+        backend.dsa_prefill_impl = "fa3"
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+
+        with envs.SGLANG_DSA_FUSE_TOPK.override(True):
+            metadata = backend.get_indexer_metadata(0, forward_batch)
+
+        self.assertEqual(metadata.topk_backend, DSATopKBackend.SGL_KERNEL)
+        self.assertFalse(metadata.force_unfused_topk)
+
     def test_glm_sm89_fallback_indexer_uses_graph_off_forward_indexer(self):
         from sglang.srt.layers.attention.dsa import dsa_indexer
 

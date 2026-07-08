@@ -2526,8 +2526,11 @@ class DeepseekSparseAttnBackend(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
         force_unfused = (
-            self.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
+            not self._use_dsa_fuse_topk()
+            or (
+                self.hisparse_coordinator is not None
+                and forward_batch.forward_mode.is_decode_or_idle()
+            )
         )
         return DSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
