@@ -1,5 +1,7 @@
 import json
+import os
 import unittest
+import tempfile
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -202,41 +204,57 @@ class TestSm89SparseMlaShapeDump(unittest.TestCase):
         page_table = torch.tensor([[0, 1, -1], [2, -1, -1]], dtype=torch.int32)
         cache_seqlens = torch.tensor([2, 1], dtype=torch.int32)
 
-        with patch.dict(
-            "os.environ", {"SGLANG_GLM_DSA_SM89_DUMP_SHAPES": "1"}, clear=True
-        ), patch("builtins.print") as mock_print:
-            dsa_backend.DeepseekSparseAttnBackend._forward_torch_mla(
-                backend,
-                q_rope=q_rope,
-                kv_cache=kv_cache,
-                v_head_dim=4,
-                q_nope=q_nope,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                sm_scale=1.0,
-                logit_cap=0.0,
-                page_size=1,
-                layer_id=7,
-            )
-            dsa_backend.DeepseekSparseAttnBackend._forward_torch_mla(
-                backend,
-                q_rope=q_rope,
-                kv_cache=kv_cache,
-                v_head_dim=4,
-                q_nope=q_nope,
-                page_table=page_table,
-                cache_seqlens=cache_seqlens,
-                sm_scale=1.0,
-                logit_cap=0.0,
-                page_size=1,
-                layer_id=11,
-            )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shapes_path = os.path.join(tmpdir, "shapes.jsonl")
+            with patch.dict(
+                "os.environ",
+                {
+                    "SGLANG_GLM_DSA_SM89_DUMP_SHAPES": "1",
+                    "SGLANG_GLM_DSA_SM89_SHAPES_PATH": shapes_path,
+                },
+                clear=True,
+            ), patch("builtins.print") as mock_print:
+                dsa_backend.DeepseekSparseAttnBackend._forward_torch_mla(
+                    backend,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    v_head_dim=4,
+                    q_nope=q_nope,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    sm_scale=1.0,
+                    logit_cap=0.0,
+                    page_size=1,
+                    layer_id=7,
+                )
+                with open(shapes_path, "r", encoding="utf-8") as fh:
+                    file_lines = fh.read().splitlines()
+                self.assertEqual(len(file_lines), 1)
+
+                dsa_backend.DeepseekSparseAttnBackend._forward_torch_mla(
+                    backend,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    v_head_dim=4,
+                    q_nope=q_nope,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    sm_scale=1.0,
+                    logit_cap=0.0,
+                    page_size=1,
+                    layer_id=11,
+                )
+                with open(shapes_path, "r", encoding="utf-8") as fh:
+                    file_lines = fh.read().splitlines()
+                self.assertEqual(len(file_lines), 1)
 
         mock_print.assert_called_once()
         self.assertEqual(len(mock_print.call_args.args), 1)
         line = mock_print.call_args.args[0]
         dump = json.loads(line)
+        file_dump = json.loads(file_lines[0])
         self.assertEqual(dump["event"], "GLM_DSA_SM89_SHAPES")
+        self.assertEqual(file_dump, dump)
         self.assertEqual(dump["layer_id"], 7)
         self.assertEqual(dump["q_nope_shape"], [2, 1, 4])
         self.assertEqual(dump["q_rope_shape"], [2, 1, 4])

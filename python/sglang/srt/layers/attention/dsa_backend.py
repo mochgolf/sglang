@@ -2119,7 +2119,22 @@ class DeepseekSparseAttnBackend(
             "v_head_dim": int(v_head_dim),
             "page_size": int(page_size),
         }
-        print(json.dumps(payload, sort_keys=True))
+        line = json.dumps(payload, sort_keys=True)
+        print(line, flush=True)
+
+        shapes_path = os.environ.get("SGLANG_GLM_DSA_SM89_SHAPES_PATH")
+        if shapes_path:
+            fd = None
+            try:
+                fd = os.open(
+                    shapes_path,
+                    os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                    0o644,
+                )
+                os.write(fd, (line + "\n").encode("utf-8"))
+            finally:
+                if fd is not None:
+                    os.close(fd)
         self._dumped_glm_sm89_torch_mla_shapes = True
 
     def _forward_flashmla_sparse(
