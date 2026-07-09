@@ -355,6 +355,7 @@ class DeepseekSparseAttnBackend(
         self.use_glm_sm89_dsa_fallback = bool(
             getattr(model_runner.server_args, "enable_glm_dsa_sm89_fallback", False)
         )
+        self._logged_glm_sm89_effective_torch_mla = False
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -1921,6 +1922,13 @@ class DeepseekSparseAttnBackend(
             getattr(self, "use_glm_sm89_dsa_fallback", False)
             and self.device_sm_major < 9
         ):
+            if not self._logged_glm_sm89_effective_torch_mla:
+                logger.warning(
+                    "GLM DSA SM89 effective backend is torch_mla: requested fa3, "
+                    "but device_sm_major=%s < 9 requires the correctness fallback.",
+                    self.device_sm_major,
+                )
+                self._logged_glm_sm89_effective_torch_mla = True
             return self._forward_torch_mla(
                 q_rope=q_rope,
                 kv_cache=kv_cache,
