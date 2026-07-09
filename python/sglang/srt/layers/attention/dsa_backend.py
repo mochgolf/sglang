@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -361,6 +363,7 @@ class DeepseekSparseAttnBackend(
             getattr(model_runner.server_args, "enable_glm_dsa_sm89_fallback", False)
         )
         self._logged_glm_sm89_effective_torch_mla = False
+        self._dumped_glm_sm89_torch_mla_shapes = False
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -1735,6 +1738,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                layer_id=getattr(layer, "layer_id", None),
             )
         elif dsa_impl == "aiter":
             if q_rope is not None:
@@ -1892,6 +1896,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                layer_id=getattr(layer, "layer_id", None),
             )
         elif self.dsa_decode_impl == "aiter":
             if q_all is None or not _is_hip:
@@ -1922,6 +1927,7 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         logit_cap: float,
         page_size: int,
+        layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         if (
             getattr(self, "use_glm_sm89_dsa_fallback", False)
@@ -1944,6 +1950,7 @@ class DeepseekSparseAttnBackend(
                 sm_scale=sm_scale,
                 logit_cap=logit_cap,
                 page_size=page_size,
+                layer_id=layer_id,
             )
 
         if kv_cache.dtype == torch.float8_e4m3fn:
@@ -1982,6 +1989,7 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         logit_cap: float,
         page_size: int,
+        layer_id: Optional[int] = None,
     ) -> torch.Tensor:
         """Torch fallback for SM89 GLM DSA where FA3 cannot handle MLA dims."""
         assert page_size == 1, "Torch DSA fallback currently expects page_size=1"
@@ -2000,6 +2008,16 @@ class DeepseekSparseAttnBackend(
                 c_kv_cache = kv_cache[:, :, :v_head_dim]
                 kv_all = torch.cat([c_kv_cache, k_rope_cache], dim=-1)
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
+                self._maybe_dump_glm_sm89_torch_mla_shapes(
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    v_head_dim=v_head_dim,
+                    page_size=page_size,
+                    layer_id=layer_id,
+                )
 
             out = torch.empty_like(q_nope)
             total_q = q_all.shape[0]
@@ -2066,6 +2084,42 @@ class DeepseekSparseAttnBackend(
                     out[start:end] = chunk_out
 
             return out
+
+    def _maybe_dump_glm_sm89_torch_mla_shapes(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        v_head_dim: int,
+        page_size: int,
+        layer_id: Optional[int],
+    ) -> None:
+        if getattr(self, "_dumped_glm_sm89_torch_mla_shapes", False):
+            return
+        if os.environ.get("SGLANG_GLM_DSA_SM89_DUMP_SHAPES") != "1":
+            return
+
+        payload = {
+            "layer_id": layer_id,
+            "q_nope_shape": list(q_nope.shape),
+            "q_nope_stride": list(q_nope.stride()),
+            "q_rope_shape": list(q_rope.shape),
+            "q_rope_stride": list(q_rope.stride()),
+            "kv_cache_shape": list(kv_cache.shape),
+            "kv_cache_stride": list(kv_cache.stride()),
+            "kv_cache_dtype": str(kv_cache.dtype),
+            "page_table_shape": list(page_table.shape),
+            "page_table_stride": list(page_table.stride()),
+            "cache_seqlens_shape": list(cache_seqlens.shape),
+            "cache_seqlens_stride": list(cache_seqlens.stride()),
+            "cache_seqlens_max": int(cache_seqlens.max().item()),
+            "v_head_dim": int(v_head_dim),
+            "page_size": int(page_size),
+        }
+        print("GLM_DSA_SM89_SHAPES", json.dumps(payload, sort_keys=True))
+        self._dumped_glm_sm89_torch_mla_shapes = True
 
     def _forward_flashmla_sparse(
         self,
