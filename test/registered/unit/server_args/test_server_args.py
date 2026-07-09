@@ -7,6 +7,8 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 import sglang.srt.server_args as server_args_module
 from sglang.srt.environ import envs
 from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
@@ -405,6 +407,56 @@ class TestGlmSm89DsaFallback(CustomTestCase):
 
         self.assertEqual(metadata.topk_backend, DSATopKBackend.TORCH)
         self.assertTrue(metadata.force_unfused_topk)
+
+    def test_glm_sm89_fallback_fa3_dequantizes_fp8_kv_cache(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
+        backend.num_splits = 0
+
+        q_rope = torch.zeros(1, 1, 64, dtype=torch.bfloat16)
+        q_nope = torch.zeros(1, 1, 512, dtype=torch.bfloat16)
+        fp8_kv_cache = torch.empty(1, 1, 656, dtype=torch.float8_e4m3fn)
+        dequantized_kv_cache = torch.zeros(1, 1, 576, dtype=torch.bfloat16)
+        page_table = torch.zeros(1, 1, dtype=torch.int32)
+        cache_seqlens = torch.ones(1, dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+
+        def fake_flash_attn_with_kvcache(**kwargs):
+            self.assertEqual(kwargs["q"].dtype, torch.bfloat16)
+            self.assertEqual(kwargs["qv"].dtype, torch.bfloat16)
+            self.assertEqual(kwargs["k_cache"].dtype, torch.bfloat16)
+            self.assertEqual(kwargs["v_cache"].dtype, torch.bfloat16)
+            self.assertEqual(kwargs["k_cache"].shape[-1], 64)
+            self.assertEqual(kwargs["v_cache"].shape[-1], 512)
+            return torch.zeros_like(kwargs["qv"])
+
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.dequantize_k_cache",
+                return_value=dequantized_kv_cache,
+            ) as mock_dequantize,
+            patch(
+                "sglang.srt.layers.attention.dsa_backend.flash_attn_with_kvcache",
+                side_effect=fake_flash_attn_with_kvcache,
+            ),
+        ):
+            backend._forward_fa3(
+                q_rope=q_rope,
+                kv_cache=fp8_kv_cache,
+                v_head_dim=512,
+                q_nope=q_nope,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=1,
+                sm_scale=1.0,
+                logit_cap=0.0,
+                page_size=1,
+            )
+
+        mock_dequantize.assert_called_once_with(fp8_kv_cache)
 
     def test_regular_dsa_indexer_metadata_keeps_fused_topk_enabled(self):
         from sglang.srt.layers.attention import dsa_backend

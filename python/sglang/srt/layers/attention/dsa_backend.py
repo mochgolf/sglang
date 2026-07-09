@@ -20,7 +20,10 @@ from sglang.srt.runtime_context import get_parallel
 logger = logging.getLogger(__name__)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.dsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.dsa.dequant_k_cache import (
+    dequantize_k_cache,
+    dequantize_k_cache_paged,
+)
 from sglang.srt.layers.attention.dsa.dsa_backend_mtp_precompute import (
     DeepseekSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -1914,6 +1917,8 @@ class DeepseekSparseAttnBackend(
         logit_cap: float,
         page_size: int,
     ) -> torch.Tensor:
+        if kv_cache.dtype == torch.float8_e4m3fn:
+            kv_cache = dequantize_k_cache(kv_cache)
         k_rope_cache = kv_cache[:, :, v_head_dim:]
         c_kv_cache = kv_cache[:, :, :v_head_dim]
         qk_rope_dim = k_rope_cache.shape[-1]
