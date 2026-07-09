@@ -1994,6 +1994,7 @@ class DeepseekSparseAttnBackend(
         """Torch fallback for SM89 GLM DSA where FA3 cannot handle MLA dims."""
         assert page_size == 1, "Torch DSA fallback currently expects page_size=1"
         profile = glm_dsa_sm89_profile_enabled()
+        raw_kv_cache = kv_cache
         with nvtx_range("torch_mla.total"), cuda_timer("torch_mla.total", profile):
             with nvtx_range("torch_mla.dequant"), cuda_timer(
                 "torch_mla.dequant", profile
@@ -2011,7 +2012,8 @@ class DeepseekSparseAttnBackend(
                 self._maybe_dump_glm_sm89_torch_mla_shapes(
                     q_nope=q_nope,
                     q_rope=q_rope,
-                    kv_cache=kv_cache,
+                    raw_kv_cache=raw_kv_cache,
+                    dequant_kv_cache=kv_cache,
                     page_table=page_table,
                     cache_seqlens=cache_seqlens,
                     v_head_dim=v_head_dim,
@@ -2089,7 +2091,8 @@ class DeepseekSparseAttnBackend(
         self,
         q_nope: torch.Tensor,
         q_rope: torch.Tensor,
-        kv_cache: torch.Tensor,
+        raw_kv_cache: torch.Tensor,
+        dequant_kv_cache: torch.Tensor,
         page_table: torch.Tensor,
         cache_seqlens: torch.Tensor,
         v_head_dim: int,
@@ -2100,6 +2103,17 @@ class DeepseekSparseAttnBackend(
             return
         if os.environ.get("SGLANG_GLM_DSA_SM89_DUMP_SHAPES") != "1":
             return
+        dump_min_q_tokens = 2
+        raw_dump_min_q_tokens = os.environ.get("SGLANG_GLM_DSA_SM89_DUMP_MIN_Q_TOKENS")
+        if raw_dump_min_q_tokens is not None:
+            try:
+                parsed_dump_min_q_tokens = int(raw_dump_min_q_tokens)
+            except (TypeError, ValueError):
+                parsed_dump_min_q_tokens = 2
+            if parsed_dump_min_q_tokens >= 1:
+                dump_min_q_tokens = parsed_dump_min_q_tokens
+        if int(q_nope.shape[0]) < dump_min_q_tokens:
+            return
 
         payload = {
             "event": "GLM_DSA_SM89_SHAPES",
@@ -2108,9 +2122,12 @@ class DeepseekSparseAttnBackend(
             "q_nope_stride": list(q_nope.stride()),
             "q_rope_shape": list(q_rope.shape),
             "q_rope_stride": list(q_rope.stride()),
-            "kv_cache_shape": list(kv_cache.shape),
-            "kv_cache_stride": list(kv_cache.stride()),
-            "kv_cache_dtype": str(kv_cache.dtype),
+            "kv_cache_shape": list(raw_kv_cache.shape),
+            "kv_cache_stride": list(raw_kv_cache.stride()),
+            "kv_cache_dtype": str(raw_kv_cache.dtype),
+            "dequant_kv_cache_shape": list(dequant_kv_cache.shape),
+            "dequant_kv_cache_stride": list(dequant_kv_cache.stride()),
+            "dequant_kv_cache_dtype": str(dequant_kv_cache.dtype),
             "page_table_shape": list(page_table.shape),
             "page_table_stride": list(page_table.stride()),
             "cache_seqlens_shape": list(cache_seqlens.shape),
