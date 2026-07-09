@@ -233,9 +233,10 @@ class TestSm89SparseMlaShapeDump(unittest.TestCase):
             )
 
         mock_print.assert_called_once()
-        prefix, payload = mock_print.call_args.args
-        self.assertEqual(prefix, "GLM_DSA_SM89_SHAPES")
-        dump = json.loads(payload)
+        self.assertEqual(len(mock_print.call_args.args), 1)
+        line = mock_print.call_args.args[0]
+        dump = json.loads(line)
+        self.assertEqual(dump["event"], "GLM_DSA_SM89_SHAPES")
         self.assertEqual(dump["layer_id"], 7)
         self.assertEqual(dump["q_nope_shape"], [2, 1, 4])
         self.assertEqual(dump["q_rope_shape"], [2, 1, 4])

@@ -2102,6 +2102,7 @@ class DeepseekSparseAttnBackend(
             return
 
         payload = {
+            "event": "GLM_DSA_SM89_SHAPES",
             "layer_id": layer_id,
             "q_nope_shape": list(q_nope.shape),
             "q_nope_stride": list(q_nope.stride()),
@@ -2118,7 +2119,7 @@ class DeepseekSparseAttnBackend(
             "v_head_dim": int(v_head_dim),
             "page_size": int(page_size),
         }
-        print("GLM_DSA_SM89_SHAPES", json.dumps(payload, sort_keys=True))
+        print(json.dumps(payload, sort_keys=True))
         self._dumped_glm_sm89_torch_mla_shapes = True
 
     def _forward_flashmla_sparse(
