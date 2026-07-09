@@ -458,6 +458,84 @@ class TestGlmSm89DsaFallback(CustomTestCase):
 
         mock_dequantize.assert_called_once_with(fp8_kv_cache)
 
+    def test_glm_sm89_fallback_fa3_routes_to_torch_mla(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
+        backend.use_glm_sm89_dsa_fallback = True
+        backend.device_sm_major = 8
+        sentinel = object()
+        backend._forward_torch_mla = MagicMock(return_value=sentinel)
+
+        q_rope = torch.zeros(1, 1, 2)
+        q_nope = torch.zeros(1, 1, 2)
+        kv_cache = torch.zeros(1, 1, 4)
+        page_table = torch.zeros(1, 1, dtype=torch.int32)
+        cache_seqlens = torch.ones(1, dtype=torch.int32)
+        cu_seqlens = torch.tensor([0, 1], dtype=torch.int32)
+
+        with patch(
+            "sglang.srt.layers.attention.dsa_backend.flash_attn_with_kvcache"
+        ) as mock_fa3:
+            result = backend._forward_fa3(
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=2,
+                q_nope=q_nope,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=1,
+                sm_scale=1.0,
+                logit_cap=0.0,
+                page_size=1,
+            )
+
+        self.assertIs(result, sentinel)
+        backend._forward_torch_mla.assert_called_once()
+        mock_fa3.assert_not_called()
+
+    def test_glm_sm89_torch_mla_matches_manual_attention(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
+        q_nope = torch.tensor([[[1.0, 0.0]], [[0.0, 1.0]]])
+        q_rope = torch.tensor([[[0.5, 0.0]], [[0.0, 0.5]]])
+        kv_cache = torch.tensor(
+            [
+                [[1.0, 0.0, 1.0, 0.0]],
+                [[0.0, 1.0, 0.0, 1.0]],
+                [[1.0, 1.0, 0.5, 0.5]],
+            ]
+        )
+        page_table = torch.tensor([[0, 1, -1], [2, -1, -1]], dtype=torch.int32)
+        cache_seqlens = torch.tensor([2, 1], dtype=torch.int32)
+
+        actual = backend._forward_torch_mla(
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            v_head_dim=2,
+            q_nope=q_nope,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            sm_scale=1.0,
+            logit_cap=0.0,
+            page_size=1,
+        )
+
+        expected_rows = []
+        q_all = torch.cat([q_nope, q_rope], dim=-1)
+        for i in range(q_all.shape[0]):
+            indices = page_table[i, : cache_seqlens[i].item()].to(torch.long)
+            selected = kv_cache[indices].squeeze(1)
+            scores = torch.matmul(q_all[i], selected.transpose(0, 1))
+            probs = torch.softmax(scores, dim=-1)
+            expected_rows.append(torch.matmul(probs, selected[:, :2]))
+        expected = torch.stack(expected_rows, dim=0)
+
+        torch.testing.assert_close(actual, expected)
+
     def test_regular_dsa_indexer_metadata_keeps_fused_topk_enabled(self):
         from sglang.srt.layers.attention import dsa_backend
         from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend

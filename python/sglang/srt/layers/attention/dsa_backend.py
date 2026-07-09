@@ -1917,6 +1917,22 @@ class DeepseekSparseAttnBackend(
         logit_cap: float,
         page_size: int,
     ) -> torch.Tensor:
+        if (
+            getattr(self, "use_glm_sm89_dsa_fallback", False)
+            and self.device_sm_major < 9
+        ):
+            return self._forward_torch_mla(
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=v_head_dim,
+                q_nope=q_nope,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                sm_scale=sm_scale,
+                logit_cap=logit_cap,
+                page_size=page_size,
+            )
+
         if kv_cache.dtype == torch.float8_e4m3fn:
             kv_cache = dequantize_k_cache(kv_cache)
         k_rope_cache = kv_cache[:, :, v_head_dim:]
@@ -1941,6 +1957,85 @@ class DeepseekSparseAttnBackend(
             num_splits=self.num_splits,
         )
         return o  # type: ignore
+
+    def _forward_torch_mla(
+        self,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        q_nope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        sm_scale: float,
+        logit_cap: float,
+        page_size: int,
+    ) -> torch.Tensor:
+        """Torch fallback for SM89 GLM DSA where FA3 cannot handle MLA dims."""
+        assert page_size == 1, "Torch DSA fallback currently expects page_size=1"
+        if kv_cache.dtype == torch.float8_e4m3fn:
+            kv_cache = dequantize_k_cache(kv_cache)
+
+        k_rope_cache = kv_cache[:, :, v_head_dim:]
+        c_kv_cache = kv_cache[:, :, :v_head_dim]
+        kv_all = torch.cat([c_kv_cache, k_rope_cache], dim=-1)
+        q_all = torch.cat([q_nope, q_rope], dim=-1)
+
+        out = torch.empty_like(q_nope)
+        total_q = q_all.shape[0]
+        chunk_size = 128
+        arange_topk = torch.arange(page_table.shape[1], device=page_table.device)
+
+        for start in range(0, total_q, chunk_size):
+            end = min(start + chunk_size, total_q)
+            row_lens = cache_seqlens[start:end].to(torch.long)
+            max_len = int(row_lens.max().item()) if row_lens.numel() else 0
+            if max_len == 0:
+                out[start:end].zero_()
+                continue
+
+            selected = page_table[start:end, :max_len]
+            valid = (arange_topk[:max_len].unsqueeze(0) < row_lens.unsqueeze(1)) & (
+                selected >= 0
+            )
+            safe_selected = selected.clamp(min=0).to(torch.long)
+            selected_kv = kv_all[safe_selected].squeeze(2)
+            selected_k = selected_kv
+            selected_v = selected_kv[..., :v_head_dim]
+
+            q_chunk = q_all[start:end].unsqueeze(2)
+            k_chunk = selected_k.unsqueeze(1)
+            v_chunk = selected_v.unsqueeze(1)
+            attn_mask = valid[:, None, None, :]
+            empty_rows = ~valid.any(dim=1)
+
+            if logit_cap and logit_cap > 0:
+                scores = torch.matmul(
+                    q_chunk.to(torch.float32),
+                    k_chunk.to(torch.float32).transpose(-1, -2),
+                )
+                scores.mul_(sm_scale)
+                scores = logit_cap * torch.tanh(scores / logit_cap)
+                scores = scores.masked_fill(~attn_mask, float("-inf"))
+                if empty_rows.any():
+                    scores[empty_rows, :, :, 0] = 0
+                probs = torch.softmax(scores, dim=-1).to(v_chunk.dtype)
+                chunk_out = torch.matmul(probs, v_chunk)
+            else:
+                chunk_out = torch.nn.functional.scaled_dot_product_attention(
+                    q_chunk,
+                    k_chunk,
+                    v_chunk,
+                    attn_mask=attn_mask,
+                    scale=sm_scale,
+                    is_causal=False,
+                )
+
+            chunk_out = chunk_out.squeeze(2)
+            if empty_rows.any():
+                chunk_out[empty_rows].zero_()
+            out[start:end] = chunk_out
+
+        return out
 
     def _forward_flashmla_sparse(
         self,
