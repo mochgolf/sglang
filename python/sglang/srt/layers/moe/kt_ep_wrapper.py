@@ -358,6 +358,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         if self.tp_rank == 0:
             self.submit(layer, dispatch_output)
 
+        if self.num_gpu_experts <= 0:
+            return StandardCombineInput(hidden_states=self.sync(x))
+
         # Step 2: Prepare GPU computation by masking CPU expert IDs
         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
         topk_ids = topk_output.topk_ids

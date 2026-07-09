@@ -4,6 +4,10 @@ import unittest
 import torch
 
 import sglang.srt.layers.moe.kt_ep_wrapper as kt_ep_wrapper
+from sglang.srt.layers.moe.token_dispatcher.standard import (
+    StandardDispatchOutput,
+    StandardTopKOutput,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
@@ -29,6 +33,26 @@ class _DummyGpuMethod:
     def process_weights_after_loading(self, layer):
         self.processed_weights = True
         raise AssertionError("GPU postprocess should not run without GPU experts")
+
+
+class _DummyForwardGpuMethod:
+    def __init__(self):
+        self.apply_call_count = 0
+
+    def apply(self, layer, dispatch_output):
+        self.apply_call_count += 1
+        raise AssertionError("GPU apply should not run without GPU experts")
+
+    def create_weights(
+        self,
+        layer,
+        num_experts,
+        hidden_size,
+        intermediate_size_per_partition,
+        params_dtype,
+        **extra_weight_attrs,
+    ):
+        return None
 
 
 class _DummyLayer:
@@ -131,6 +155,62 @@ class TestKTEPWrapper(unittest.TestCase):
             kt_ep_wrapper.get_parallel = old_get_parallel
 
         self.assertFalse(gpu_method.processed_weights)
+
+    def test_all_cpu_experts_skip_gpu_forward_apply(self):
+        old_available = kt_ep_wrapper.KTRANSFORMERS_AVAILABLE
+        old_get_parallel = kt_ep_wrapper.get_parallel
+        try:
+            kt_ep_wrapper.KTRANSFORMERS_AVAILABLE = True
+            kt_ep_wrapper.get_parallel = lambda: SimpleNamespace(tp_rank=0)
+
+            gpu_method = _DummyForwardGpuMethod()
+            wrapper = kt_ep_wrapper.KTEPWrapperMethod(
+                gpu_method,
+                kt_ep_wrapper.KTConfig(
+                    layer_idx=3,
+                    num_gpu_experts=0,
+                    cpuinfer_threads=76,
+                    threadpool_count=1,
+                    weight_path="/tmp/weights",
+                    chunked_prefill_size=2048,
+                    max_deferred_experts_per_token=None,
+                    method="NVFP4",
+                ),
+            )
+
+            dispatch_output = StandardDispatchOutput(
+                hidden_states=torch.ones((2, 2), dtype=torch.float32),
+                hidden_states_scale=None,
+                topk_output=StandardTopKOutput(
+                    topk_weights=torch.full((2, 2), 0.5, dtype=torch.float32),
+                    topk_ids=torch.zeros((2, 2), dtype=torch.int32),
+                    router_logits=torch.zeros((2, 2), dtype=torch.float32),
+                ),
+            )
+
+            submit_called = []
+            sync_called = []
+            fake_cpu_output = torch.full((2, 2), 9.0, dtype=torch.float32)
+
+            def fake_submit(layer, output):
+                submit_called.append(output)
+
+            def fake_sync(x):
+                sync_called.append(x)
+                return fake_cpu_output
+
+            wrapper.submit = fake_submit
+            wrapper.sync = fake_sync
+
+            output = wrapper.apply(layer=_DummyLayer(), dispatch_output=dispatch_output)
+        finally:
+            kt_ep_wrapper.KTRANSFORMERS_AVAILABLE = old_available
+            kt_ep_wrapper.get_parallel = old_get_parallel
+
+        self.assertEqual(gpu_method.apply_call_count, 0)
+        self.assertEqual(len(submit_called), 1)
+        self.assertEqual(len(sync_called), 1)
+        self.assertTrue(torch.equal(output.hidden_states, fake_cpu_output))
 
 
 if __name__ == "__main__":
