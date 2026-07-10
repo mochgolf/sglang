@@ -1066,11 +1066,15 @@ class TestSm89SparseMlaDecodeCuda(unittest.TestCase):
             (actual_b, expected_b, case_b),
         ):
             nonempty = case["cache_seqlens"] > 0
-            self.assertTrue(
-                torch.allclose(
-                    actual[nonempty], expected[nonempty], atol=5e-2, rtol=5e-3
-                )
-            )
+            actual_nonempty = actual[nonempty].float()
+            expected_nonempty = expected[nonempty].float()
+            diff = (actual_nonempty - expected_nonempty).abs()
+            self.assertLessEqual(diff.max().item(), 5e-2)
+            self.assertLessEqual(diff.mean().item(), 5e-3)
+            cosine = torch.nn.functional.cosine_similarity(
+                actual_nonempty.flatten(), expected_nonempty.flatten(), dim=0
+            ).item()
+            self.assertGreaterEqual(cosine, 0.995)
             empty = ~nonempty
             if empty.any():
                 self.assertTrue(
@@ -1090,10 +1094,12 @@ class TestSm89SparseMlaDecodeCuda(unittest.TestCase):
             "q_rope_dtype": {"q_rope": case["q_rope"].float()},
             "q_nope_rank": {"q_nope": case["q_nope"].unsqueeze(0)},
             "page_table_dtype": {"page_table": case["page_table"].long()},
+            "page_table_rank": {"page_table": case["page_table"].unsqueeze(0)},
             "cache_seqlens_dtype": {
                 "cache_seqlens": case["cache_seqlens"].long()
             },
             "kv_cache_dtype": {"kv_cache": case["kv_cache"].bfloat16()},
+            "kv_cache_rank": {"kv_cache": case["kv_cache"].unsqueeze(0)},
             "device": {"q_rope": case["q_rope"].cpu()},
             "head_count": {
                 "q_nope": torch.zeros(2, 65, 512, device="cuda", dtype=torch.bfloat16),
