@@ -775,6 +775,204 @@ class TestSm89SparseMlaBackendDispatch(unittest.TestCase):
         cache_seqlens = torch.tensor([2, 1], dtype=torch.int32)
         return q_nope, q_rope, kv_cache, page_table, cache_seqlens
 
+    def test_forward_decode_routes_sm89_cuda_physical_metadata(self):
+        from sglang.srt.layers.attention import dsa_backend
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        backend = self._make_backend()
+        backend.dsa_decode_impl = "sm89_cuda"
+        backend.hisparse_coordinator = None
+        backend._use_dsa_fuse_topk = MagicMock(return_value=False)
+
+        q_nope, q_rope, kv_cache, logical_page_table, cache_seqlens = (
+            self._make_inputs()
+        )
+        physical_page_table = logical_page_table + 17
+        topk_indices = torch.tensor([[1, 0, -1], [0, -1, -1]], dtype=torch.int32)
+        backend.forward_metadata = SimpleNamespace(
+            page_table_1=logical_page_table,
+            dsa_cache_seqlens_int32=cache_seqlens,
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=MagicMock(return_value=kv_cache)
+        )
+        sentinel = object()
+        backend._forward_sm89_cuda_decode = MagicMock(return_value=sentinel)
+        layer = SimpleNamespace(
+            is_cross_attention=False,
+            tp_q_head_num=1,
+            v_head_dim=512,
+            head_dim=576,
+            scaling=0.125,
+            logit_cap=30.0,
+            layer_id=7,
+        )
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+
+        with patch.object(
+            dsa_backend,
+            "transform_index_page_table_decode",
+            return_value=physical_page_table,
+        ) as mock_transform:
+            out = dsa_backend.DeepseekSparseAttnBackend.forward_decode(
+                backend,
+                q=q_nope,
+                k=None,
+                v=None,
+                layer=layer,
+                forward_batch=forward_batch,
+                save_kv_cache=False,
+                q_rope=q_rope,
+                topk_indices=topk_indices,
+            )
+
+        self.assertIs(out, sentinel)
+        mock_transform.assert_called_once_with(
+            page_table=logical_page_table,
+            topk_indices=topk_indices,
+            page_size=1,
+        )
+        backend._forward_sm89_cuda_decode.assert_called_once()
+        call = backend._forward_sm89_cuda_decode.call_args.kwargs
+        self.assertTrue(torch.equal(call["q_rope"], q_rope))
+        self.assertIs(call["kv_cache"], kv_cache)
+        self.assertEqual(call["v_head_dim"], 512)
+        self.assertTrue(torch.equal(call["q_nope"], q_nope))
+        self.assertIs(call["page_table"], physical_page_table)
+        self.assertIs(call["cache_seqlens"], cache_seqlens)
+        self.assertEqual(call["sm_scale"], 0.125)
+        self.assertEqual(call["logit_cap"], 30.0)
+        self.assertEqual(call["page_size"], 1)
+
+    def test_forward_sm89_cuda_calls_kernel_and_logs_once(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        backend = self._make_backend()
+        backend._logged_glm_sm89_effective_sm89_cuda = False
+        q_nope, q_rope, kv_cache, page_table, cache_seqlens = self._make_inputs()
+        sentinel = torch.ones_like(q_nope)
+
+        with patch.object(dsa_backend.logger, "info") as mock_info, patch(
+            "sglang.srt.layers.attention.dsa.sm89_sparse_mla."
+            "sm89_sparse_mla_decode_cuda",
+            return_value=sentinel,
+        ) as mock_kernel:
+            first = dsa_backend.DeepseekSparseAttnBackend._forward_sm89_cuda_decode(
+                backend,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=512,
+                q_nope=q_nope,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                sm_scale=0.125,
+                logit_cap=30.0,
+                page_size=1,
+            )
+            second = dsa_backend.DeepseekSparseAttnBackend._forward_sm89_cuda_decode(
+                backend,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=512,
+                q_nope=q_nope,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                sm_scale=0.125,
+                logit_cap=30.0,
+                page_size=1,
+            )
+
+        self.assertIs(first, sentinel)
+        self.assertIs(second, sentinel)
+        self.assertEqual(mock_kernel.call_count, 2)
+        mock_kernel.assert_called_with(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            sm_scale=0.125,
+            logit_cap=30.0,
+            v_head_dim=512,
+        )
+        mock_info.assert_called_once_with(
+            "GLM DSA SM89 effective decode backend is sm89_cuda."
+        )
+
+    def test_forward_sm89_cuda_rejects_invalid_runtime_contract(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        q_nope, q_rope, kv_cache, page_table, cache_seqlens = self._make_inputs()
+        cases = (
+            ("model", {"model_arch": "OtherModel"}, {}, "GLM DSA"),
+            ("device", {"device_capability": (9, 0)}, {}, "SM89"),
+            ("kv", {}, {"kv_cache": kv_cache.to(torch.bfloat16)}, "FP8 E4M3"),
+            ("page_size", {}, {"page_size": 64}, "page_size=1"),
+            ("v_head_dim", {}, {"v_head_dim": 256}, "GLM dimensions"),
+            ("q_nope", {}, {"q_nope": q_nope[..., :256]}, "GLM dimensions"),
+            ("q_rope", {}, {"q_rope": q_rope[..., :32]}, "GLM dimensions"),
+        )
+
+        with patch(
+            "sglang.srt.layers.attention.dsa.sm89_sparse_mla."
+            "sm89_sparse_mla_decode_cuda"
+        ) as mock_kernel:
+            for name, backend_overrides, call_overrides, message in cases:
+                with self.subTest(name=name):
+                    backend = self._make_backend()
+                    for attr, value in backend_overrides.items():
+                        setattr(backend, attr, value)
+                    kwargs = {
+                        "q_rope": q_rope,
+                        "kv_cache": kv_cache,
+                        "v_head_dim": 512,
+                        "q_nope": q_nope,
+                        "page_table": page_table,
+                        "cache_seqlens": cache_seqlens,
+                        "sm_scale": 0.125,
+                        "logit_cap": 30.0,
+                        "page_size": 1,
+                    }
+                    kwargs.update(call_overrides)
+
+                    with self.assertRaisesRegex(ValueError, message):
+                        dsa_backend.DeepseekSparseAttnBackend._forward_sm89_cuda_decode(
+                            backend, **kwargs
+                        )
+
+        mock_kernel.assert_not_called()
+
+    def test_forward_sm89_cuda_kernel_error_propagates_without_torch_fallback(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        backend = self._make_backend()
+        backend._logged_glm_sm89_effective_sm89_cuda = False
+        backend._forward_torch_mla = MagicMock()
+        q_nope, q_rope, kv_cache, page_table, cache_seqlens = self._make_inputs()
+        error = RuntimeError("decode kernel failed")
+
+        with patch(
+            "sglang.srt.layers.attention.dsa.sm89_sparse_mla."
+            "sm89_sparse_mla_decode_cuda",
+            side_effect=error,
+        ):
+            with self.assertRaises(RuntimeError) as raised:
+                dsa_backend.DeepseekSparseAttnBackend._forward_sm89_cuda_decode(
+                    backend,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    v_head_dim=512,
+                    q_nope=q_nope,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    sm_scale=0.125,
+                    logit_cap=30.0,
+                    page_size=1,
+                )
+
+        self.assertIs(raised.exception, error)
+        backend._forward_torch_mla.assert_not_called()
+
     def test_forward_sm89_triton_calls_kernel(self):
         from sglang.srt.layers.attention import dsa_backend
 

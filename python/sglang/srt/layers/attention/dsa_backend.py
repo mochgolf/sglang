@@ -311,6 +311,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_kv",
     "flashmla_auto",
     "fa3",
+    "sm89_cuda",
     "sm89_triton",
     "tilelang",
     "aiter",
@@ -376,6 +377,7 @@ class DeepseekSparseAttnBackend(
             getattr(model_runner.server_args, "enable_glm_dsa_sm89_fallback", False)
         )
         self._logged_glm_sm89_effective_torch_mla = False
+        self._logged_glm_sm89_effective_sm89_cuda = False
         self._logged_glm_sm89_effective_sm89_triton = False
         self._dumped_glm_sm89_torch_mla_shapes = False
         if self.num_q_heads <= 64:
@@ -1933,6 +1935,18 @@ class DeepseekSparseAttnBackend(
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
             )
+        elif self.dsa_decode_impl == "sm89_cuda":
+            return self._forward_sm89_cuda_decode(
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                q_nope=q_nope,
+                page_table=page_table_1,
+                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                page_size=1,
+            )
         elif self.dsa_decode_impl == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
@@ -1963,6 +1977,61 @@ class DeepseekSparseAttnBackend(
 
         else:
             assert False, f"Unsupported {self.dsa_decode_impl = }"
+
+    def _forward_sm89_cuda_decode(
+        self,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        q_nope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        sm_scale: float,
+        logit_cap: float,
+        page_size: int,
+    ) -> torch.Tensor:
+        if self.model_arch not in {"GlmMoeDsaForCausalLM", "GlmMoeDsaModel"}:
+            raise ValueError(
+                "sm89_cuda DSA backend is only supported for GLM DSA models."
+            )
+        if self.device_capability != (8, 9):
+            raise ValueError(
+                "sm89_cuda DSA backend is only supported on SM89 devices; "
+                f"got capability={self.device_capability}."
+            )
+        if kv_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "sm89_cuda DSA backend requires FP8 E4M3 KV cache; "
+                f"got {kv_cache.dtype}."
+            )
+        if page_size != 1:
+            raise ValueError("sm89_cuda DSA decode requires page_size=1.")
+        if v_head_dim != 512 or q_nope.shape[-1] != 512 or q_rope.shape[-1] != 64:
+            raise ValueError(
+                "sm89_cuda DSA backend currently requires GLM dimensions "
+                f"v_head_dim=512, q_nope_dim=512, q_rope_dim=64; got "
+                f"{v_head_dim=}, q_nope_dim={q_nope.shape[-1]}, "
+                f"q_rope_dim={q_rope.shape[-1]}."
+            )
+
+        if not getattr(self, "_logged_glm_sm89_effective_sm89_cuda", False):
+            logger.info("GLM DSA SM89 effective decode backend is sm89_cuda.")
+            self._logged_glm_sm89_effective_sm89_cuda = True
+
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_decode_cuda,
+        )
+
+        return sm89_sparse_mla_decode_cuda(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            sm_scale=sm_scale,
+            logit_cap=logit_cap,
+            v_head_dim=v_head_dim,
+        )
 
     def _forward_fa3(
         self,

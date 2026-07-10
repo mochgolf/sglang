@@ -304,6 +304,112 @@ class TestGlmSm89DsaFallback(CustomTestCase):
     def test_dsa_choices_include_sm89_triton(self):
         self.assertIn("sm89_triton", server_args_module.DSA_CHOICES)
 
+    def test_dsa_choices_include_sm89_cuda(self):
+        self.assertIn("sm89_cuda", server_args_module.DSA_CHOICES)
+
+    def test_glm_sm89_accepts_explicit_sm89_cuda_decode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_decode_backend="sm89_cuda",
+        )
+
+        server_args._set_default_dsa_backends(
+            kv_cache_dtype="fp8_e4m3",
+            major=8,
+            minor=9,
+            model_arch="GlmMoeDsaForCausalLM",
+        )
+
+        self.assertEqual(server_args.dsa_prefill_backend, "fa3")
+        self.assertEqual(server_args.dsa_decode_backend, "sm89_cuda")
+        self.assertTrue(server_args.enable_glm_dsa_sm89_fallback)
+
+    def test_sm89_cuda_rejects_prefill(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="sm89_cuda",
+        )
+
+        with self.assertRaisesRegex(ValueError, "decode only"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=8,
+                minor=9,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+    def test_sm89_cuda_rejects_non_glm_target(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_decode_backend="sm89_cuda",
+        )
+
+        with self.assertRaisesRegex(ValueError, "GLM DSA on SM89"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=8,
+                minor=9,
+                model_arch="OtherModel",
+            )
+
+    def test_sm89_cuda_rejects_non_sm89_target(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_decode_backend="sm89_cuda",
+        )
+
+        with self.assertRaisesRegex(ValueError, "GLM DSA on SM89"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=9,
+                minor=0,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+    def test_sm89_cuda_requires_fp8_kv(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="bfloat16",
+            dsa_decode_backend="sm89_cuda",
+        )
+
+        with self.assertRaisesRegex(ValueError, "fp8_e4m3"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="bfloat16",
+                major=8,
+                minor=9,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+    def test_sm89_cuda_rejects_all_speculative_algorithms(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        algorithms = [
+            algorithm.name
+            for algorithm in SpeculativeAlgorithm
+            if algorithm is not SpeculativeAlgorithm.NONE
+        ] + ["NEXTN"]
+        for algorithm in algorithms:
+            with self.subTest(algorithm=algorithm):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    kv_cache_dtype="fp8_e4m3",
+                    dsa_decode_backend="sm89_cuda",
+                    speculative_algorithm=algorithm,
+                )
+
+                with self.assertRaisesRegex(ValueError, "speculative/MTP"):
+                    server_args._set_default_dsa_backends(
+                        kv_cache_dtype="fp8_e4m3",
+                        major=8,
+                        minor=9,
+                        model_arch="GlmMoeDsaForCausalLM",
+                    )
+
     def test_glm_sm89_fallback_accepts_explicit_sm89_triton_prefill(self):
         server_args = ServerArgs(
             model_path="dummy",

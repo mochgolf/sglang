@@ -315,6 +315,7 @@ DSA_CHOICES = [
     "flashmla_kv",
     "flashmla_auto",
     "fa3",
+    "sm89_cuda",
     "sm89_triton",
     "tilelang",
     "aiter",
@@ -3470,18 +3471,43 @@ class ServerArgs:
             self.dsa_prefill_backend,
             self.dsa_decode_backend,
         )
+        requested_sm89_cuda = "sm89_cuda" in (
+            self.dsa_prefill_backend,
+            self.dsa_decode_backend,
+        )
         if requested_sm89_triton and not is_glm_sm89_target:
             raise ValueError(
                 "sm89_triton DSA backend is only supported for GLM DSA on SM89."
+            )
+        if requested_sm89_cuda and not is_glm_sm89_target:
+            raise ValueError(
+                "sm89_cuda DSA backend is only supported for GLM DSA on SM89."
             )
         if self.dsa_decode_backend == "sm89_triton":
             raise ValueError(
                 "sm89_triton DSA backend currently supports prefill only; "
                 "use fa3 or omit --dsa-decode-backend for decode."
             )
+        if self.dsa_prefill_backend == "sm89_cuda":
+            raise ValueError(
+                "sm89_cuda DSA backend currently supports decode only; "
+                "use fa3, sm89_triton, or omit --dsa-prefill-backend for prefill."
+            )
         if self.dsa_prefill_backend == "sm89_triton" and kv_cache_dtype != "fp8_e4m3":
             raise ValueError(
                 "sm89_triton DSA backend requires --kv-cache-dtype fp8_e4m3."
+            )
+        if self.dsa_decode_backend == "sm89_cuda" and kv_cache_dtype != "fp8_e4m3":
+            raise ValueError(
+                "sm89_cuda DSA backend requires --kv-cache-dtype fp8_e4m3."
+            )
+        if (
+            self.dsa_decode_backend == "sm89_cuda"
+            and self.speculative_algorithm is not None
+        ):
+            raise ValueError(
+                "sm89_cuda DSA decode does not support speculative/MTP modes; "
+                "TARGET_VERIFY and DRAFT_EXTEND_V2 routing is not implemented."
             )
 
         if is_glm_sm89_target:
