@@ -213,3 +213,57 @@ def sm89_sparse_mla_prefill_cuda(
         block_n=block_n,
         cuda_impl=cuda_impl,
     )
+
+
+def sm89_sparse_mla_decode_cuda(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    sm_scale: float,
+    logit_cap: float,
+    v_head_dim: int,
+) -> torch.Tensor:
+    if q_nope.ndim != 3:
+        raise ValueError("sm89_cuda decode requires rank-3 q_nope.")
+    batch = q_nope.shape[0]
+    tensors = (q_nope, q_rope, kv_cache, page_table, cache_seqlens)
+    if any(t.device != q_nope.device for t in tensors):
+        raise ValueError("sm89_cuda decode tensors must share one CUDA device.")
+    if not q_nope.is_cuda or q_nope.dtype != torch.bfloat16:
+        raise ValueError("sm89_cuda decode requires CUDA BF16 q_nope.")
+    if not (1 <= q_nope.shape[1] <= 64) or q_nope.shape[-1] != 512:
+        raise ValueError("sm89_cuda decode requires q_nope=[B,H,512].")
+    if q_rope.dtype != torch.bfloat16 or q_rope.shape != (*q_nope.shape[:2], 64):
+        raise ValueError("sm89_cuda decode requires q_rope=[B,H,64].")
+    if (
+        page_table.dtype != torch.int32
+        or page_table.ndim != 2
+        or page_table.shape[0] != batch
+        or not (1 <= page_table.shape[1] <= 4096)
+    ):
+        raise ValueError("sm89_cuda decode requires page_table=[B,topk].")
+    if cache_seqlens.dtype != torch.int32 or cache_seqlens.shape != (batch,):
+        raise ValueError("sm89_cuda decode requires cache_seqlens=[B].")
+    if (
+        kv_cache.ndim != 3
+        or kv_cache.shape[1] != 1
+        or kv_cache.dtype != torch.float8_e4m3fn
+        or kv_cache.shape[-1] != 656
+    ):
+        raise ValueError("sm89_cuda decode requires packed FP8 E4M3 KV width 656.")
+    if v_head_dim != 512:
+        raise ValueError("sm89_cuda decode requires v_head_dim=512.")
+    return sm89_sparse_mla_prefill_cuda(
+        q_nope=q_nope,
+        q_rope=q_rope,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        sm_scale=sm_scale,
+        logit_cap=logit_cap,
+        v_head_dim=v_head_dim,
+        block_n=32,
+        cuda_impl="tensorcore",
+    )

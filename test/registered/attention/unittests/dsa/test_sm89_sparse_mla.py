@@ -874,6 +874,258 @@ class TestSm89SparseMlaBackendDispatch(unittest.TestCase):
         backend._forward_torch_mla.assert_called_once()
 
 
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestSm89SparseMlaDecodeCuda(unittest.TestCase):
+    _SM_SCALE = 1.0 / (512 + 64) ** 0.5
+
+    def _make_decode_case(self, batch, row_lens, seed):
+        self.assertEqual(len(row_lens), batch)
+        torch.manual_seed(seed)
+        device = torch.device("cuda")
+        topk = 2048
+        pool_size = 4096
+
+        q_nope = torch.randn(
+            batch, 32, 1024, device=device, dtype=torch.float32
+        ).to(torch.bfloat16)[..., ::2]
+        q_rope = torch.randn(
+            batch, 32, 128, device=device, dtype=torch.float32
+        ).to(torch.bfloat16)[..., ::2]
+        dequant_kv_cache = torch.randn(
+            pool_size, 1, 576, device=device, dtype=torch.float32
+        ).to(torch.bfloat16)
+        page_table = torch.full(
+            (batch, topk), -1, device=device, dtype=torch.int32
+        )
+        shuffled_slots = torch.randperm(
+            pool_size, device=device, dtype=torch.int32
+        ).repeat(2)
+        offset = 0
+        for row, row_len in enumerate(row_lens):
+            if row_len:
+                page_table[row, :row_len] = shuffled_slots[
+                    offset : offset + row_len
+                ]
+                offset = (offset + row_len) % pool_size
+
+        from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
+
+        kv_cache = quantize_k_cache(
+            dequant_kv_cache.view(pool_size, 1, 1, -1)
+        ).view(pool_size, 1, 656)
+        return {
+            "q_nope": q_nope,
+            "q_rope": q_rope,
+            "kv_cache": kv_cache,
+            "page_table": page_table,
+            "cache_seqlens": torch.tensor(
+                row_lens, device=device, dtype=torch.int32
+            ),
+        }
+
+    def _assert_matches_reference(self, case, logit_cap):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_decode_cuda,
+            sm89_sparse_mla_prefill_reference,
+        )
+
+        expected = sm89_sparse_mla_prefill_reference(
+            case["q_nope"],
+            case["q_rope"],
+            case["kv_cache"],
+            case["page_table"],
+            case["cache_seqlens"],
+            self._SM_SCALE,
+            logit_cap,
+            512,
+        )
+        actual = sm89_sparse_mla_decode_cuda(
+            case["q_nope"],
+            case["q_rope"],
+            case["kv_cache"],
+            case["page_table"],
+            case["cache_seqlens"],
+            self._SM_SCALE,
+            logit_cap,
+            512,
+        )
+        self.assertEqual(actual.shape, case["q_nope"].shape)
+        diff = (actual.float() - expected.float()).abs()
+        nonempty = case["cache_seqlens"] > 0
+        self.assertLessEqual(diff[nonempty].max().item(), 5e-2)
+        self.assertLessEqual(diff[nonempty].mean().item(), 5e-3)
+        cosine = torch.nn.functional.cosine_similarity(
+            actual[nonempty].float().flatten(),
+            expected[nonempty].float().flatten(),
+            dim=0,
+        ).item()
+        self.assertGreaterEqual(cosine, 0.995)
+        empty = ~nonempty
+        if empty.any():
+            self.assertTrue(
+                torch.equal(actual[empty], torch.zeros_like(actual[empty]))
+            )
+
+    def test_decode_cuda_wrapper_forces_tensorcore(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla
+
+        q_nope = torch.zeros(2, 32, 512, device="cuda", dtype=torch.bfloat16)
+        q_rope = torch.zeros(2, 32, 64, device="cuda", dtype=torch.bfloat16)
+        kv = torch.zeros(8, 1, 656, device="cuda", dtype=torch.float8_e4m3fn)
+        pages = torch.zeros(2, 4, device="cuda", dtype=torch.int32)
+        lengths = torch.full((2,), 4, device="cuda", dtype=torch.int32)
+        sentinel = torch.ones_like(q_nope)
+        with patch.object(
+            sm89_sparse_mla, "sm89_sparse_mla_prefill_cuda", return_value=sentinel
+        ) as op:
+            out = sm89_sparse_mla.sm89_sparse_mla_decode_cuda(
+                q_nope, q_rope, kv, pages, lengths, 0.0416666667, 0.0, 512
+            )
+        self.assertIs(out, sentinel)
+        self.assertEqual(
+            op.call_args.kwargs,
+            {
+                "q_nope": q_nope,
+                "q_rope": q_rope,
+                "kv_cache": kv,
+                "page_table": pages,
+                "cache_seqlens": lengths,
+                "sm_scale": 0.0416666667,
+                "logit_cap": 0.0,
+                "v_head_dim": 512,
+                "block_n": 32,
+                "cuda_impl": "tensorcore",
+            },
+        )
+
+    def test_decode_cuda_matches_reference_for_batch_shapes_and_softcaps(self):
+        row_lens_by_batch = {
+            1: [1],
+            2: [0, 64],
+            8: [0, 1, 64, 2048, 1, 64, 2048, 1],
+        }
+        for batch, row_lens in row_lens_by_batch.items():
+            case = self._make_decode_case(batch, row_lens, seed=1000 + batch)
+            self.assertFalse(case["q_nope"].is_contiguous())
+            for logit_cap in (0.0, 30.0):
+                with self.subTest(batch=batch, logit_cap=logit_cap):
+                    self._assert_matches_reference(case, logit_cap)
+        torch.cuda.synchronize()
+
+    def test_decode_cuda_generic_path_is_stream_safe_and_non_aliasing(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_decode_cuda,
+            sm89_sparse_mla_prefill_reference,
+        )
+
+        case_a = self._make_decode_case(2, [0, 2048], seed=201)
+        case_b = self._make_decode_case(2, [1, 64], seed=202)
+        inputs_ready = torch.cuda.Event()
+        inputs_ready.record()
+        done_a = torch.cuda.Event()
+        done_b = torch.cuda.Event()
+        stream_a = torch.cuda.Stream()
+        stream_b = torch.cuda.Stream()
+
+        with torch.cuda.stream(stream_a):
+            stream_a.wait_event(inputs_ready)
+            expected_a = sm89_sparse_mla_prefill_reference(
+                **case_a,
+                sm_scale=self._SM_SCALE,
+                logit_cap=30.0,
+                v_head_dim=512,
+            )
+            actual_a = sm89_sparse_mla_decode_cuda(
+                **case_a,
+                sm_scale=self._SM_SCALE,
+                logit_cap=30.0,
+                v_head_dim=512,
+            )
+            done_a.record(stream_a)
+        with torch.cuda.stream(stream_b):
+            stream_b.wait_event(inputs_ready)
+            expected_b = sm89_sparse_mla_prefill_reference(
+                **case_b,
+                sm_scale=self._SM_SCALE,
+                logit_cap=0.0,
+                v_head_dim=512,
+            )
+            actual_b = sm89_sparse_mla_decode_cuda(
+                **case_b,
+                sm_scale=self._SM_SCALE,
+                logit_cap=0.0,
+                v_head_dim=512,
+            )
+            done_b.record(stream_b)
+        torch.cuda.current_stream().wait_event(done_a)
+        torch.cuda.current_stream().wait_event(done_b)
+        torch.cuda.synchronize()
+
+        for actual, expected, case in (
+            (actual_a, expected_a, case_a),
+            (actual_b, expected_b, case_b),
+        ):
+            nonempty = case["cache_seqlens"] > 0
+            self.assertTrue(
+                torch.allclose(
+                    actual[nonempty], expected[nonempty], atol=5e-2, rtol=5e-3
+                )
+            )
+            empty = ~nonempty
+            if empty.any():
+                self.assertTrue(
+                    torch.equal(actual[empty], torch.zeros_like(actual[empty]))
+                )
+        self.assertNotEqual(
+            actual_a.untyped_storage().data_ptr(),
+            actual_b.untyped_storage().data_ptr(),
+        )
+
+    def test_decode_cuda_rejects_invalid_contracts_before_kernel_call(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla
+
+        case = self._make_decode_case(2, [1, 64], seed=300)
+        invalid_cases = {
+            "q_nope_dtype": {"q_nope": case["q_nope"].float()},
+            "q_rope_dtype": {"q_rope": case["q_rope"].float()},
+            "q_nope_rank": {"q_nope": case["q_nope"].unsqueeze(0)},
+            "page_table_dtype": {"page_table": case["page_table"].long()},
+            "cache_seqlens_dtype": {
+                "cache_seqlens": case["cache_seqlens"].long()
+            },
+            "kv_cache_dtype": {"kv_cache": case["kv_cache"].bfloat16()},
+            "device": {"q_rope": case["q_rope"].cpu()},
+            "head_count": {
+                "q_nope": torch.zeros(2, 65, 512, device="cuda", dtype=torch.bfloat16),
+                "q_rope": torch.zeros(2, 65, 64, device="cuda", dtype=torch.bfloat16),
+            },
+            "topk_width": {
+                "page_table": torch.zeros(2, 4097, device="cuda", dtype=torch.int32)
+            },
+            "kv_width": {
+                "kv_cache": torch.zeros(
+                    4096, 1, 655, device="cuda", dtype=torch.float8_e4m3fn
+                )
+            },
+            "row_length_shape": {
+                "cache_seqlens": torch.ones(2, 1, device="cuda", dtype=torch.int32)
+            },
+        }
+        with patch.object(sm89_sparse_mla, "sm89_sparse_mla_prefill_cuda") as op:
+            for name, replacements in invalid_cases.items():
+                args = case | replacements
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    ValueError, "sm89_cuda decode"
+                ):
+                    sm89_sparse_mla.sm89_sparse_mla_decode_cuda(
+                        **args,
+                        sm_scale=self._SM_SCALE,
+                        logit_cap=0.0,
+                        v_head_dim=512,
+                    )
+        op.assert_not_called()
+
+
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
 class TestSm89SparseMlaTriton(unittest.TestCase):
     def _make_triton_case(self, total_q, topk):
