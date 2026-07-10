@@ -315,6 +315,7 @@ DSA_CHOICES = [
     "flashmla_kv",
     "flashmla_auto",
     "fa3",
+    "sm89_triton",
     "tilelang",
     "aiter",
     "trtllm",
@@ -3462,9 +3463,28 @@ class ServerArgs:
         user_set_decode = self.dsa_decode_backend is not None
         self.enable_glm_dsa_sm89_fallback = False
 
-        if is_glm_dsa_sm89_fallback_target(
+        is_glm_sm89_target = is_glm_dsa_sm89_fallback_target(
             model_arch, capability=(major, minor) if minor is not None else None
-        ):
+        )
+        requested_sm89_triton = "sm89_triton" in (
+            self.dsa_prefill_backend,
+            self.dsa_decode_backend,
+        )
+        if requested_sm89_triton and not is_glm_sm89_target:
+            raise ValueError(
+                "sm89_triton DSA backend is only supported for GLM DSA on SM89."
+            )
+        if self.dsa_decode_backend == "sm89_triton":
+            raise ValueError(
+                "sm89_triton DSA backend currently supports prefill only; "
+                "use fa3 or omit --dsa-decode-backend for decode."
+            )
+        if self.dsa_prefill_backend == "sm89_triton" and kv_cache_dtype != "fp8_e4m3":
+            raise ValueError(
+                "sm89_triton DSA backend requires --kv-cache-dtype fp8_e4m3."
+            )
+
+        if is_glm_sm89_target:
             explicit_unsupported = [
                 backend
                 for backend in (self.dsa_prefill_backend, self.dsa_decode_backend)

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.srt.layers.attention.dsa.sm89_debug import profile_region
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_compiler_backend
@@ -351,38 +352,50 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         """
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 
-        x = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
+        with profile_region("kt_ep.apply.total"):
+            x = dispatch_output.hidden_states
+            topk_output = dispatch_output.topk_output
 
-        # Step 1: Submit CPU expert computation (non-blocking)
-        if self.tp_rank == 0:
-            self.submit(layer, dispatch_output)
+            # Step 1: Submit CPU expert computation (non-blocking)
+            if self.tp_rank == 0:
+                with profile_region("kt_ep.submit"):
+                    self.submit(layer, dispatch_output)
 
-        if self.num_gpu_experts <= 0:
-            return StandardCombineInput(hidden_states=self.sync(x))
+            if self.num_gpu_experts <= 0:
+                with profile_region("kt_ep.sync"):
+                    cpu_output = self.sync(x)
+                return StandardCombineInput(hidden_states=cpu_output)
 
-        # Step 2: Prepare GPU computation by masking CPU expert IDs
-        # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
-        topk_ids = topk_output.topk_ids
-        masked_topk_ids = mask_cpu_expert_ids(topk_ids, self.num_gpu_experts)
+            # Step 2: Prepare GPU computation by masking CPU expert IDs
+            # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
+            with profile_region("kt_ep.mask_gpu_experts"):
+                topk_ids = topk_output.topk_ids
+                masked_topk_ids = mask_cpu_expert_ids(
+                    topk_ids, self.num_gpu_experts
+                )
 
-        # Create modified dispatch output for GPU computation
-        masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
-        masked_dispatch_output = dispatch_output._replace(
-            topk_output=masked_topk_output
-        )
+                # Create modified dispatch output for GPU computation
+                masked_topk_output = topk_output._replace(topk_ids=masked_topk_ids)
+                masked_dispatch_output = dispatch_output._replace(
+                    topk_output=masked_topk_output
+                )
 
-        # Step 3: Execute GPU expert computation (any quantization method)
-        # This runs in parallel with CPU computation
-        gpu_combine_input = self.gpu_method.apply(layer, masked_dispatch_output)
+            # Step 3: Execute GPU expert computation (any quantization method)
+            # This runs in parallel with CPU computation
+            with profile_region("kt_ep.gpu_apply"):
+                gpu_combine_input = self.gpu_method.apply(
+                    layer, masked_dispatch_output
+                )
 
-        # Step 4: Synchronize CPU results and merge with GPU results
-        output = gpu_combine_input.hidden_states
-        if self.tp_rank == 0:
-            cpu_output = self.sync(x)
-            output = output + cpu_output
+            # Step 4: Synchronize CPU results and merge with GPU results
+            output = gpu_combine_input.hidden_states
+            if self.tp_rank == 0:
+                with profile_region("kt_ep.sync"):
+                    cpu_output = self.sync(x)
+                with profile_region("kt_ep.merge_cpu_gpu"):
+                    output = output + cpu_output
 
-        return StandardCombineInput(hidden_states=output)
+            return StandardCombineInput(hidden_states=output)
 
     def __getattr__(self, name: str):
         """Delegate attribute access to the wrapped GPU method.

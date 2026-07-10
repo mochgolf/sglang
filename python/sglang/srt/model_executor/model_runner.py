@@ -120,6 +120,11 @@ from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
     attn_backend_wrapper,
 )
+from sglang.srt.layers.attention.dsa.sm89_debug import (
+    cuda_timer,
+    glm_dsa_sm89_profile_enabled,
+    nvtx_range,
+)
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import (
@@ -2985,6 +2990,33 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         return output
 
     def _forward_raw(
+        self,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool = False,
+        split_forward_count: int = 1,
+    ) -> ModelRunnerOutput:
+        profile = glm_dsa_sm89_profile_enabled()
+        if not profile:
+            return self._forward_raw_impl(
+                forward_batch,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+
+        with (
+            nvtx_range("model_runner.forward_raw.total"),
+            cuda_timer("model_runner.forward_raw.total", profile),
+        ):
+            return self._forward_raw_impl(
+                forward_batch,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+
+    def _forward_raw_impl(
         self,
         forward_batch: ForwardBatch,
         pp_proxy_tensors: Optional[PPProxyTensors],

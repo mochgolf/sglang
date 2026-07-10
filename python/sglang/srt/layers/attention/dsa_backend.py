@@ -307,7 +307,14 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse",
+    "flashmla_kv",
+    "flashmla_auto",
+    "fa3",
+    "sm89_triton",
+    "tilelang",
+    "aiter",
+    "trtllm",
 ]
 
 
@@ -332,6 +339,12 @@ class DeepseekSparseAttnBackend(
         )
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        self.model_architectures = (
+            getattr(model_runner.model_config.hf_config, "architectures", None) or []
+        )
+        self.model_arch = (
+            self.model_architectures[0] if self.model_architectures else None
+        )
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -363,6 +376,7 @@ class DeepseekSparseAttnBackend(
             getattr(model_runner.server_args, "enable_glm_dsa_sm89_fallback", False)
         )
         self._logged_glm_sm89_effective_torch_mla = False
+        self._logged_glm_sm89_effective_sm89_triton = False
         self._dumped_glm_sm89_torch_mla_shapes = False
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -423,6 +437,7 @@ class DeepseekSparseAttnBackend(
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self._validate_sm89_triton_backend_config()
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
@@ -436,6 +451,29 @@ class DeepseekSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
+
+    def _validate_sm89_triton_backend_config(self) -> None:
+        if self.dsa_decode_impl == "sm89_triton":
+            raise ValueError(
+                "sm89_triton DSA backend currently supports prefill only; "
+                "use fa3 for decode."
+            )
+        if self.dsa_prefill_impl != "sm89_triton":
+            return
+        if self.model_arch not in {"GlmMoeDsaForCausalLM", "GlmMoeDsaModel"}:
+            raise ValueError(
+                "sm89_triton DSA backend is only supported for GLM DSA models."
+            )
+        if self.device_capability != (8, 9):
+            raise ValueError(
+                "sm89_triton DSA backend is only supported on SM89 devices; "
+                f"got capability={self.device_capability}."
+            )
+        if self.kv_cache_dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "sm89_triton DSA backend requires fp8_e4m3 KV cache dtype; "
+                f"got {self.kv_cache_dtype}."
+            )
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -1740,6 +1778,19 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
                 layer_id=getattr(layer, "layer_id", None),
             )
+        elif dsa_impl == "sm89_triton":
+            return self._forward_sm89_triton(
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                q_nope=q_nope,
+                page_table=page_table_1,
+                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                page_size=1,
+                layer_id=getattr(layer, "layer_id", None),
+            )
         elif dsa_impl == "aiter":
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
@@ -1933,7 +1984,7 @@ class DeepseekSparseAttnBackend(
             getattr(self, "use_glm_sm89_dsa_fallback", False)
             and self.device_sm_major < 9
         ):
-            if not self._logged_glm_sm89_effective_torch_mla:
+            if not getattr(self, "_logged_glm_sm89_effective_torch_mla", False):
                 logger.warning(
                     "GLM DSA SM89 effective backend is torch_mla: requested fa3, "
                     "but device_sm_major=%s < 9 requires the correctness fallback.",
@@ -1977,6 +2028,86 @@ class DeepseekSparseAttnBackend(
             num_splits=self.num_splits,
         )
         return o  # type: ignore
+
+    def _forward_sm89_triton(
+        self,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        q_nope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        sm_scale: float,
+        logit_cap: float,
+        page_size: int,
+        layer_id: Optional[int] = None,
+    ) -> torch.Tensor:
+        if page_size != 1:
+            raise ValueError("sm89_triton DSA prefill requires page_size=1.")
+        if self.model_arch not in {"GlmMoeDsaForCausalLM", "GlmMoeDsaModel"}:
+            raise ValueError(
+                "sm89_triton DSA backend is only supported for GLM DSA models."
+            )
+        if self.device_capability != (8, 9):
+            raise ValueError(
+                "sm89_triton DSA backend is only supported on SM89 devices; "
+                f"got capability={self.device_capability}."
+            )
+        if kv_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "sm89_triton DSA backend requires FP8 E4M3 KV cache; "
+                f"got {kv_cache.dtype}."
+            )
+        if v_head_dim != 512 or q_nope.shape[-1] != 512 or q_rope.shape[-1] != 64:
+            raise ValueError(
+                "sm89_triton DSA backend currently requires GLM dimensions "
+                f"v_head_dim=512, q_nope_dim=512, q_rope_dim=64; got "
+                f"{v_head_dim=}, q_nope_dim={q_nope.shape[-1]}, "
+                f"q_rope_dim={q_rope.shape[-1]}."
+            )
+
+        if not getattr(self, "_logged_glm_sm89_effective_sm89_triton", False):
+            logger.info(
+                "GLM DSA SM89 effective prefill backend is sm89_triton."
+            )
+            self._logged_glm_sm89_effective_sm89_triton = True
+
+        try:
+            from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+                sm89_sparse_mla_prefill_triton,
+            )
+
+            return sm89_sparse_mla_prefill_triton(
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                sm_scale=sm_scale,
+                logit_cap=logit_cap,
+                v_head_dim=v_head_dim,
+            )
+        except Exception:
+            if os.environ.get("SGLANG_GLM_DSA_SM89_ALLOW_TORCH_FALLBACK") != "1":
+                raise
+            logger.exception(
+                "GLM DSA SM89 sm89_triton prefill failed at layer_id=%s; "
+                "falling back to torch_mla because "
+                "SGLANG_GLM_DSA_SM89_ALLOW_TORCH_FALLBACK=1.",
+                layer_id,
+            )
+            return self._forward_torch_mla(
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=v_head_dim,
+                q_nope=q_nope,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                sm_scale=sm_scale,
+                logit_cap=logit_cap,
+                page_size=page_size,
+                layer_id=layer_id,
+            )
 
     def _forward_torch_mla(
         self,
@@ -2082,7 +2213,11 @@ class DeepseekSparseAttnBackend(
 
                     chunk_out = chunk_out.squeeze(2)
                     if empty_rows.any():
-                        chunk_out[empty_rows].zero_()
+                        chunk_out = torch.where(
+                            empty_rows[:, None, None],
+                            torch.zeros_like(chunk_out),
+                            chunk_out,
+                        )
                     out[start:end] = chunk_out
 
             return out

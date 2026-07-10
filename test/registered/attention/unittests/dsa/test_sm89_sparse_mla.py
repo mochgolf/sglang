@@ -1,8 +1,9 @@
 import json
 import os
-import unittest
 import tempfile
+import unittest
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -95,6 +96,171 @@ class TestSm89SparseMlaDebugHelpers(unittest.TestCase):
 
         mock_event.assert_not_called()
         mock_print.assert_not_called()
+
+    def test_profile_region_disabled_skips_nvtx_and_timer(self):
+        from sglang.srt.layers.attention.dsa import sm89_debug
+
+        with patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_PROFILE": "0"}, clear=True
+        ), patch.object(sm89_debug, "nvtx_range") as mock_nvtx, patch.object(
+            sm89_debug, "cuda_timer"
+        ) as mock_timer:
+            with sm89_debug.profile_region("moe.test"):
+                pass
+
+        mock_nvtx.assert_not_called()
+        mock_timer.assert_not_called()
+
+    def test_profile_region_enabled_wraps_nvtx_and_timer(self):
+        from sglang.srt.layers.attention.dsa import sm89_debug
+
+        events = []
+
+        @contextmanager
+        def fake_nvtx_range(name):
+            events.append(("nvtx_enter", name))
+            try:
+                yield
+            finally:
+                events.append(("nvtx_exit", name))
+
+        @contextmanager
+        def fake_cuda_timer(name, enabled):
+            events.append(("timer_enter", name, enabled))
+            try:
+                yield
+            finally:
+                events.append(("timer_exit", name, enabled))
+
+        with patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_PROFILE": "1"}, clear=True
+        ), patch.object(
+            sm89_debug, "nvtx_range", side_effect=fake_nvtx_range
+        ), patch.object(
+            sm89_debug, "cuda_timer", side_effect=fake_cuda_timer
+        ):
+            with sm89_debug.profile_region("moe.test"):
+                pass
+
+        self.assertEqual(
+            events,
+            [
+                ("nvtx_enter", "moe.test"),
+                ("timer_enter", "moe.test", True),
+                ("timer_exit", "moe.test", True),
+                ("nvtx_exit", "moe.test"),
+            ],
+        )
+
+
+class TestKTEPWrapperProfiling(unittest.TestCase):
+    def test_all_cpu_apply_profiles_submit_and_sync(self):
+        from sglang.srt.layers.moe import kt_ep_wrapper
+
+        method = object.__new__(kt_ep_wrapper.KTEPWrapperMethod)
+        method.tp_rank = 0
+        method.wrapper = object()
+        method.num_gpu_experts = 0
+        method.moe_runner_config = SimpleNamespace(activation="silu")
+        method.submit = MagicMock()
+
+        x = torch.zeros(2, 4)
+        cpu_out = torch.ones_like(x)
+        method.sync = MagicMock(return_value=cpu_out)
+        dispatch_output = SimpleNamespace(hidden_states=x, topk_output=object())
+
+        events = []
+
+        @contextmanager
+        def fake_profile_region(name, enabled=None):
+            events.append(("enter", name, enabled))
+            try:
+                yield
+            finally:
+                events.append(("exit", name, enabled))
+
+        with patch.object(
+            kt_ep_wrapper,
+            "profile_region",
+            side_effect=fake_profile_region,
+            create=True,
+        ):
+            output = method.apply(
+                layer=SimpleNamespace(), dispatch_output=dispatch_output
+            )
+
+        self.assertIs(output.hidden_states, cpu_out)
+        method.submit.assert_called_once()
+        method.sync.assert_called_once_with(x)
+        self.assertIn(("enter", "kt_ep.apply.total", None), events)
+        self.assertIn(("enter", "kt_ep.submit", None), events)
+        self.assertIn(("enter", "kt_ep.sync", None), events)
+
+
+class TestSm89SparseMlaForwardProfiling(unittest.TestCase):
+    def test_forward_raw_is_profiled_when_profile_env_enabled(self):
+        from sglang.srt.model_executor import model_runner
+
+        runner = object.__new__(model_runner.ModelRunner)
+        runner.device = "cuda"
+        runner.decode_cuda_graph_runner = None
+        runner.prefill_cuda_graph_runner = None
+        runner.eager_runner = SimpleNamespace(execute=MagicMock(return_value="logits"))
+        runner._prepare_eager_forward_batch = MagicMock()
+        runner.pp_group = SimpleNamespace(is_last_rank=False)
+        runner.attn_backend = object()
+
+        forward_mode = SimpleNamespace(
+            is_cpu_graph=lambda: False,
+            is_cuda_graph=lambda: False,
+            is_decode=lambda: False,
+            is_split_prefill=lambda: False,
+            is_extend=lambda include_draft_extend_v2=False: True,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=forward_mode,
+            global_num_tokens_cpu=None,
+        )
+        events = []
+
+        @contextmanager
+        def fake_nvtx_range(name):
+            events.append(("nvtx_enter", name))
+            try:
+                yield
+            finally:
+                events.append(("nvtx_exit", name))
+
+        @contextmanager
+        def fake_cuda_timer(name, enabled):
+            events.append(("timer_enter", name, enabled))
+            try:
+                yield
+            finally:
+                events.append(("timer_exit", name, enabled))
+
+        with patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_PROFILE": "1"}, clear=True
+        ), patch.object(
+            model_runner, "has_forward_context", return_value=True
+        ), patch.object(
+            model_runner, "nvtx_range", side_effect=fake_nvtx_range
+        ), patch.object(
+            model_runner, "cuda_timer", side_effect=fake_cuda_timer
+        ):
+            output = model_runner.ModelRunner._forward_raw(
+                runner,
+                forward_batch=forward_batch,
+                pp_proxy_tensors=None,
+            )
+
+        self.assertEqual(output.logits_output, "logits")
+        self.assertIn(("nvtx_enter", "model_runner.forward_raw.total"), events)
+        self.assertIn(("nvtx_exit", "model_runner.forward_raw.total"), events)
+        self.assertIn(
+            ("timer_enter", "model_runner.forward_raw.total", True), events
+        )
+        self.assertIn(("timer_exit", "model_runner.forward_raw.total", True), events)
 
 
 class TestSm89SparseMlaTimingInstrumentation(unittest.TestCase):
@@ -427,6 +593,896 @@ class TestSm89SparseMlaShapeDump(unittest.TestCase):
         self.assertEqual(
             backend._forward_torch_mla.call_args.kwargs["layer_id"], layer.layer_id
         )
+
+
+class TestSm89SparseMlaReference(unittest.TestCase):
+    def _make_reference_case(self, total_q, topk, row_lens_kind, dtype):
+        torch.manual_seed(total_q * 1009 + topk)
+        num_heads = 2
+        v_head_dim = 8
+        rope_dim = 4
+        q_shape = (total_q, num_heads, v_head_dim)
+        rope_shape = (total_q, num_heads, rope_dim)
+        kv_tokens = max(topk + total_q + 7, 16)
+
+        q_nope = torch.randn(q_shape, dtype=torch.float32).to(torch.bfloat16) * 0.125
+        q_rope = torch.randn(rope_shape, dtype=torch.float32).to(torch.bfloat16) * 0.125
+        dequant_kv_cache = (
+            torch.randn(kv_tokens, 1, v_head_dim + rope_dim, dtype=torch.float32).to(
+                torch.bfloat16
+            )
+            * 0.125
+        )
+
+        row_lens = []
+        for row in range(total_q):
+            if row_lens_kind == "all_full":
+                row_len = topk
+            elif row_lens_kind == "alternating":
+                choices = (topk, max(topk // 2, 1), 1)
+                row_len = choices[row % len(choices)]
+            elif row_lens_kind == "one_empty":
+                row_len = 0 if row == 0 else max(topk - (row % 5), 1)
+            else:
+                raise AssertionError(f"unknown row_lens_kind={row_lens_kind}")
+            row_lens.append(row_len)
+
+        page_table = torch.full((total_q, topk), -1, dtype=torch.int32)
+        for row, row_len in enumerate(row_lens):
+            if row_len == 0:
+                continue
+            token_ids = (torch.arange(row_len, dtype=torch.int32) * 3 + row * 7) % (
+                kv_tokens
+            )
+            page_table[row, :row_len] = token_ids
+
+        kv_cache = dequant_kv_cache
+        if dtype == torch.float8_e4m3fn:
+            kv_cache = torch.empty(kv_tokens, 1, 656, dtype=torch.float8_e4m3fn)
+
+        return {
+            "q_nope": q_nope,
+            "q_rope": q_rope,
+            "kv_cache": kv_cache,
+            "dequant_kv_cache": dequant_kv_cache,
+            "page_table": page_table,
+            "cache_seqlens": torch.tensor(row_lens, dtype=torch.int32),
+            "sm_scale": 1.0 / (v_head_dim + rope_dim) ** 0.5,
+            "logit_cap": 0.0,
+            "v_head_dim": v_head_dim,
+        }
+
+    def test_reference_synthetic_shapes_are_finite(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_prefill_reference,
+        )
+
+        for total_q in (1, 17, 128, 257):
+            for topk in (64, 256, 2048):
+                for row_lens_kind in ("all_full", "alternating", "one_empty"):
+                    for dtype in (torch.bfloat16, torch.float8_e4m3fn):
+                        for logit_cap in (0.0, 30.0):
+                            with self.subTest(
+                                total_q=total_q,
+                                topk=topk,
+                                row_lens_kind=row_lens_kind,
+                                dtype=dtype,
+                                logit_cap=logit_cap,
+                            ):
+                                case = self._make_reference_case(
+                                    total_q, topk, row_lens_kind, dtype
+                                )
+                                if dtype == torch.float8_e4m3fn:
+                                    patch_target = (
+                                        "sglang.srt.layers.attention.dsa."
+                                        "dequant_k_cache.dequantize_k_cache"
+                                    )
+                                    with patch(
+                                        patch_target,
+                                        return_value=case["dequant_kv_cache"],
+                                    ) as mock_dequant:
+                                        out = sm89_sparse_mla_prefill_reference(
+                                            case["q_nope"],
+                                            case["q_rope"],
+                                            case["kv_cache"],
+                                            case["page_table"],
+                                            case["cache_seqlens"],
+                                            case["sm_scale"],
+                                            logit_cap,
+                                            case["v_head_dim"],
+                                        )
+                                    mock_dequant.assert_called_once_with(
+                                        case["kv_cache"]
+                                    )
+                                else:
+                                    out = sm89_sparse_mla_prefill_reference(
+                                        case["q_nope"],
+                                        case["q_rope"],
+                                        case["kv_cache"],
+                                        case["page_table"],
+                                        case["cache_seqlens"],
+                                        case["sm_scale"],
+                                        logit_cap,
+                                        case["v_head_dim"],
+                                    )
+
+                                self.assertEqual(out.shape, case["q_nope"].shape)
+                                self.assertFalse(torch.isnan(out).any().item())
+                                self.assertFalse(torch.isinf(out).any().item())
+                                empty_rows = case["cache_seqlens"] == 0
+                                if empty_rows.any():
+                                    self.assertTrue(
+                                        torch.equal(
+                                            out[empty_rows],
+                                            torch.zeros_like(out[empty_rows]),
+                                        )
+                                    )
+
+    def test_reference_matches_torch_mla_fallback(self):
+        from sglang.srt.layers.attention import dsa_backend
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_prefill_reference,
+        )
+
+        case = self._make_reference_case(17, 64, "one_empty", torch.bfloat16)
+        backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
+        backend._dumped_glm_sm89_torch_mla_shapes = False
+
+        with patch.dict("os.environ", {}, clear=True):
+            for logit_cap in (0.0, 30.0):
+                with self.subTest(logit_cap=logit_cap):
+                    reference = sm89_sparse_mla_prefill_reference(
+                        case["q_nope"],
+                        case["q_rope"],
+                        case["kv_cache"],
+                        case["page_table"],
+                        case["cache_seqlens"],
+                        case["sm_scale"],
+                        logit_cap,
+                        case["v_head_dim"],
+                    )
+                    fallback = dsa_backend.DeepseekSparseAttnBackend._forward_torch_mla(
+                        backend,
+                        q_rope=case["q_rope"],
+                        kv_cache=case["kv_cache"],
+                        v_head_dim=case["v_head_dim"],
+                        q_nope=case["q_nope"],
+                        page_table=case["page_table"],
+                        cache_seqlens=case["cache_seqlens"],
+                        sm_scale=case["sm_scale"],
+                        logit_cap=logit_cap,
+                        page_size=1,
+                    )
+
+                    self.assertTrue(torch.allclose(reference, fallback, atol=0, rtol=0))
+
+
+class TestSm89SparseMlaBackendDispatch(unittest.TestCase):
+    def _make_backend(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        backend = object.__new__(dsa_backend.DeepseekSparseAttnBackend)
+        backend.model_arch = "GlmMoeDsaForCausalLM"
+        backend.device_capability = (8, 9)
+        backend._dumped_glm_sm89_torch_mla_shapes = False
+        return backend
+
+    def _make_inputs(self):
+        q_nope = torch.zeros(2, 1, 512, dtype=torch.bfloat16)
+        q_rope = torch.zeros(2, 1, 64, dtype=torch.bfloat16)
+        kv_cache = torch.zeros(4, 1, 656, dtype=torch.float8_e4m3fn)
+        page_table = torch.tensor([[0, 1, -1], [2, -1, -1]], dtype=torch.int32)
+        cache_seqlens = torch.tensor([2, 1], dtype=torch.int32)
+        return q_nope, q_rope, kv_cache, page_table, cache_seqlens
+
+    def test_forward_sm89_triton_calls_kernel(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        backend = self._make_backend()
+        q_nope, q_rope, kv_cache, page_table, cache_seqlens = self._make_inputs()
+        sentinel = torch.zeros_like(q_nope)
+
+        with patch(
+            "sglang.srt.layers.attention.dsa.sm89_sparse_mla."
+            "sm89_sparse_mla_prefill_triton",
+            return_value=sentinel,
+        ) as mock_kernel:
+            out = dsa_backend.DeepseekSparseAttnBackend._forward_sm89_triton(
+                backend,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=512,
+                q_nope=q_nope,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                sm_scale=1.0,
+                logit_cap=0.0,
+                page_size=1,
+                layer_id=3,
+            )
+
+        self.assertIs(out, sentinel)
+        mock_kernel.assert_called_once_with(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            sm_scale=1.0,
+            logit_cap=0.0,
+            v_head_dim=512,
+        )
+
+    def test_forward_sm89_triton_kernel_error_requires_explicit_fallback(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        backend = self._make_backend()
+        q_nope, q_rope, kv_cache, page_table, cache_seqlens = self._make_inputs()
+
+        with patch.dict("os.environ", {}, clear=True), patch(
+            "sglang.srt.layers.attention.dsa.sm89_sparse_mla."
+            "sm89_sparse_mla_prefill_triton",
+            side_effect=RuntimeError("kernel failed"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "kernel failed"):
+                dsa_backend.DeepseekSparseAttnBackend._forward_sm89_triton(
+                    backend,
+                    q_rope=q_rope,
+                    kv_cache=kv_cache,
+                    v_head_dim=512,
+                    q_nope=q_nope,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    sm_scale=1.0,
+                    logit_cap=0.0,
+                    page_size=1,
+                    layer_id=3,
+                )
+
+    def test_forward_sm89_triton_allows_env_gated_torch_fallback(self):
+        from sglang.srt.layers.attention import dsa_backend
+
+        backend = self._make_backend()
+        q_nope, q_rope, kv_cache, page_table, cache_seqlens = self._make_inputs()
+        sentinel = torch.ones_like(q_nope)
+        backend._forward_torch_mla = MagicMock(return_value=sentinel)
+
+        with patch.dict(
+            "os.environ",
+            {"SGLANG_GLM_DSA_SM89_ALLOW_TORCH_FALLBACK": "1"},
+            clear=True,
+        ), patch(
+            "sglang.srt.layers.attention.dsa.sm89_sparse_mla."
+            "sm89_sparse_mla_prefill_triton",
+            side_effect=RuntimeError("kernel failed"),
+        ):
+            out = dsa_backend.DeepseekSparseAttnBackend._forward_sm89_triton(
+                backend,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=512,
+                q_nope=q_nope,
+                page_table=page_table,
+                cache_seqlens=cache_seqlens,
+                sm_scale=1.0,
+                logit_cap=0.0,
+                page_size=1,
+                layer_id=3,
+            )
+
+        self.assertIs(out, sentinel)
+        backend._forward_torch_mla.assert_called_once()
+
+
+@unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+class TestSm89SparseMlaTriton(unittest.TestCase):
+    def _make_triton_case(self, total_q, topk):
+        torch.manual_seed(total_q * 4099 + topk)
+        device = torch.device("cuda")
+        num_heads = 1
+        v_head_dim = 512
+        rope_dim = 64
+        kv_tokens = topk + total_q + 17
+
+        q_nope = (
+            torch.randn(
+                total_q, num_heads, v_head_dim, device=device, dtype=torch.float32
+            ).to(torch.bfloat16)
+            * 0.125
+        )
+        q_rope = (
+            torch.randn(
+                total_q, num_heads, rope_dim, device=device, dtype=torch.float32
+            ).to(torch.bfloat16)
+            * 0.125
+        )
+        dequant_kv_cache = (
+            torch.randn(kv_tokens, 1, v_head_dim + rope_dim, device=device).to(
+                torch.bfloat16
+            )
+            * 0.125
+        )
+
+        page_table = torch.full((total_q, topk), -1, device=device, dtype=torch.int32)
+        row_lens = []
+        for row in range(total_q):
+            if row == 0:
+                row_len = 0
+            elif row % 3 == 0:
+                row_len = max(topk // 2, 1)
+            else:
+                row_len = topk
+            row_lens.append(row_len)
+            if row_len > 0:
+                token_ids = (torch.arange(row_len, device=device, dtype=torch.int32) * 5 + row * 11) % (
+                    kv_tokens
+                )
+                page_table[row, :row_len] = token_ids
+
+        from sglang.srt.layers.attention.dsa.quant_k_cache import quantize_k_cache
+
+        kv_cache = quantize_k_cache(dequant_kv_cache.view(kv_tokens, 1, 1, -1)).view(
+            kv_tokens, 1, 656
+        )
+
+        return {
+            "q_nope": q_nope,
+            "q_rope": q_rope,
+            "kv_cache": kv_cache,
+            "page_table": page_table,
+            "cache_seqlens": torch.tensor(row_lens, device=device, dtype=torch.int32),
+            "sm_scale": 1.0 / (v_head_dim + rope_dim) ** 0.5,
+            "v_head_dim": v_head_dim,
+        }
+
+    def test_triton_matches_reference(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_prefill_reference,
+            sm89_sparse_mla_prefill_triton,
+        )
+
+        for total_q in (16, 64, 128):
+            for topk in (64, 256):
+                for logit_cap in (0.0, 30.0):
+                    with self.subTest(
+                        total_q=total_q, topk=topk, logit_cap=logit_cap
+                    ):
+                        case = self._make_triton_case(total_q, topk)
+                        expected = sm89_sparse_mla_prefill_reference(
+                            case["q_nope"],
+                            case["q_rope"],
+                            case["kv_cache"],
+                            case["page_table"],
+                            case["cache_seqlens"],
+                            case["sm_scale"],
+                            logit_cap,
+                            case["v_head_dim"],
+                        )
+                        actual = sm89_sparse_mla_prefill_triton(
+                            case["q_nope"],
+                            case["q_rope"],
+                            case["kv_cache"],
+                            case["page_table"],
+                            case["cache_seqlens"],
+                            case["sm_scale"],
+                            logit_cap,
+                            case["v_head_dim"],
+                        )
+                        torch.cuda.synchronize()
+
+                        expected_f = expected.float()
+                        actual_f = actual.float()
+                        diff = (actual_f - expected_f).abs()
+                        max_abs = diff.max().item()
+                        mean_abs = diff.mean().item()
+                        cosine = torch.nn.functional.cosine_similarity(
+                            actual_f.flatten(), expected_f.flatten(), dim=0
+                        ).item()
+
+                        self.assertLessEqual(max_abs, 5e-2)
+                        self.assertLessEqual(mean_abs, 5e-3)
+                        self.assertGreaterEqual(cosine, 0.995)
+                        empty_rows = case["cache_seqlens"] == 0
+                        self.assertTrue(
+                            torch.equal(
+                                actual[empty_rows],
+                                torch.zeros_like(actual[empty_rows]),
+                            )
+                        )
+
+    def test_cuda_backend_matches_reference_small_shape(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_prefill_cuda,
+            sm89_sparse_mla_prefill_reference,
+        )
+
+        case = self._make_triton_case(total_q=8, topk=32)
+        expected = sm89_sparse_mla_prefill_reference(
+            case["q_nope"],
+            case["q_rope"],
+            case["kv_cache"],
+            case["page_table"],
+            case["cache_seqlens"],
+            case["sm_scale"],
+            30.0,
+            case["v_head_dim"],
+        )
+        actual = sm89_sparse_mla_prefill_cuda(
+            case["q_nope"],
+            case["q_rope"],
+            case["kv_cache"],
+            case["page_table"],
+            case["cache_seqlens"],
+            case["sm_scale"],
+            30.0,
+            case["v_head_dim"],
+            block_n=32,
+        )
+        torch.cuda.synchronize()
+
+        diff = (actual.float() - expected.float()).abs()
+        self.assertLessEqual(diff.max().item(), 5e-2)
+        self.assertLessEqual(diff.mean().item(), 5e-3)
+        empty_rows = case["cache_seqlens"] == 0
+        self.assertTrue(
+            torch.equal(actual[empty_rows], torch.zeros_like(actual[empty_rows]))
+        )
+
+    def test_triton_entry_can_select_cuda_backend_with_env(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla
+
+        q_nope = torch.zeros(1, 1, 512, device="cuda", dtype=torch.bfloat16)
+        q_rope = torch.zeros(1, 1, 64, device="cuda", dtype=torch.bfloat16)
+        kv_cache = torch.zeros(1, 1, 656, device="cuda", dtype=torch.float8_e4m3fn)
+        page_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+        cache_seqlens = torch.ones(1, device="cuda", dtype=torch.int32)
+        sentinel = torch.ones_like(q_nope)
+
+        with patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_KERNEL": "cuda"}, clear=True
+        ), patch.object(
+            sm89_sparse_mla,
+            "sm89_sparse_mla_prefill_cuda",
+            return_value=sentinel,
+        ) as mock_cuda, patch.object(sm89_sparse_mla.logger, "info") as mock_info:
+            sm89_sparse_mla._logged_kernel_impls.clear()
+            actual = sm89_sparse_mla.sm89_sparse_mla_prefill_triton(
+                q_nope,
+                q_rope,
+                kv_cache,
+                page_table,
+                cache_seqlens,
+                1.0,
+                30.0,
+                512,
+                block_n=32,
+            )
+            second = sm89_sparse_mla.sm89_sparse_mla_prefill_triton(
+                q_nope,
+                q_rope,
+                kv_cache,
+                page_table,
+                cache_seqlens,
+                1.0,
+                30.0,
+                512,
+                block_n=32,
+            )
+
+        self.assertIs(actual, sentinel)
+        self.assertIs(second, sentinel)
+        self.assertEqual(mock_cuda.call_count, 2)
+        mock_cuda.assert_called_with(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            sm_scale=1.0,
+            logit_cap=30.0,
+            v_head_dim=512,
+            block_n=32,
+        )
+        mock_info.assert_called_once()
+        self.assertIn("uses %s implementation", mock_info.call_args.args[0])
+        self.assertEqual(mock_info.call_args.args[1], "cuda")
+        sm89_sparse_mla._logged_kernel_impls.clear()
+
+    def test_cuda_backend_is_profiled_when_profile_env_enabled(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla
+
+        q_nope = torch.zeros(1, 1, 512, device="cuda", dtype=torch.bfloat16)
+        q_rope = torch.zeros(1, 1, 64, device="cuda", dtype=torch.bfloat16)
+        kv_cache = torch.zeros(1, 1, 656, device="cuda", dtype=torch.float8_e4m3fn)
+        page_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+        cache_seqlens = torch.ones(1, device="cuda", dtype=torch.int32)
+        sentinel = torch.ones_like(q_nope)
+        events = []
+
+        @contextmanager
+        def fake_nvtx_range(name):
+            events.append(("nvtx_enter", name))
+            try:
+                yield
+            finally:
+                events.append(("nvtx_exit", name))
+
+        @contextmanager
+        def fake_cuda_timer(name, enabled):
+            events.append(("timer_enter", name, enabled))
+            try:
+                yield
+            finally:
+                events.append(("timer_exit", name, enabled))
+
+        with patch.dict(
+            os.environ,
+            {
+                "SGLANG_GLM_DSA_SM89_KERNEL": "cuda",
+                "SGLANG_GLM_DSA_SM89_PROFILE": "1",
+            },
+            clear=True,
+        ), patch.object(
+            sm89_sparse_mla,
+            "sm89_sparse_mla_prefill_cuda",
+            return_value=sentinel,
+        ), patch.object(
+            sm89_sparse_mla, "nvtx_range", side_effect=fake_nvtx_range
+        ), patch.object(
+            sm89_sparse_mla, "cuda_timer", side_effect=fake_cuda_timer
+        ):
+            actual = sm89_sparse_mla.sm89_sparse_mla_prefill_triton(
+                q_nope,
+                q_rope,
+                kv_cache,
+                page_table,
+                cache_seqlens,
+                1.0,
+                30.0,
+                512,
+                block_n=32,
+            )
+
+        self.assertIs(actual, sentinel)
+        self.assertIn(("nvtx_enter", "sm89_sparse_mla.cuda.total"), events)
+        self.assertIn(("nvtx_exit", "sm89_sparse_mla.cuda.total"), events)
+        self.assertIn(("timer_enter", "sm89_sparse_mla.cuda.total", True), events)
+        self.assertIn(("timer_exit", "sm89_sparse_mla.cuda.total", True), events)
+
+    def test_cuda_backend_skips_profile_context_when_profile_env_disabled(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla
+
+        q_nope = torch.zeros(1, 1, 512, device="cuda", dtype=torch.bfloat16)
+        q_rope = torch.zeros(1, 1, 64, device="cuda", dtype=torch.bfloat16)
+        kv_cache = torch.zeros(1, 1, 656, device="cuda", dtype=torch.float8_e4m3fn)
+        page_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+        cache_seqlens = torch.ones(1, device="cuda", dtype=torch.int32)
+        sentinel = torch.ones_like(q_nope)
+
+        with patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_KERNEL": "cuda"}, clear=True
+        ), patch.object(
+            sm89_sparse_mla,
+            "sm89_sparse_mla_prefill_cuda",
+            return_value=sentinel,
+        ), patch.object(
+            sm89_sparse_mla, "nvtx_range"
+        ) as mock_nvtx, patch.object(
+            sm89_sparse_mla, "cuda_timer"
+        ) as mock_timer:
+            actual = sm89_sparse_mla.sm89_sparse_mla_prefill_triton(
+                q_nope,
+                q_rope,
+                kv_cache,
+                page_table,
+                cache_seqlens,
+                1.0,
+                30.0,
+                512,
+                block_n=32,
+            )
+
+        self.assertIs(actual, sentinel)
+        mock_nvtx.assert_not_called()
+        mock_timer.assert_not_called()
+
+    def test_select_v_block_from_env(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_triton import (
+            select_sm89_sparse_mla_v_block,
+        )
+
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(select_sm89_sparse_mla_v_block(None), 64)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_V_BLOCK": "128"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_v_block(None), 128)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_V_BLOCK": "256"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_v_block(None), 256)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_V_BLOCK": "256"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_v_block(128), 128)
+
+    def test_select_v_block_rejects_unsupported_values(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_triton import (
+            select_sm89_sparse_mla_v_block,
+        )
+
+        with self.assertRaisesRegex(ValueError, "SGLANG_GLM_DSA_SM89_V_BLOCK"):
+            select_sm89_sparse_mla_v_block(96)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_V_BLOCK": "invalid"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "SGLANG_GLM_DSA_SM89_V_BLOCK"):
+                select_sm89_sparse_mla_v_block(None)
+
+    def test_select_block_n_from_env(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_triton import (
+            select_sm89_sparse_mla_block_n,
+        )
+
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(select_sm89_sparse_mla_block_n(None), 64)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_BLOCK_N": "32"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_block_n(None), 32)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_BLOCK_N": "128"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_block_n(None), 128)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_BLOCK_N": "128"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_block_n(32), 32)
+
+    def test_select_block_n_rejects_unsupported_values(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_triton import (
+            select_sm89_sparse_mla_block_n,
+        )
+
+        with self.assertRaisesRegex(ValueError, "SGLANG_GLM_DSA_SM89_BLOCK_N"):
+            select_sm89_sparse_mla_block_n(96)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_BLOCK_N": "invalid"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "SGLANG_GLM_DSA_SM89_BLOCK_N"):
+                select_sm89_sparse_mla_block_n(None)
+
+    def test_select_block_m_from_env(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_triton import (
+            select_sm89_sparse_mla_block_m,
+        )
+
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(select_sm89_sparse_mla_block_m(None), 1)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_BLOCK_M": "2"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_block_m(None), 2)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_BLOCK_M": "4"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_block_m(None), 4)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_BLOCK_M": "4"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_block_m(2), 2)
+
+    def test_select_block_m_rejects_unsupported_values(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_triton import (
+            select_sm89_sparse_mla_block_m,
+        )
+
+        with self.assertRaisesRegex(ValueError, "SGLANG_GLM_DSA_SM89_BLOCK_M"):
+            select_sm89_sparse_mla_block_m(3)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_BLOCK_M": "invalid"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "SGLANG_GLM_DSA_SM89_BLOCK_M"):
+                select_sm89_sparse_mla_block_m(None)
+
+    def test_select_split_k_from_env(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_triton import (
+            select_sm89_sparse_mla_split_k,
+        )
+
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(select_sm89_sparse_mla_split_k(None), 1)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_SPLIT_K": "4"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_split_k(None), 4)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_SPLIT_K": "8"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_split_k(None), 8)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_SPLIT_K": "8"}, clear=True
+        ):
+            self.assertEqual(select_sm89_sparse_mla_split_k(4), 4)
+
+    def test_select_split_k_rejects_unsupported_values(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_triton import (
+            select_sm89_sparse_mla_split_k,
+        )
+
+        with self.assertRaisesRegex(ValueError, "SGLANG_GLM_DSA_SM89_SPLIT_K"):
+            select_sm89_sparse_mla_split_k(3)
+
+        with unittest.mock.patch.dict(
+            os.environ, {"SGLANG_GLM_DSA_SM89_SPLIT_K": "invalid"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "SGLANG_GLM_DSA_SM89_SPLIT_K"):
+                select_sm89_sparse_mla_split_k(None)
+
+    def test_triton_v_block_variants_match_reference(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_prefill_reference,
+            sm89_sparse_mla_prefill_triton,
+        )
+
+        case = self._make_triton_case(total_q=16, topk=64)
+        expected = sm89_sparse_mla_prefill_reference(
+            case["q_nope"],
+            case["q_rope"],
+            case["kv_cache"],
+            case["page_table"],
+            case["cache_seqlens"],
+            case["sm_scale"],
+            0.0,
+            case["v_head_dim"],
+        )
+
+        for v_block in (64, 128, 256):
+            with self.subTest(v_block=v_block):
+                actual = sm89_sparse_mla_prefill_triton(
+                    case["q_nope"],
+                    case["q_rope"],
+                    case["kv_cache"],
+                    case["page_table"],
+                    case["cache_seqlens"],
+                    case["sm_scale"],
+                    0.0,
+                    case["v_head_dim"],
+                    v_block=v_block,
+                )
+                torch.cuda.synchronize()
+                diff = (actual.float() - expected.float()).abs()
+                self.assertLessEqual(diff.max().item(), 5e-2)
+                self.assertLessEqual(diff.mean().item(), 5e-3)
+
+    def test_triton_block_n_variants_match_reference(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_prefill_reference,
+            sm89_sparse_mla_prefill_triton,
+        )
+
+        case = self._make_triton_case(total_q=16, topk=128)
+        expected = sm89_sparse_mla_prefill_reference(
+            case["q_nope"],
+            case["q_rope"],
+            case["kv_cache"],
+            case["page_table"],
+            case["cache_seqlens"],
+            case["sm_scale"],
+            30.0,
+            case["v_head_dim"],
+        )
+
+        for block_n in (32, 64, 128):
+            with self.subTest(block_n=block_n):
+                actual = sm89_sparse_mla_prefill_triton(
+                    case["q_nope"],
+                    case["q_rope"],
+                    case["kv_cache"],
+                    case["page_table"],
+                    case["cache_seqlens"],
+                    case["sm_scale"],
+                    30.0,
+                    case["v_head_dim"],
+                    v_block=128,
+                    block_n=block_n,
+                )
+                torch.cuda.synchronize()
+                diff = (actual.float() - expected.float()).abs()
+                self.assertLessEqual(diff.max().item(), 5e-2)
+                self.assertLessEqual(diff.mean().item(), 5e-3)
+
+    def test_triton_block_m_variants_match_reference(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_prefill_reference,
+            sm89_sparse_mla_prefill_triton,
+        )
+
+        case = self._make_triton_case(total_q=16, topk=64)
+        expected = sm89_sparse_mla_prefill_reference(
+            case["q_nope"],
+            case["q_rope"],
+            case["kv_cache"],
+            case["page_table"],
+            case["cache_seqlens"],
+            case["sm_scale"],
+            30.0,
+            case["v_head_dim"],
+        )
+
+        for block_m in (1, 2, 4):
+            with self.subTest(block_m=block_m):
+                actual = sm89_sparse_mla_prefill_triton(
+                    case["q_nope"],
+                    case["q_rope"],
+                    case["kv_cache"],
+                    case["page_table"],
+                    case["cache_seqlens"],
+                    case["sm_scale"],
+                    30.0,
+                    case["v_head_dim"],
+                    v_block=64,
+                    block_n=32,
+                    block_m=block_m,
+                )
+                torch.cuda.synchronize()
+                diff = (actual.float() - expected.float()).abs()
+                self.assertLessEqual(diff.max().item(), 5e-2)
+                self.assertLessEqual(diff.mean().item(), 5e-3)
+
+    def test_triton_split_k_variants_match_reference(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_prefill_reference,
+            sm89_sparse_mla_prefill_triton,
+        )
+
+        case = self._make_triton_case(total_q=16, topk=128)
+        expected = sm89_sparse_mla_prefill_reference(
+            case["q_nope"],
+            case["q_rope"],
+            case["kv_cache"],
+            case["page_table"],
+            case["cache_seqlens"],
+            case["sm_scale"],
+            30.0,
+            case["v_head_dim"],
+        )
+
+        for split_k in (1, 4, 8):
+            with self.subTest(split_k=split_k):
+                actual = sm89_sparse_mla_prefill_triton(
+                    case["q_nope"],
+                    case["q_rope"],
+                    case["kv_cache"],
+                    case["page_table"],
+                    case["cache_seqlens"],
+                    case["sm_scale"],
+                    30.0,
+                    case["v_head_dim"],
+                    v_block=128,
+                    block_n=32,
+                    block_m=1,
+                    split_k=split_k,
+                )
+                torch.cuda.synchronize()
+                diff = (actual.float() - expected.float()).abs()
+                self.assertLessEqual(diff.max().item(), 5e-2)
+                self.assertLessEqual(diff.mean().item(), 5e-3)
 
 
 if __name__ == "__main__":

@@ -35,3 +35,15 @@ def cuda_timer(name: str, enabled: bool):
         end.record()
         torch.cuda.synchronize()
         print(f"[GLM-DSA-SM89] {name}: {start.elapsed_time(end):.3f} ms", flush=True)
+
+
+@contextmanager
+def profile_region(name: str, enabled: bool | None = None):
+    if enabled is None:
+        enabled = glm_dsa_sm89_profile_enabled()
+    if not enabled:
+        yield
+        return
+
+    with nvtx_range(name), cuda_timer(name, True):
+        yield

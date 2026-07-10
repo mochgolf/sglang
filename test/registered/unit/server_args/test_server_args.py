@@ -301,6 +301,73 @@ class TestGlmSm89DsaFallback(CustomTestCase):
             self.assertFalse(envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get())
             self.assertTrue(server_args.enable_glm_dsa_sm89_fallback)
 
+    def test_dsa_choices_include_sm89_triton(self):
+        self.assertIn("sm89_triton", server_args_module.DSA_CHOICES)
+
+    def test_glm_sm89_fallback_accepts_explicit_sm89_triton_prefill(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="sm89_triton",
+        )
+
+        server_args._set_default_dsa_backends(
+            kv_cache_dtype="fp8_e4m3",
+            major=8,
+            minor=9,
+            model_arch="GlmMoeDsaForCausalLM",
+        )
+
+        self.assertEqual(server_args.dsa_prefill_backend, "sm89_triton")
+        self.assertEqual(server_args.dsa_decode_backend, "fa3")
+        self.assertEqual(server_args.dsa_topk_backend, "torch")
+        self.assertTrue(server_args.enable_glm_dsa_sm89_fallback)
+
+    def test_glm_sm89_fallback_rejects_explicit_sm89_triton_decode(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_decode_backend="sm89_triton",
+        )
+
+        with self.assertRaisesRegex(ValueError, "prefill only"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=8,
+                minor=9,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+    def test_sm89_triton_rejects_non_glm_sm89_target(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend="sm89_triton",
+        )
+
+        with self.assertRaisesRegex(ValueError, "GLM DSA on SM89"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="fp8_e4m3",
+                major=9,
+                minor=0,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
+    def test_sm89_triton_requires_fp8_kv(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="bfloat16",
+            dsa_prefill_backend="sm89_triton",
+        )
+
+        with self.assertRaisesRegex(ValueError, "fp8_e4m3"):
+            server_args._set_default_dsa_backends(
+                kv_cache_dtype="bfloat16",
+                major=8,
+                minor=9,
+                model_arch="GlmMoeDsaForCausalLM",
+            )
+
     def test_glm_sm89_fallback_does_not_leak_env_to_non_target_args(self):
         with ExitStack() as stack:
             stack.enter_context(envs.SGLANG_DSA_FUSE_TOPK.override(True))

@@ -39,6 +39,10 @@ from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_r
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.layers.attention.dsa.sm89_debug import (
+    glm_dsa_sm89_profile_enabled,
+    profile_region,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -619,31 +623,69 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
+        profile = glm_dsa_sm89_profile_enabled()
         if hidden_states.shape[0] > 0:
-            shared_output = self._forward_shared_experts(hidden_states)
+            if profile:
+                with profile_region("glm_moe.forward_normal.shared_experts", profile):
+                    shared_output = self._forward_shared_experts(hidden_states)
+            else:
+                shared_output = self._forward_shared_experts(hidden_states)
             # router_logits: (num_tokens, n_experts)
-            router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
+            if profile:
+                with profile_region("glm_moe.forward_normal.gate", profile):
+                    router_logits = self.gate(hidden_states)
+                with profile_region("glm_moe.forward_normal.topk", profile):
+                    topk_output = self.topk(hidden_states, router_logits)
+            else:
+                router_logits = self.gate(hidden_states)
+                topk_output = self.topk(hidden_states, router_logits)
         else:
             shared_output = None
             topk_output = self.topk.empty_topk_output(hidden_states.device)
 
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        if profile:
+            with profile_region("glm_moe.forward_normal.experts", profile):
+                final_hidden_states = self.experts(hidden_states, topk_output)
+        else:
+            final_hidden_states = self.experts(hidden_states, topk_output)
         if not _is_cuda and not _use_aiter:
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
-            with use_symmetric_memory(
-                parallel_state.get_tp_group(), disabled=not is_allocation_symmetric()
-            ):
-                final_hidden_states_out = torch.empty_like(final_hidden_states)
-            torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
-            final_hidden_states = final_hidden_states_out
+            if profile:
+                with profile_region("glm_moe.forward_normal.add_shared", profile):
+                    with use_symmetric_memory(
+                        parallel_state.get_tp_group(),
+                        disabled=not is_allocation_symmetric(),
+                    ):
+                        final_hidden_states_out = torch.empty_like(final_hidden_states)
+                    torch.add(
+                        final_hidden_states,
+                        shared_output,
+                        out=final_hidden_states_out,
+                    )
+                    final_hidden_states = final_hidden_states_out
+            else:
+                with use_symmetric_memory(
+                    parallel_state.get_tp_group(),
+                    disabled=not is_allocation_symmetric(),
+                ):
+                    final_hidden_states_out = torch.empty_like(final_hidden_states)
+                torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)
+                final_hidden_states = final_hidden_states_out
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
             use_reduce_scatter=use_reduce_scatter,
             should_allreduce_fusion=should_allreduce_fusion,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if profile:
+                with profile_region("glm_moe.forward_normal.post_all_reduce", profile):
+                    final_hidden_states = tensor_model_parallel_all_reduce(
+                        final_hidden_states
+                    )
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
         return final_hidden_states
 
     def forward_deepep(

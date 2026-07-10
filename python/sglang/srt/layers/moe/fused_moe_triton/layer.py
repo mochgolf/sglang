@@ -22,6 +22,10 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.attention.dsa.sm89_debug import (
+    glm_dsa_sm89_profile_enabled,
+    profile_region,
+)
 from sglang.srt.layers.moe import (
     MoeRunnerConfig,
     get_deepep_mode,
@@ -1113,19 +1117,40 @@ class FusedMoE(torch.nn.Module):
     def forward_impl(self, hidden_states: torch.Tensor, topk_output: TopKOutput):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
+        profile = glm_dsa_sm89_profile_enabled()
 
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
+        if profile:
+            with profile_region("fused_moe.dispatch", profile):
+                dispatch_output = self.dispatcher.dispatch(
+                    hidden_states=hidden_states, topk_output=topk_output
+                )
+        else:
+            dispatch_output = self.dispatcher.dispatch(
+                hidden_states=hidden_states, topk_output=topk_output
+            )
 
-        combine_input = self.run_moe_core(
-            dispatch_output=dispatch_output,
-        )
+        if profile:
+            with profile_region("fused_moe.run_moe_core", profile):
+                combine_input = self.run_moe_core(
+                    dispatch_output=dispatch_output,
+                )
+        else:
+            combine_input = self.run_moe_core(
+                dispatch_output=dispatch_output,
+            )
 
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+            if profile:
+                with profile_region("fused_moe.combine", profile):
+                    final_hidden_states = self.dispatcher.combine(
+                        combine_input=combine_input
+                    )
+            else:
+                final_hidden_states = self.dispatcher.combine(
+                    combine_input=combine_input
+                )
 
             # TODO: should we add some conditions here?
             final_hidden_states = final_hidden_states[
@@ -1133,7 +1158,15 @@ class FusedMoE(torch.nn.Module):
             ].contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if profile:
+                with profile_region("fused_moe.all_reduce", profile):
+                    final_hidden_states = tensor_model_parallel_all_reduce(
+                        final_hidden_states
+                    )
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         return final_hidden_states
 
