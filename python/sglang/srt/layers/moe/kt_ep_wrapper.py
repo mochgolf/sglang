@@ -151,13 +151,14 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         self.gpu_method = gpu_method
         self.kt_config = kt_config
-        self.num_gpu_experts = kt_config.num_gpu_experts
+        self.num_gpu_experts = kt_config.num_gpu_experts or 0
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
         self.tp_rank = get_parallel().tp_rank
 
         # KT wrapper will be initialized in create_weights
         self.wrapper: Optional[KTMoEWrapper] = None
+        self.gpu_experts_mask: Optional[torch.Tensor] = None
 
         # Store parameters needed for KT initialization
         self._layer_params = None
@@ -215,6 +216,11 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
 
         # 2. Initialize KT wrapper for CPU experts
         # CPU experts: num_gpu_experts to num_experts-1
+        gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool, device="cpu")
+        if self.num_gpu_experts > 0:
+            gpu_experts_mask[: self.num_gpu_experts] = True
+        self.gpu_experts_mask = gpu_experts_mask
+
         if self.tp_rank == 0:
             self.wrapper = KTMoEWrapper(
                 layer_idx=self.kt_config.layer_idx,
@@ -222,6 +228,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
                 num_experts_per_tok=num_experts_per_tok,
                 hidden_size=hidden_size,
                 moe_intermediate_size=intermediate_size_full,
+                gpu_experts_mask=gpu_experts_mask,
                 num_gpu_experts=self.num_gpu_experts,
                 cpuinfer_threads=self.kt_config.cpuinfer_threads,
                 threadpool_count=self.kt_config.threadpool_count,
@@ -238,7 +245,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             layer: The MoE layer module
         """
         # 1. Process GPU weights
-        if hasattr(self.gpu_method, "process_weights_after_loading"):
+        if self.num_gpu_experts > 0 and hasattr(
+            self.gpu_method, "process_weights_after_loading"
+        ):
             self.gpu_method.process_weights_after_loading(layer)
 
         # 2. Load CPU weights using KT wrapper
@@ -348,6 +357,9 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # Step 1: Submit CPU expert computation (non-blocking)
         if self.tp_rank == 0:
             self.submit(layer, dispatch_output)
+
+        if self.num_gpu_experts == 0:
+            return StandardCombineInput(hidden_states=self.sync(x))
 
         # Step 2: Prepare GPU computation by masking CPU expert IDs
         # CPU expert IDs (>= num_gpu_experts) are set to -1 so GPU kernel skips them
