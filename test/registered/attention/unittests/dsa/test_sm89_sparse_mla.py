@@ -1,12 +1,279 @@
+import gc
+import hashlib
+import inspect
 import json
 import os
 import tempfile
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
+
+
+_SPLITK_SCALE_FORMULA_VERSION = "token5-group3-mod7-v1"
+_SPLITK_SCALE_SEED = 20260712
+
+
+def _splitk_host_partial_state(logits, values, split_tokens):
+    partial_lse = []
+    partial_o = []
+    for start in range(0, logits.numel(), split_tokens):
+        split_logits = logits[start : start + split_tokens]
+        split_values = values[start : start + split_tokens]
+        finite = torch.isfinite(split_logits)
+        if not finite.any():
+            partial_lse.append(torch.tensor(float("-inf"), dtype=torch.float32))
+            partial_o.append(torch.zeros(values.shape[1], dtype=torch.float32))
+            continue
+        valid_logits = split_logits[finite].float()
+        lse = torch.logsumexp(valid_logits, dim=0)
+        probabilities = torch.exp(valid_logits - lse).to(torch.bfloat16).float()
+        rounded_values = split_values[finite].to(torch.bfloat16).float()
+        partial_lse.append(lse)
+        partial_o.append(probabilities @ rounded_values)
+    return torch.stack(partial_lse), torch.stack(partial_o)
+
+
+def _splitk_host_combine(partial_lse, partial_o):
+    finite = torch.isfinite(partial_lse)
+    if not finite.any():
+        return torch.zeros(partial_o.shape[-1], dtype=torch.float32)
+    global_lse = torch.logsumexp(partial_lse[finite], dim=0)
+    weights = torch.zeros_like(partial_lse)
+    weights[finite] = torch.exp(partial_lse[finite] - global_lse)
+    return weights @ partial_o
+
+
+def _cuda_kernel_source_body(source, kernel_name):
+    start = source.index(kernel_name)
+    body_start = source.index("{", start)
+    depth = 0
+    for offset in range(body_start, len(source)):
+        if source[offset] == "{":
+            depth += 1
+        elif source[offset] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[body_start + 1 : offset]
+    raise AssertionError(f"unterminated CUDA kernel {kernel_name}")
+
+
+class TestSm89SparseMlaSplitKHost(unittest.TestCase):
+    def test_splitk_host_ownership_maps(self):
+        for split_tokens in (32, 64):
+            qk_warp_count = split_tokens // 16
+            for split in range(2048 // split_tokens):
+                split_start = split * split_tokens
+                qk_tokens = [
+                    split_start + 16 * warp + token_local
+                    for warp in range(qk_warp_count)
+                    for token_local in range(16)
+                ]
+                self.assertEqual(
+                    sorted(qk_tokens),
+                    list(range(split_start, split_start + split_tokens)),
+                )
+            pv_dimensions = [
+                16 * (4 * warp + fragment) + dim_local
+                for warp in range(8)
+                for fragment in range(4)
+                for dim_local in range(16)
+            ]
+            self.assertEqual(sorted(pv_dimensions), list(range(512)))
+
+    def test_splitk_host_softmax_state_oracle(self):
+        logits = torch.tensor(
+            [float("-inf")] * 4
+            + [-1.5, 0.25, float("-inf"), 1.0]
+            + [float("-inf")] * 4,
+            dtype=torch.float32,
+        )
+        values = torch.arange(12 * 7, dtype=torch.float32).reshape(12, 7) / 17
+        partial_lse, partial_o = _splitk_host_partial_state(logits, values, 4)
+        merged = _splitk_host_combine(partial_lse, partial_o)
+        finite = torch.isfinite(logits)
+        full_lse = torch.logsumexp(logits[finite], dim=0)
+        full_prob = torch.exp(logits[finite] - full_lse).to(torch.bfloat16).float()
+        expected = full_prob @ values[finite].to(torch.bfloat16).float()
+
+        self.assertTrue(torch.isneginf(partial_lse[[0, 2]]).all())
+        self.assertTrue(torch.equal(partial_o[[0, 2]], torch.zeros_like(partial_o[[0, 2]])))
+        torch.testing.assert_close(merged, expected, atol=0, rtol=0)
+
+        empty_lse = torch.full((3,), float("-inf"), dtype=torch.float32)
+        empty_o = torch.zeros(3, 7, dtype=torch.float32)
+        all_empty = _splitk_host_combine(empty_lse, empty_o)
+        self.assertTrue(torch.isfinite(all_empty).all())
+        self.assertTrue(torch.equal(all_empty, torch.zeros_like(all_empty)))
+
+
+def test_decode_kernel_selector(monkeypatch):
+    from sglang.srt.layers.attention.dsa.sm89_sparse_mla_cuda import (
+        select_sm89_sparse_mla_decode_kernel,
+    )
+
+    monkeypatch.delenv("SGLANG_GLM_DSA_SM89_DECODE_KERNEL", raising=False)
+    assert select_sm89_sparse_mla_decode_kernel() == "three_stage"
+    assert select_sm89_sparse_mla_decode_kernel(" splitK32 ") == "splitk32"
+    assert select_sm89_sparse_mla_decode_kernel("splitk64") == "splitk64"
+    with pytest.raises(ValueError, match="three_stage.*splitk32.*splitk64"):
+        select_sm89_sparse_mla_decode_kernel("tensorcore")
+
+
+def test_splitk_workspace():
+    from sglang.srt.layers.attention.dsa.sm89_sparse_mla_cuda import (
+        splitk_workspace_schema,
+    )
+
+    assert splitk_workspace_schema(1, 32, 2048, 32) == {
+        "splits": 64,
+        "partial_o_bytes": 4_194_304,
+        "partial_lse_bytes": 8_192,
+        "workspace_bytes": 4_202_496,
+    }
+    assert splitk_workspace_schema(1, 32, 2048, 64)["workspace_bytes"] == 2_101_248
+
+
+def test_splitk_partial_only_wrapper_uses_exact_preallocated_workspace(monkeypatch):
+    from sglang.srt.layers.attention.dsa import sm89_sparse_mla_cuda
+
+    q_nope = object()
+    q_rope = object()
+    kv_cache = object()
+    page_table = object()
+    cache_seqlens = object()
+    partial_o = object()
+    partial_lse = object()
+    allocation_calls = []
+
+    def fake_empty(shape, *, device, dtype):
+        allocation_calls.append((shape, device, dtype))
+        return partial_o if len(allocation_calls) == 1 else partial_lse
+
+    q_descriptor = SimpleNamespace(is_cuda=True, device=torch.device("cuda:0"))
+    monkeypatch.setattr(torch, "empty", fake_empty)
+    monkeypatch.setattr(
+        sm89_sparse_mla_cuda,
+        "_validate_sm89_sparse_mla_decode_cuda_splitk_workspace",
+        MagicMock(),
+    )
+    allocated = (
+        sm89_sparse_mla_cuda.allocate_sm89_sparse_mla_decode_cuda_splitk_workspace(
+            q_descriptor, 32
+        )
+    )
+    assert allocated == (partial_o, partial_lse)
+    assert allocation_calls == [
+        ((64, 1, 32, 512), torch.device("cuda:0"), torch.float32),
+        ((64, 1, 32), torch.device("cuda:0"), torch.float32),
+    ]
+
+    partial_op = MagicMock(return_value=None)
+    extension = SimpleNamespace(
+        sm89_sparse_mla_decode_cuda_splitk_partial=partial_op
+    )
+    monkeypatch.setattr(
+        sm89_sparse_mla_cuda,
+        "_validate_sm89_sparse_mla_decode_cuda_splitk",
+        MagicMock(return_value=0.125),
+    )
+    monkeypatch.setattr(
+        sm89_sparse_mla_cuda,
+        "_load_sm89_sparse_mla_cuda_ext",
+        MagicMock(return_value=extension),
+    )
+
+    result = sm89_sparse_mla_cuda.sm89_sparse_mla_decode_cuda_splitk_partial(
+        q_nope,
+        q_rope,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        partial_o,
+        partial_lse,
+        0.125,
+        0.0,
+        512,
+        32,
+    )
+    assert result is None
+    partial_op.assert_called_once_with(
+        q_nope,
+        q_rope,
+        kv_cache,
+        page_table,
+        cache_seqlens,
+        partial_o,
+        partial_lse,
+        0.125,
+        0.0,
+        512,
+        32,
+    )
+
+
+def test_splitk_partial_only_cuda_source_contract():
+    from sglang.srt.layers.attention.dsa import sm89_sparse_mla_cuda
+
+    source_path = (
+        Path(sm89_sparse_mla_cuda.__file__).resolve().parent
+        / "csrc"
+        / "sm89_sparse_mla_cuda.cu"
+    )
+    source = source_path.read_text(encoding="utf-8")
+    python_validation = inspect.getsource(
+        sm89_sparse_mla_cuda._validate_sm89_sparse_mla_decode_cuda_splitk_workspace
+    )
+    partial_entry = _cuda_kernel_source_body(
+        source, "sm89_sparse_mla_decode_cuda_splitk_partial"
+    )
+    shared_partial_launcher = _cuda_kernel_source_body(
+        source, "launch_sm89_sparse_mla_splitk_partial"
+    )
+    full_launcher = _cuda_kernel_source_body(
+        source, "Sm89SparseMlaSplitKResult launch_sm89_sparse_mla_splitk("
+    )
+
+    assert "validate_sm89_sparse_mla_splitk(" in partial_entry
+    assert "validate_sm89_sparse_mla_splitk_workspace(" in partial_entry
+    assert "launch_sm89_sparse_mla_splitk_partial(" in partial_entry
+    assert "torch::empty" not in partial_entry
+    assert "combine" not in partial_entry
+    assert "C10_CUDA_KERNEL_LAUNCH_CHECK();" in shared_partial_launcher
+    assert "launch_sm89_sparse_mla_splitk_partial(" in full_launcher
+    assert "sm89_sparse_mla_splitk_combine_kernel" in full_launcher
+    assert (
+        'm.def("sm89_sparse_mla_decode_cuda_splitk_partial", '
+        "&sm89_sparse_mla_decode_cuda_splitk_partial"
+    ) in source
+    for marker in (
+        "partial_o.scalar_type() == at::kFloat",
+        "partial_lse.scalar_type() == at::kFloat",
+        "partial_o.is_contiguous()",
+        "partial_lse.is_contiguous()",
+        "partial_o.storage().nbytes() > 0",
+        "partial_lse.storage().nbytes() > 0",
+        "reinterpret_cast<uintptr_t>(partial_o.data_ptr()) % 32 == 0",
+    ):
+        assert marker in source
+    for marker in (
+        "partial_o.device != q_nope.device",
+        "partial_lse.device != q_nope.device",
+        "partial_o.dtype != torch.float32",
+        "partial_lse.dtype != torch.float32",
+        "partial_o.shape != (splits, 1, 32, 512)",
+        "partial_lse.shape != (splits, 1, 32)",
+        "partial_o.is_contiguous()",
+        "partial_lse.is_contiguous()",
+        "partial_o.untyped_storage().nbytes() <= 0",
+        "partial_lse.untyped_storage().nbytes() <= 0",
+        "partial_o.data_ptr() % 32",
+    ):
+        assert marker in python_validation
 
 
 class TestSm89SparseMlaBackendLogging(unittest.TestCase):
@@ -1076,6 +1343,887 @@ class TestSm89SparseMlaBackendDispatch(unittest.TestCase):
 class TestSm89SparseMlaDecodeCuda(unittest.TestCase):
     _SM_SCALE = 1.0 / (512 + 64) ** 0.5
 
+    def _make_exact_splitk_case(
+        self,
+        pool_size=4096,
+        seed=_SPLITK_SCALE_SEED,
+        page_table=None,
+        cache_seqlen=2048,
+        q_layout="noncontiguous",
+    ):
+        device = torch.device("cuda")
+        generator = torch.Generator(device=device).manual_seed(seed)
+        q_nope_storage = torch.randn(
+            1, 32, 1024, device=device, dtype=torch.float32, generator=generator
+        ).to(torch.bfloat16)
+        q_rope_storage = torch.randn(
+            1, 32, 128, device=device, dtype=torch.float32, generator=generator
+        ).to(torch.bfloat16)
+        if q_layout == "noncontiguous":
+            q_nope = q_nope_storage[..., ::2]
+            q_rope = q_rope_storage[..., ::2]
+        elif q_layout == "contiguous":
+            q_nope = q_nope_storage[..., ::2].contiguous()
+            q_rope = q_rope_storage[..., ::2].contiguous()
+        else:
+            raise ValueError(f"unsupported Q layout: {q_layout}")
+
+        packed_bytes = torch.empty(
+            pool_size, 1, 656, device=device, dtype=torch.uint8
+        )
+        kv_cache = packed_bytes.view(torch.float8_e4m3fn)
+        dim = torch.arange(512, device=device, dtype=torch.int64).unsqueeze(0)
+        for start in range(0, pool_size, 8192):
+            end = min(start + 8192, pool_size)
+            token = torch.arange(
+                start, end, device=device, dtype=torch.int64
+            ).unsqueeze(1)
+            quantized = (((token * 13 + dim * 7) % 29) - 14).float() / 8
+            kv_cache[start:end, 0, :512].copy_(
+                quantized.to(torch.float8_e4m3fn)
+            )
+            rope = torch.randn(
+                end - start,
+                64,
+                device=device,
+                dtype=torch.float32,
+                generator=generator,
+            )
+            rope = torch.where(rope == 0, torch.full_like(rope, 0.125), rope)
+            packed_bytes[start:end, 0, 528:].view(torch.bfloat16).copy_(
+                rope.to(torch.bfloat16)
+            )
+
+        token = torch.arange(pool_size, device=device, dtype=torch.int64).unsqueeze(1)
+        group = torch.arange(4, device=device, dtype=torch.int64).unsqueeze(0)
+        scales = 0.03125 * (1 + ((token * 5 + group * 3) % 7)).float()
+        packed_bytes[:, 0, 512:528].view(torch.float32).copy_(scales)
+
+        if page_table is None:
+            selected = (
+                torch.arange(2048, device=device, dtype=torch.int64)
+                * (pool_size - 1)
+                // 2047
+            ).to(torch.int32)
+            page_table = selected.unsqueeze(0)
+        else:
+            page_table = page_table.to(device=device, dtype=torch.int32)
+            if page_table.ndim == 1:
+                page_table = page_table.unsqueeze(0)
+        return {
+            "q_nope": q_nope,
+            "q_rope": q_rope,
+            "kv_cache": kv_cache,
+            "page_table": page_table,
+            "cache_seqlens": torch.tensor(
+                [cache_seqlen], device=device, dtype=torch.int32
+            ),
+        }
+
+    def _assert_exact_splitk_scales(self, case):
+        selected = case["page_table"][0]
+        valid = selected[(selected >= 0) & (selected < case["kv_cache"].shape[0])]
+        quantile_positions = torch.linspace(
+            0, valid.numel() - 1, 9, device=valid.device
+        ).round().long()
+        tokens = valid[quantile_positions].long()
+        packed_bytes = case["kv_cache"].view(torch.uint8)
+        actual = packed_bytes[tokens, 0, 512:528].contiguous().view(torch.float32)
+        group = torch.arange(4, device=tokens.device, dtype=torch.int64).unsqueeze(0)
+        expected = 0.03125 * (1 + ((tokens.unsqueeze(1) * 5 + group * 3) % 7)).float()
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        for group_id in range(4):
+            self.assertGreaterEqual(torch.unique(actual[:, group_id]).numel(), 2)
+        self.assertGreaterEqual(actual.min().item(), 0.03125)
+        self.assertLessEqual(actual.max().item(), 0.21875)
+
+    def _dequant_selected_splitk(self, kv_cache, token_ids):
+        packed = kv_cache.view(torch.uint8)[token_ids.long(), 0]
+        quantized = packed[:, :512].contiguous().view(torch.float8_e4m3fn)
+        scales = packed[:, 512:528].contiguous().view(torch.float32)
+        nope = (quantized.float() * scales.repeat_interleave(128, dim=1)).to(
+            torch.bfloat16
+        )
+        rope = packed[:, 528:].contiguous().view(torch.bfloat16)
+        return nope, rope
+
+    def _splitk_reference(self, case):
+        row_len = max(0, min(int(case["cache_seqlens"][0].item()), 2048))
+        selected = case["page_table"][0, :row_len]
+        valid = (selected >= 0) & (selected < case["kv_cache"].shape[0])
+        if not valid.any():
+            return torch.zeros_like(case["q_nope"])
+        nope, rope = self._dequant_selected_splitk(
+            case["kv_cache"], selected[valid]
+        )
+        q = torch.cat([case["q_nope"][0], case["q_rope"][0]], dim=-1)
+        k = torch.cat([nope, rope], dim=-1)
+        logits = (q.float() @ k.float().transpose(0, 1)) * self._SM_SCALE
+        lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+        probabilities = torch.exp(logits - lse).to(torch.bfloat16).float()
+        return (probabilities @ nope.float()).to(torch.bfloat16).unsqueeze(0)
+
+    def _splitk_partial_reference(self, case, split_tokens):
+        splits = 2048 // split_tokens
+        partial_o = torch.zeros(
+            splits, 1, 32, 512, device="cuda", dtype=torch.float32
+        )
+        partial_lse = torch.full(
+            (splits, 1, 32), float("-inf"), device="cuda", dtype=torch.float32
+        )
+        split_valid = torch.zeros(splits, device="cuda", dtype=torch.int32)
+        row_len = max(0, min(int(case["cache_seqlens"][0].item()), 2048))
+        q = torch.cat([case["q_nope"][0], case["q_rope"][0]], dim=-1)
+        for split in range(splits):
+            start = split * split_tokens
+            stop = start + split_tokens
+            selected = case["page_table"][0, start:stop]
+            positions = torch.arange(start, stop, device="cuda")
+            valid = (
+                (positions < row_len)
+                & (selected >= 0)
+                & (selected < case["kv_cache"].shape[0])
+            )
+            if not valid.any():
+                continue
+            split_valid[split] = 1
+            nope, rope = self._dequant_selected_splitk(
+                case["kv_cache"], selected[valid]
+            )
+            k = torch.cat([nope, rope], dim=-1)
+            logits = (q.float() @ k.float().transpose(0, 1)) * self._SM_SCALE
+            lse = torch.logsumexp(logits, dim=-1)
+            probability = torch.exp(logits - lse.unsqueeze(1)).to(torch.bfloat16)
+            partial_lse[split, 0] = lse
+            partial_o[split, 0] = probability.float() @ nope.float()
+        return partial_o, partial_lse, split_valid
+
+    def _assert_splitk_numeric_gates(self, actual, expected):
+        self.assertTrue(torch.isfinite(actual).all())
+        if not torch.count_nonzero(expected):
+            self.assertTrue(torch.equal(actual, torch.zeros_like(actual)))
+            return
+        diff = (actual.float() - expected.float()).abs()
+        self.assertLessEqual(diff.max().item(), 5e-2)
+        self.assertLessEqual(diff.mean().item(), 5e-3)
+        cosine = torch.nn.functional.cosine_similarity(
+            actual.float().flatten(), expected.float().flatten(), dim=0
+        ).item()
+        self.assertGreaterEqual(cosine, 0.995)
+
+    def _splitk_extension_identity(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla_cuda
+
+        ext = sm89_sparse_mla_cuda._load_sm89_sparse_mla_cuda_ext()
+        extension_path = Path(ext.__file__).resolve()
+        source_path = (
+            Path(sm89_sparse_mla_cuda.__file__).resolve().parent
+            / "csrc"
+            / "sm89_sparse_mla_cuda.cu"
+        )
+        identity = {
+            "extension_path": str(extension_path),
+            "extension_sha256": hashlib.sha256(extension_path.read_bytes()).hexdigest(),
+            "source_sha256": hashlib.sha256(source_path.read_bytes()).hexdigest(),
+        }
+        print("SPLITK_EXTENSION_IDENTITY=" + json.dumps(identity, sort_keys=True))
+        return ext, identity
+
+    def _splitk_metrics(self, actual, expected):
+        diff = (actual.float() - expected.float()).abs()
+        if torch.count_nonzero(expected):
+            cosine = torch.nn.functional.cosine_similarity(
+                actual.float().flatten(), expected.float().flatten(), dim=0
+            ).item()
+        else:
+            cosine = 1.0 if not torch.count_nonzero(actual) else 0.0
+        return {
+            "max_abs": diff.max().item(),
+            "mean_abs": diff.mean().item(),
+            "cosine": cosine,
+        }
+
+    def _three_stage_splitk_reference(self, case):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_cuda import (
+            sm89_sparse_mla_prefill_cuda,
+        )
+
+        return sm89_sparse_mla_prefill_cuda(
+            **case,
+            sm_scale=self._SM_SCALE,
+            logit_cap=0.0,
+            v_head_dim=512,
+            block_n=32,
+            cuda_impl="tensorcore",
+        )
+
+    def test_splitk_direct_entry_matches_reference(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_cuda import (
+            sm89_sparse_mla_decode_cuda_splitk,
+            sm89_sparse_mla_prefill_cuda,
+        )
+
+        case = self._make_exact_splitk_case(pool_size=4096)
+        self._assert_exact_splitk_scales(case)
+        expected = self._splitk_reference(case)
+        three_stage = sm89_sparse_mla_prefill_cuda(
+            **case,
+            sm_scale=self._SM_SCALE,
+            logit_cap=0.0,
+            v_head_dim=512,
+            block_n=32,
+            cuda_impl="tensorcore",
+        )
+        self._assert_splitk_numeric_gates(three_stage, expected)
+        for split_tokens in (32, 64):
+            with self.subTest(split_tokens=split_tokens):
+                actual = sm89_sparse_mla_decode_cuda_splitk(
+                    **case,
+                    sm_scale=self._SM_SCALE,
+                    logit_cap=0.0,
+                    v_head_dim=512,
+                    split_tokens=split_tokens,
+                )
+                self._assert_splitk_numeric_gates(actual, expected)
+                self._assert_splitk_numeric_gates(actual, three_stage)
+
+    def test_splitk_debug_partial_state_handles_empty_and_mixed_splits(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla_cuda
+
+        for split_tokens in (32, 64):
+            pages = torch.full((2048,), -1, dtype=torch.int32)
+            pages[:7] = torch.arange(7, dtype=torch.int32)
+            second_start = 2 * split_tokens + 3
+            pages[second_start : second_start + 9] = torch.arange(
+                100, 109, dtype=torch.int32
+            )
+            case = self._make_exact_splitk_case(page_table=pages)
+            expected_o, expected_lse, expected_valid = (
+                self._splitk_partial_reference(case, split_tokens)
+            )
+            ext = sm89_sparse_mla_cuda._load_sm89_sparse_mla_cuda_ext()
+            out, partial_o, partial_lse, split_valid = (
+                ext.sm89_sparse_mla_decode_cuda_splitk_debug(
+                    case["q_nope"],
+                    case["q_rope"],
+                    case["kv_cache"],
+                    case["page_table"],
+                    case["cache_seqlens"],
+                    self._SM_SCALE,
+                    0.0,
+                    512,
+                    split_tokens,
+                )
+            )
+            self._assert_splitk_numeric_gates(out, self._splitk_reference(case))
+            self.assertEqual(partial_o.shape, expected_o.shape)
+            self.assertEqual(partial_lse.shape, expected_lse.shape)
+            self.assertEqual(split_valid.shape, (2048 // split_tokens, 1, 2))
+            self.assertTrue(torch.equal(split_valid[:, 0, 0], split_valid[:, 0, 1]))
+            self.assertTrue(torch.equal(split_valid[:, 0, 0], expected_valid))
+            finite = torch.isfinite(expected_lse)
+            torch.testing.assert_close(
+                partial_lse[finite], expected_lse[finite], atol=5e-3, rtol=5e-3
+            )
+            self.assertTrue(torch.isneginf(partial_lse[~finite]).all())
+            diff = (partial_o - expected_o).abs()
+            self.assertLessEqual(diff.max().item(), 5e-2)
+            self.assertLessEqual(diff.mean().item(), 5e-3)
+            empty = ~expected_valid.bool()
+            self.assertTrue(
+                torch.equal(partial_o[empty], torch.zeros_like(partial_o[empty]))
+            )
+
+    def test_splitk_all_empty_is_finite_and_bit_exact_zero(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_cuda import (
+            sm89_sparse_mla_decode_cuda_splitk,
+        )
+
+        pages = torch.full((2048,), -1, dtype=torch.int32)
+        case = self._make_exact_splitk_case(
+            page_table=pages, cache_seqlen=2048
+        )
+        for split_tokens in (32, 64):
+            out = sm89_sparse_mla_decode_cuda_splitk(
+                **case,
+                sm_scale=self._SM_SCALE,
+                logit_cap=0.0,
+                v_head_dim=512,
+                split_tokens=split_tokens,
+            )
+            self.assertEqual(out.shape, (1, 32, 512))
+            self.assertEqual(out.dtype, torch.bfloat16)
+            self.assertTrue(torch.isfinite(out).all())
+            self.assertTrue(torch.equal(out, torch.zeros_like(out)))
+
+    def test_splitk_source_orders_token_barrier_before_qk(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla_cuda
+
+        source_path = (
+            Path(sm89_sparse_mla_cuda.__file__).resolve().parent
+            / "csrc"
+            / "sm89_sparse_mla_cuda.cu"
+        )
+        source = source_path.read_text(encoding="utf-8")
+        kernel = _cuda_kernel_source_body(
+            source, "sm89_sparse_mla_splitk_partial_kernel"
+        )
+        publication = kernel.index("token_ids[tid] = token")
+        barrier = kernel.index("__syncthreads_or(token_valid)")
+        first_token_read = kernel.index("token_ids[", publication + 1)
+        first_kv_load = min(
+            index
+            for marker in ("load_fp8_scaled(", "load_rope_bf16(")
+            if (index := kernel.find(marker)) >= 0
+        )
+        first_wmma = kernel.index("wmma::load_matrix_sync")
+        self.assertLess(publication, barrier)
+        self.assertLess(barrier, first_token_read)
+        self.assertLess(barrier, first_kv_load)
+        self.assertLess(barrier, first_wmma)
+
+    def test_splitk_source_enforces_wmma_pointer_alignment(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla_cuda
+
+        source_path = (
+            Path(sm89_sparse_mla_cuda.__file__).resolve().parent
+            / "csrc"
+            / "sm89_sparse_mla_cuda.cu"
+        )
+        source = source_path.read_text(encoding="utf-8")
+        kernel = _cuda_kernel_source_body(
+            source, "sm89_sparse_mla_splitk_partial_kernel"
+        )
+        for operand in (
+            "q_tile",
+            "k_tiles",
+            "score_tile",
+            "prob_tile",
+            "value_tiles",
+        ):
+            with self.subTest(operand=operand):
+                self.assertRegex(
+                    kernel,
+                    rf"__shared__\s+__align__\(32\)[^;]*\b{operand}\[",
+                )
+        workspace_validation = _cuda_kernel_source_body(
+            source, "validate_sm89_sparse_mla_splitk_workspace"
+        )
+        full_launcher = _cuda_kernel_source_body(
+            source, "Sm89SparseMlaSplitKResult launch_sm89_sparse_mla_splitk("
+        )
+        allocation = full_launcher.index("auto partial_o = torch::empty(")
+        alignment_check = workspace_validation.index(
+            "reinterpret_cast<uintptr_t>(partial_o.data_ptr()) % 32 == 0"
+        )
+        validation_call = full_launcher.index(
+            "validate_sm89_sparse_mla_splitk_workspace(", allocation
+        )
+        launch_call = full_launcher.index(
+            "launch_sm89_sparse_mla_splitk_partial(", validation_call
+        )
+        self.assertGreaterEqual(alignment_check, 0)
+        self.assertLess(allocation, validation_call)
+        self.assertLess(validation_call, launch_call)
+
+    def test_splitk_source_guards_nonfinite_lse_without_barrier(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla_cuda
+
+        source_path = (
+            Path(sm89_sparse_mla_cuda.__file__).resolve().parent
+            / "csrc"
+            / "sm89_sparse_mla_cuda.cu"
+        )
+        source = source_path.read_text(encoding="utf-8")
+        kernel = _cuda_kernel_source_body(
+            source, "sm89_sparse_mla_splitk_partial_kernel"
+        )
+        finite_lse_block = _cuda_kernel_source_body(
+            kernel, "if (isfinite(row_lse))"
+        )
+        self.assertIn("score_tile[probability_head][token_local] - row_lse", finite_lse_block)
+        self.assertNotIn("__syncthreads", finite_lse_block)
+
+    def test_splitk_direct_wrapper_rejects_before_extension_load(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla_cuda
+
+        case = self._make_exact_splitk_case()
+        pool_size = case["kv_cache"].shape[0]
+        bad_kv_inner_stride = torch.empty(
+            pool_size, 1, 1312, device="cuda", dtype=torch.float8_e4m3fn
+        ).as_strided((pool_size, 1, 656), (1312, 1312, 2))
+        bad_kv_row_stride = torch.empty(
+            pool_size, 1, 658, device="cuda", dtype=torch.float8_e4m3fn
+        )[..., :656]
+        bad_kv_base_alignment = torch.empty(
+            pool_size, 1, 660, device="cuda", dtype=torch.float8_e4m3fn
+        )[..., 1:657]
+        zero_stride_length = torch.zeros(
+            1, device="cuda", dtype=torch.int32
+        ).expand(2)[:1]
+        invalid_cases = {
+            "q_dtype": (case | {"q_nope": case["q_nope"].float()}, {}),
+            "q_shape": (case | {"q_nope": case["q_nope"][:, :, :511]}, {}),
+            "q_stride": (
+                case
+                | {
+                    "q_nope": case["q_nope"].as_strided(
+                        case["q_nope"].shape,
+                        (0, case["q_nope"].stride(1), case["q_nope"].stride(2)),
+                    )
+                },
+                {},
+            ),
+            "rope_dtype": (case | {"q_rope": case["q_rope"].float()}, {}),
+            "rope_stride": (
+                case
+                | {
+                    "q_rope": case["q_rope"].as_strided(
+                        case["q_rope"].shape,
+                        (0, case["q_rope"].stride(1), case["q_rope"].stride(2)),
+                    )
+                },
+                {},
+            ),
+            "page_dtype": (case | {"page_table": case["page_table"].long()}, {}),
+            "page_shape": (case | {"page_table": case["page_table"][:, :1024]}, {}),
+            "page_stride": (
+                case
+                | {
+                    "page_table": case["page_table"].as_strided(
+                        case["page_table"].shape, (0, case["page_table"].stride(1))
+                    )
+                },
+                {},
+            ),
+            "length_dtype": (
+                case | {"cache_seqlens": case["cache_seqlens"].long()},
+                {},
+            ),
+            "length_stride": (case | {"cache_seqlens": zero_stride_length}, {}),
+            "kv_dtype": (case | {"kv_cache": case["kv_cache"].bfloat16()}, {}),
+            "kv_empty": (
+                case
+                | {
+                    "kv_cache": torch.empty(
+                        0, 1, 656, device="cuda", dtype=torch.float8_e4m3fn
+                    )
+                },
+                {},
+            ),
+            "kv_inner_stride": (case | {"kv_cache": bad_kv_inner_stride}, {}),
+            "kv_row_stride": (case | {"kv_cache": bad_kv_row_stride}, {}),
+            "kv_base_alignment": (
+                case | {"kv_cache": bad_kv_base_alignment},
+                {},
+            ),
+            "device": (case | {"q_rope": case["q_rope"].cpu()}, {}),
+            "sm_scale_nan": (case, {"sm_scale": float("nan")}),
+            "sm_scale_inf": (case, {"sm_scale": float("inf")}),
+            "cap_positive": (case, {"logit_cap": 1.0}),
+            "cap_nan": (case, {"logit_cap": float("nan")}),
+            "value_dim": (case, {"v_head_dim": 256}),
+            "split_width": (case, {"split_tokens": 16}),
+        }
+        ext = SimpleNamespace(sm89_sparse_mla_decode_cuda_splitk=MagicMock())
+        with patch.object(
+            sm89_sparse_mla_cuda,
+            "_load_sm89_sparse_mla_cuda_ext",
+            return_value=ext,
+        ) as load_ext:
+            for name, (invalid_case, overrides) in invalid_cases.items():
+                kwargs = {
+                    "sm_scale": self._SM_SCALE,
+                    "logit_cap": 0.0,
+                    "v_head_dim": 512,
+                    "split_tokens": 32,
+                }
+                kwargs.update(overrides)
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    ValueError, "split-K"
+                ):
+                    sm89_sparse_mla_cuda.sm89_sparse_mla_decode_cuda_splitk(
+                        **invalid_case, **kwargs
+                    )
+        load_ext.assert_not_called()
+        ext.sm89_sparse_mla_decode_cuda_splitk.assert_not_called()
+
+    def test_splitk_wrapper_rejects_sm_scale_fp32_overflow_before_load(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla_cuda
+
+        case = self._make_exact_splitk_case()
+        ext = SimpleNamespace(sm89_sparse_mla_decode_cuda_splitk=MagicMock())
+        with patch.object(
+            sm89_sparse_mla_cuda,
+            "_load_sm89_sparse_mla_cuda_ext",
+            return_value=ext,
+        ) as load_ext, self.assertRaisesRegex(ValueError, "FP32 sm_scale"):
+            sm89_sparse_mla_cuda.sm89_sparse_mla_decode_cuda_splitk(
+                **case,
+                sm_scale=1e300,
+                logit_cap=0.0,
+                v_head_dim=512,
+                split_tokens=32,
+            )
+        load_ext.assert_not_called()
+        ext.sm89_sparse_mla_decode_cuda_splitk.assert_not_called()
+
+    def test_splitk_direct_extension_rejects_sm_scale_fp32_overflow(self):
+        from sglang.srt.layers.attention.dsa import sm89_sparse_mla_cuda
+
+        ext, _ = self._splitk_extension_identity()
+        case = self._make_exact_splitk_case()
+        with self.assertRaisesRegex(RuntimeError, "FP32 sm_scale"):
+            ext.sm89_sparse_mla_decode_cuda_splitk(
+                case["q_nope"],
+                case["q_rope"],
+                case["kv_cache"],
+                case["page_table"],
+                case["cache_seqlens"],
+                1e300,
+                0.0,
+                512,
+                32,
+            )
+
+        source_path = (
+            Path(sm89_sparse_mla_cuda.__file__).resolve().parent
+            / "csrc"
+            / "sm89_sparse_mla_cuda.cu"
+        )
+        source = source_path.read_text(encoding="utf-8")
+        launcher = _cuda_kernel_source_body(
+            source, "Sm89SparseMlaSplitKResult launch_sm89_sparse_mla_splitk("
+        )
+        validation = launcher.index(
+            "const float effective_sm_scale = validate_sm89_sparse_mla_splitk("
+        )
+        allocation = launcher.index("auto partial_o = torch::empty(")
+        launch = launcher.index("launch_sm89_sparse_mla_splitk_partial(", allocation)
+        self.assertLess(validation, allocation)
+        self.assertLess(validation, launch)
+
+    def test_splitk_direct_extension_repeats_layout_checks(self):
+        ext, _ = self._splitk_extension_identity()
+        case = self._make_exact_splitk_case()
+        pool_size = case["kv_cache"].shape[0]
+        invalid = (
+            (
+                "q_stride",
+                case
+                | {
+                    "q_nope": case["q_nope"].as_strided(
+                        case["q_nope"].shape,
+                        (0, case["q_nope"].stride(1), case["q_nope"].stride(2)),
+                    )
+                },
+            ),
+            (
+                "q_rope_stride",
+                case
+                | {
+                    "q_rope": case["q_rope"].as_strided(
+                        case["q_rope"].shape,
+                        (0, case["q_rope"].stride(1), case["q_rope"].stride(2)),
+                    )
+                },
+            ),
+            (
+                "page_stride",
+                case
+                | {
+                    "page_table": case["page_table"].as_strided(
+                        case["page_table"].shape, (0, case["page_table"].stride(1))
+                    )
+                },
+            ),
+            (
+                "length_stride",
+                case
+                | {
+                    "cache_seqlens": torch.zeros(
+                        1, device="cuda", dtype=torch.int32
+                    ).expand(2)[:1]
+                },
+            ),
+            (
+                "kv_empty",
+                case
+                | {
+                    "kv_cache": torch.empty(
+                        0, 1, 656, device="cuda", dtype=torch.float8_e4m3fn
+                    )
+                },
+            ),
+            (
+                "kv_inner_stride",
+                case
+                | {
+                    "kv_cache": torch.empty(
+                        pool_size,
+                        1,
+                        1312,
+                        device="cuda",
+                        dtype=torch.float8_e4m3fn,
+                    ).as_strided((pool_size, 1, 656), (1312, 1312, 2))
+                },
+            ),
+            (
+                "kv_row_stride",
+                case
+                | {
+                    "kv_cache": torch.empty(
+                        pool_size,
+                        1,
+                        658,
+                        device="cuda",
+                        dtype=torch.float8_e4m3fn,
+                    )[..., :656]
+                },
+            ),
+            (
+                "kv_base_alignment",
+                case
+                | {
+                    "kv_cache": torch.empty(
+                        pool_size,
+                        1,
+                        660,
+                        device="cuda",
+                        dtype=torch.float8_e4m3fn,
+                    )[..., 1:657]
+                },
+            ),
+        )
+        for name, invalid_case in invalid:
+            with self.subTest(name=name), self.assertRaisesRegex(
+                RuntimeError, "split-K"
+            ):
+                ext.sm89_sparse_mla_decode_cuda_splitk(
+                    invalid_case["q_nope"],
+                    invalid_case["q_rope"],
+                    invalid_case["kv_cache"],
+                    invalid_case["page_table"],
+                    invalid_case["cache_seqlens"],
+                    self._SM_SCALE,
+                    0.0,
+                    512,
+                    32,
+                )
+
+    def test_splitk_complete_physical_pool_matrix(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_cuda import (
+            sm89_sparse_mla_decode_cuda_splitk,
+        )
+
+        self._splitk_extension_identity()
+        for split_tokens in (32, 64):
+            for pool_size in (32896, 131200, 262272):
+                with self.subTest(
+                    split_tokens=split_tokens, pool_size=pool_size
+                ):
+                    case = self._make_exact_splitk_case(
+                        pool_size=pool_size, seed=_SPLITK_SCALE_SEED
+                    )
+                    self._assert_exact_splitk_scales(case)
+                    expected = self._splitk_reference(case)
+                    three_stage = self._three_stage_splitk_reference(case)
+                    actual = sm89_sparse_mla_decode_cuda_splitk(
+                        **case,
+                        sm_scale=self._SM_SCALE,
+                        logit_cap=0.0,
+                        v_head_dim=512,
+                        split_tokens=split_tokens,
+                    )
+                    self._assert_splitk_numeric_gates(actual, expected)
+                    self._assert_splitk_numeric_gates(actual, three_stage)
+                    print(
+                        "SPLITK_CORRECTNESS="
+                        + json.dumps(
+                            {
+                                "split_tokens": split_tokens,
+                                "physical_pool_tokens": pool_size,
+                                "seed": _SPLITK_SCALE_SEED,
+                                "scale_formula": _SPLITK_SCALE_FORMULA_VERSION,
+                                "scale_min": 0.03125,
+                                "scale_max": 0.21875,
+                                "reference": self._splitk_metrics(actual, expected),
+                                "three_stage": self._splitk_metrics(
+                                    actual, three_stage
+                                ),
+                            },
+                            sort_keys=True,
+                        )
+                    )
+                    del actual, three_stage, expected, case
+                    torch.cuda.empty_cache()
+
+    def test_splitk_length_page_and_stride_matrix(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_cuda import (
+            sm89_sparse_mla_decode_cuda_splitk,
+        )
+
+        base = self._make_exact_splitk_case(pool_size=4096, q_layout="contiguous")
+        self.assertEqual(base["q_nope"].stride(), (16384, 512, 1))
+        self.assertEqual(base["q_rope"].stride(), (2048, 64, 1))
+        for split_tokens in (32, 64):
+            for row_len in (0, 1, 31, 32, 33, 63, 64, 65, 2047, 2048):
+                case = base | {
+                    "cache_seqlens": torch.tensor(
+                        [row_len], device="cuda", dtype=torch.int32
+                    )
+                }
+                with self.subTest(split_tokens=split_tokens, row_len=row_len):
+                    expected = self._splitk_reference(case)
+                    three_stage = self._three_stage_splitk_reference(case)
+                    actual = sm89_sparse_mla_decode_cuda_splitk(
+                        **case,
+                        sm_scale=self._SM_SCALE,
+                        logit_cap=0.0,
+                        v_head_dim=512,
+                        split_tokens=split_tokens,
+                    )
+                    self._assert_splitk_numeric_gates(actual, expected)
+                    self._assert_splitk_numeric_gates(actual, three_stage)
+
+            pages = base["page_table"].clone()
+            pages[0, 1] = -7
+            pages[0, 2] = base["kv_cache"].shape[0] + 17
+            pages[0, 100] = base["kv_cache"].shape[0] + 23
+            pages[0, 2047] = base["kv_cache"].shape[0] + 29
+            semantic_cases = {
+                "contiguous_q_rope": base,
+                "mixed": base
+                | {
+                    "page_table": pages,
+                    "cache_seqlens": torch.tensor(
+                        [65], device="cuda", dtype=torch.int32
+                    ),
+                },
+                "oversized_length": base
+                | {
+                    "page_table": pages,
+                    "cache_seqlens": torch.tensor(
+                        [4096], device="cuda", dtype=torch.int32
+                    ),
+                },
+                "negative_length": base
+                | {
+                    "page_table": pages,
+                    "cache_seqlens": torch.tensor(
+                        [-9], device="cuda", dtype=torch.int32
+                    ),
+                },
+            }
+            page_storage = torch.empty(
+                1, 4096, device="cuda", dtype=torch.int32
+            )
+            page_storage[:, ::2].copy_(base["page_table"])
+            semantic_cases["noncontiguous_page"] = base | {
+                "page_table": page_storage[:, ::2]
+            }
+            q_nope_storage = torch.empty(
+                1, 32, 1024, device="cuda", dtype=torch.bfloat16
+            )
+            q_rope_storage = torch.empty(
+                1, 32, 128, device="cuda", dtype=torch.bfloat16
+            )
+            q_nope_storage[..., ::2].copy_(base["q_nope"])
+            q_rope_storage[..., ::2].copy_(base["q_rope"])
+            noncontiguous_q_nope = q_nope_storage[..., ::2]
+            noncontiguous_q_rope = q_rope_storage[..., ::2]
+            self.assertEqual(noncontiguous_q_nope.stride(), (32768, 1024, 2))
+            self.assertEqual(noncontiguous_q_rope.stride(), (4096, 128, 2))
+            semantic_cases["noncontiguous_q_rope"] = base | {
+                "q_nope": noncontiguous_q_nope,
+                "q_rope": noncontiguous_q_rope,
+            }
+            for name, case in semantic_cases.items():
+                with self.subTest(split_tokens=split_tokens, semantics=name):
+                    expected = self._splitk_reference(case)
+                    three_stage = self._three_stage_splitk_reference(case)
+                    actual = sm89_sparse_mla_decode_cuda_splitk(
+                        **case,
+                        sm_scale=self._SM_SCALE,
+                        logit_cap=0.0,
+                        v_head_dim=512,
+                        split_tokens=split_tokens,
+                    )
+                    self._assert_splitk_numeric_gates(actual, expected)
+                    self._assert_splitk_numeric_gates(actual, three_stage)
+
+    def test_splitk_back_to_back_nondefault_stream(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_cuda import (
+            sm89_sparse_mla_decode_cuda_splitk,
+        )
+
+        for split_tokens in (32, 64):
+            case_a = self._make_exact_splitk_case(seed=_SPLITK_SCALE_SEED + 1)
+            case_b = self._make_exact_splitk_case(seed=_SPLITK_SCALE_SEED + 2)
+            case_b["page_table"] = torch.flip(case_b["page_table"], dims=(1,))
+            expected_a = self._splitk_reference(case_a)
+            expected_b = self._splitk_reference(case_b)
+            ready = torch.cuda.Event()
+            ready.record()
+            done = torch.cuda.Event()
+            stream = torch.cuda.Stream()
+            with torch.cuda.stream(stream):
+                stream.wait_event(ready)
+                actual_a = sm89_sparse_mla_decode_cuda_splitk(
+                    **case_a,
+                    sm_scale=self._SM_SCALE,
+                    logit_cap=0.0,
+                    v_head_dim=512,
+                    split_tokens=split_tokens,
+                )
+                actual_b = sm89_sparse_mla_decode_cuda_splitk(
+                    **case_b,
+                    sm_scale=self._SM_SCALE,
+                    logit_cap=0.0,
+                    v_head_dim=512,
+                    split_tokens=split_tokens,
+                )
+                done.record(stream)
+            torch.cuda.current_stream().wait_event(done)
+            torch.cuda.synchronize()
+            self._assert_splitk_numeric_gates(actual_a, expected_a)
+            self._assert_splitk_numeric_gates(actual_b, expected_b)
+            self.assertNotEqual(
+                actual_a.untyped_storage().data_ptr(),
+                actual_b.untyped_storage().data_ptr(),
+            )
+
+    def test_splitk_invalid_pages_memcheck(self):
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla_cuda import (
+            sm89_sparse_mla_decode_cuda_splitk,
+        )
+
+        self._splitk_extension_identity()
+        pool_size = 4096
+        pages = torch.arange(2048, dtype=torch.int32)
+        pages[1] = -11
+        pages[2] = pool_size + 13
+        pages[3] = pool_size + 17
+        pages[127] = pool_size + 19
+        case = self._make_exact_splitk_case(
+            pool_size=pool_size, page_table=pages, cache_seqlen=64
+        )
+        for split_tokens in (32, 64):
+            out = sm89_sparse_mla_decode_cuda_splitk(
+                **case,
+                sm_scale=self._SM_SCALE,
+                logit_cap=0.0,
+                v_head_dim=512,
+                split_tokens=split_tokens,
+            )
+            self.assertEqual(out.shape, (1, 32, 512))
+            self.assertEqual(out.dtype, torch.bfloat16)
+        torch.cuda.synchronize()
+        del out, case, pages
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
     def _make_decode_case(self, batch, row_lens, seed):
         self.assertEqual(len(row_lens), batch)
         torch.manual_seed(seed)
@@ -1195,6 +2343,290 @@ class TestSm89SparseMlaDecodeCuda(unittest.TestCase):
                 "cuda_impl": "tensorcore",
             },
         )
+
+    def test_decode_kernel_routes_explicit_split_width(self):
+        from sglang.srt.layers.attention.dsa import (
+            sm89_sparse_mla,
+            sm89_sparse_mla_cuda,
+        )
+
+        three_stage_cases = (
+            self._make_decode_case(1, [64], seed=401),
+            self._make_decode_case(2, [1, 64], seed=402),
+        )
+        with patch.object(
+            sm89_sparse_mla,
+            "sm89_sparse_mla_prefill_cuda",
+            side_effect=lambda **kwargs: torch.ones_like(kwargs["q_nope"]),
+        ) as three_stage:
+            for case in three_stage_cases:
+                out = sm89_sparse_mla.sm89_sparse_mla_decode_cuda(
+                    **case,
+                    sm_scale=self._SM_SCALE,
+                    logit_cap=30.0,
+                    v_head_dim=512,
+                    decode_kernel="three_stage",
+                )
+                self.assertEqual(out.shape, case["q_nope"].shape)
+
+        self.assertEqual(three_stage.call_count, 2)
+        for call in three_stage.call_args_list:
+            self.assertEqual(call.kwargs["block_n"], 32)
+            self.assertEqual(call.kwargs["cuda_impl"], "tensorcore")
+            self.assertEqual(call.kwargs["logit_cap"], 30.0)
+
+        split_case = self._make_decode_case(1, [64], seed=403)
+        self.assertTrue(all(stride > 0 for stride in split_case["q_nope"].stride()))
+        self.assertTrue(all(stride > 0 for stride in split_case["q_rope"].stride()))
+        self.assertTrue(
+            all(stride > 0 for stride in split_case["page_table"].stride())
+        )
+        self.assertEqual(split_case["cache_seqlens"].stride(0), 1)
+        self.assertEqual(split_case["kv_cache"].stride(2), 1)
+        self.assertGreaterEqual(split_case["kv_cache"].stride(0), 656)
+        self.assertEqual(split_case["kv_cache"].stride(0) % 4, 0)
+        self.assertEqual(split_case["kv_cache"].data_ptr() % 16, 0)
+
+        for selector, split_tokens in (("splitk32", 32), ("splitk64", 64)):
+            sentinel = torch.ones_like(split_case["q_nope"])
+            split_op = MagicMock(return_value=sentinel)
+            ext = SimpleNamespace(sm89_sparse_mla_decode_cuda_splitk=split_op)
+            with patch.object(
+                sm89_sparse_mla_cuda,
+                "_load_sm89_sparse_mla_cuda_ext",
+                return_value=ext,
+            ) as load_ext:
+                out = sm89_sparse_mla.sm89_sparse_mla_decode_cuda(
+                    **split_case,
+                    sm_scale=self._SM_SCALE,
+                    logit_cap=0.0,
+                    v_head_dim=512,
+                    decode_kernel=selector,
+                )
+
+            self.assertIs(out, sentinel)
+            load_ext.assert_called_once_with()
+            split_op.assert_called_once_with(
+                split_case["q_nope"],
+                split_case["q_rope"],
+                split_case["kv_cache"],
+                split_case["page_table"],
+                split_case["cache_seqlens"],
+                torch.tensor(self._SM_SCALE, dtype=torch.float32).item(),
+                0.0,
+                512,
+                split_tokens,
+            )
+
+    def test_decode_kernel_rejects_split_contract_before_extension_load(self):
+        from sglang.srt.layers.attention.dsa import (
+            sm89_sparse_mla,
+            sm89_sparse_mla_cuda,
+        )
+
+        case = self._make_decode_case(1, [64], seed=404)
+        pool_size = case["kv_cache"].shape[0]
+        bad_kv_inner_stride = torch.empty(
+            pool_size, 1, 1312, device="cuda", dtype=torch.float8_e4m3fn
+        ).as_strided((pool_size, 1, 656), (1312, 1312, 2))
+        bad_kv_row_stride = torch.empty(
+            pool_size, 1, 658, device="cuda", dtype=torch.float8_e4m3fn
+        )[..., :656]
+        bad_kv_base_alignment = torch.empty(
+            pool_size, 1, 660, device="cuda", dtype=torch.float8_e4m3fn
+        )[..., 1:657]
+        invalid_cases = {
+            "batch": self._make_decode_case(2, [1, 64], seed=405),
+            "heads": case
+            | {
+                "q_nope": case["q_nope"][:, :31],
+                "q_rope": case["q_rope"][:, :31],
+            },
+            "topk": case | {"page_table": case["page_table"][:, :1024]},
+            "q_nope_dtype": case | {"q_nope": case["q_nope"].float()},
+            "q_nope_rank": case
+            | {"q_nope": case["q_nope"].unsqueeze(0)},
+            "q_rope_dtype": case | {"q_rope": case["q_rope"].float()},
+            "page_table_dtype": case | {"page_table": case["page_table"].long()},
+            "page_table_rank": case
+            | {"page_table": case["page_table"].unsqueeze(0)},
+            "cache_seqlens_dtype": case
+            | {"cache_seqlens": case["cache_seqlens"].long()},
+            "cache_seqlens_shape": case
+            | {"cache_seqlens": case["cache_seqlens"].unsqueeze(1)},
+            "kv_cache_dtype": case | {"kv_cache": case["kv_cache"].bfloat16()},
+            "kv_cache_rank": case | {"kv_cache": case["kv_cache"].unsqueeze(0)},
+            "device": case | {"q_rope": case["q_rope"].cpu()},
+            "q_stride": case
+            | {
+                "q_nope": case["q_nope"].as_strided(
+                    case["q_nope"].shape,
+                    (0, case["q_nope"].stride(1), case["q_nope"].stride(2)),
+                )
+            },
+            "q_rope_stride": case
+            | {
+                "q_rope": case["q_rope"].as_strided(
+                    case["q_rope"].shape,
+                    (0, case["q_rope"].stride(1), case["q_rope"].stride(2)),
+                )
+            },
+            "page_stride": case
+            | {
+                "page_table": case["page_table"].as_strided(
+                    case["page_table"].shape, (0, case["page_table"].stride(1))
+                )
+            },
+            "cache_stride": case
+            | {
+                "cache_seqlens": torch.zeros(
+                    1, device="cuda", dtype=torch.int32
+                ).expand(2)[:1]
+            },
+            "kv_inner_stride": case | {"kv_cache": bad_kv_inner_stride},
+            "kv_row_stride": case | {"kv_cache": bad_kv_row_stride},
+            "kv_base_alignment": case | {"kv_cache": bad_kv_base_alignment},
+        }
+        split_op = MagicMock()
+        ext = SimpleNamespace(sm89_sparse_mla_decode_cuda_splitk=split_op)
+        with patch.object(
+            sm89_sparse_mla_cuda,
+            "_load_sm89_sparse_mla_cuda_ext",
+            return_value=ext,
+        ) as load_ext:
+            for name, invalid_case in invalid_cases.items():
+                with self.subTest(name=name), self.assertRaisesRegex(
+                    ValueError, "sm89_cuda decode"
+                ):
+                    sm89_sparse_mla.sm89_sparse_mla_decode_cuda(
+                        **invalid_case,
+                        sm_scale=self._SM_SCALE,
+                        logit_cap=0.0,
+                        v_head_dim=512,
+                        decode_kernel="splitk32",
+                    )
+            with patch.object(
+                sm89_sparse_mla_cuda,
+                "splitk_workspace_schema",
+                return_value={"workspace_bytes": 32 * 1024 * 1024},
+            ), self.assertRaisesRegex(ValueError, "workspace"):
+                sm89_sparse_mla.sm89_sparse_mla_decode_cuda(
+                    **case,
+                    sm_scale=self._SM_SCALE,
+                    logit_cap=0.0,
+                    v_head_dim=512,
+                    decode_kernel="splitk32",
+                )
+
+        load_ext.assert_not_called()
+        split_op.assert_not_called()
+
+    def test_decode_kernel_rejects_nonfinite_and_negative_caps(self):
+        from sglang.srt.layers.attention.dsa import (
+            sm89_sparse_mla,
+            sm89_sparse_mla_cuda,
+        )
+
+        case = self._make_decode_case(1, [64], seed=406)
+        split_op = MagicMock()
+        ext = SimpleNamespace(sm89_sparse_mla_decode_cuda_splitk=split_op)
+        with patch.object(
+            sm89_sparse_mla,
+            "sm89_sparse_mla_prefill_cuda",
+            return_value=torch.ones_like(case["q_nope"]),
+        ) as three_stage, patch.object(
+            sm89_sparse_mla_cuda,
+            "_load_sm89_sparse_mla_cuda_ext",
+            return_value=ext,
+        ) as load_ext:
+            for selector in ("three_stage", "splitk32", "splitk64"):
+                for logit_cap in (-1.0, float("nan"), float("inf"), float("-inf")):
+                    with self.subTest(selector=selector, logit_cap=logit_cap), self.assertRaisesRegex(
+                        ValueError, "finite and nonnegative"
+                    ):
+                        sm89_sparse_mla.sm89_sparse_mla_decode_cuda(
+                            **case,
+                            sm_scale=self._SM_SCALE,
+                            logit_cap=logit_cap,
+                            v_head_dim=512,
+                            decode_kernel=selector,
+                        )
+
+            sentinel = torch.ones_like(case["q_nope"])
+            three_stage.return_value = sentinel
+            self.assertIs(
+                sm89_sparse_mla.sm89_sparse_mla_decode_cuda(
+                    **case,
+                    sm_scale=self._SM_SCALE,
+                    logit_cap=30.0,
+                    v_head_dim=512,
+                    decode_kernel="three_stage",
+                ),
+                sentinel,
+            )
+            for selector in ("splitk32", "splitk64"):
+                with self.subTest(selector=selector), self.assertRaisesRegex(
+                    ValueError, "logit_cap=0"
+                ):
+                    sm89_sparse_mla.sm89_sparse_mla_decode_cuda(
+                        **case,
+                        sm_scale=self._SM_SCALE,
+                        logit_cap=30.0,
+                        v_head_dim=512,
+                        decode_kernel=selector,
+                    )
+
+        self.assertEqual(three_stage.call_count, 1)
+        load_ext.assert_not_called()
+        split_op.assert_not_called()
+
+    def test_decode_kernel_logs_exact_selector_once(self):
+        from sglang.srt.layers.attention.dsa import (
+            sm89_sparse_mla,
+            sm89_sparse_mla_cuda,
+        )
+
+        case = self._make_decode_case(1, [64], seed=407)
+        ext = SimpleNamespace(
+            sm89_sparse_mla_decode_cuda_splitk=MagicMock(
+                return_value=torch.ones_like(case["q_nope"])
+            )
+        )
+        sm89_sparse_mla._logged_decode_kernels.clear()
+        try:
+            with patch.object(
+                sm89_sparse_mla_cuda,
+                "_load_sm89_sparse_mla_cuda_ext",
+                return_value=ext,
+            ), patch.object(sm89_sparse_mla.logger, "info") as mock_info:
+                for selector in ("splitk32", "splitk32", "splitk64"):
+                    sm89_sparse_mla.sm89_sparse_mla_decode_cuda(
+                        **case,
+                        sm_scale=self._SM_SCALE,
+                        logit_cap=0.0,
+                        v_head_dim=512,
+                        decode_kernel=selector,
+                    )
+
+            self.assertEqual(mock_info.call_count, 2)
+            self.assertEqual(
+                mock_info.call_args_list[0].args,
+                (
+                    "GLM DSA SM89 effective decode kernel is %s selected by %s.",
+                    "splitk32",
+                    "SGLANG_GLM_DSA_SM89_DECODE_KERNEL",
+                ),
+            )
+            self.assertEqual(
+                mock_info.call_args_list[1].args,
+                (
+                    "GLM DSA SM89 effective decode kernel is %s selected by %s.",
+                    "splitk64",
+                    "SGLANG_GLM_DSA_SM89_DECODE_KERNEL",
+                ),
+            )
+        finally:
+            sm89_sparse_mla._logged_decode_kernels.clear()
 
     def test_decode_cuda_matches_reference_for_batch_shapes_and_softcaps(self):
         row_lens_by_batch = {

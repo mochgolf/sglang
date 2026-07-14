@@ -13,6 +13,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
     fused_store_index_k_cache,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.sm89_debug import profile_region
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
     is_dsa_enable_prefill_cp,
@@ -113,21 +114,41 @@ def _use_glm_sm89_dsa_fallback() -> bool:
     return _server_args_enable_glm_sm89_dsa_fallback(server_args)
 
 
-def _select_glm_sm89_fallback_topk(indexer, q_fp8, weights, forward_batch, layer_id):
-    if is_in_tc_piecewise_cuda_graph():
-        raise RuntimeError(
-            "GLM DSA SM89 fallback uses the graph-off indexer path; "
-            "disable piecewise CUDA graph for this configuration."
-        )
-    topk_result = indexer.forward_indexer(
-        q_fp8.contiguous(),
-        weights,
-        forward_batch,
-        topk=indexer.index_topk,
-        layer_id=layer_id,
-    )
-    topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
-    return maybe_capture_indexer_topk(layer_id, topk_result)
+def _select_glm_sm89_fallback_topk(
+    indexer, q_fp8, weights, forward_batch, metadata, layer_id
+):
+    with profile_region(f"dsa.indexer.layer.{layer_id}"):
+        if is_in_tc_piecewise_cuda_graph():
+            raise RuntimeError(
+                "GLM DSA SM89 fallback does not support TC-piecewise CUDA graph; "
+                "use full decode CUDA graph or disable prefill CUDA graph."
+            )
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_draft_extend_v2()
+        ):
+            assert metadata is not None, (
+                "GLM DSA SM89 paged indexer requires resolved metadata outside "
+                "TC-piecewise CUDA graph"
+            )
+            topk_result = indexer._get_topk_paged(
+                forward_batch,
+                layer_id,
+                q_fp8,
+                weights,
+                metadata,
+            )
+        else:
+            topk_result = indexer.forward_indexer(
+                q_fp8.contiguous(),
+                weights,
+                forward_batch,
+                topk=indexer.index_topk,
+                layer_id=layer_id,
+            )
+        topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+        return maybe_capture_indexer_topk(layer_id, topk_result)
 
 
 def _uses_dsa_attention_backend(forward_batch: ForwardBatch) -> bool:
@@ -675,99 +696,117 @@ class Indexer(MultiPlatformOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
-        # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
-        # otherwise fall back to computing it here.
-        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
 
         assert len(q_fp8.shape) == 3
-        # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
-        # hidden states; q_offset is the real (unpadded) q length.
+        # TP/DP padding can leave extra query rows that are not represented in
+        # the indexer metadata. Keep those rows out of every paged logits path.
         q_offset = sum(metadata.get_dsa_extend_len_cpu())
 
-        # DG-native q=[B,next_n,H,D] is faster than expanded q=[B*next_n,1,H,D]
-        # for target_verify with next_n>=2 (bigger MMA tile, fewer atoms). The
-        # precomputed ctx_lens_2d's shape is the single source of truth — if
-        # dsa_backend chose the per-token layout (e.g. non-SM100), fall through
-        # to the expanded path.
-        B = metadata.get_seqlens_int32().shape[0]
-        next_n = q_offset // B if B > 0 else 0
-        ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
-        use_dg_native = (
-            _is_cuda
-            and forward_batch.forward_mode.is_target_verify()
-            and next_n >= 2
-            and ctx_2d is not None
-            and ctx_2d.shape == (B, next_n)
-        )
+        if self.use_glm_sm89_dsa_fallback:
+            from sglang.srt.layers.attention.dsa.sm89_paged_indexer import (
+                sm89_paged_fp8_index_logits,
+            )
 
-        if use_dg_native:
-            seqlens_32_2d = ctx_2d
-        elif seqlens_32.dim() == 2:
-            seqlens_32_2d = seqlens_32
+            assert len(kv_cache_fp8.shape) == 2
+            assert len(weights.shape) == 3
+            logits = sm89_paged_fp8_index_logits(
+                q_fp8[:q_offset].unsqueeze(1),
+                kv_cache_fp8,
+                weights[:q_offset].squeeze(2),
+                seqlens_32,
+                block_tables,
+                max_seq_len,
+            )
         else:
-            seqlens_32_2d = seqlens_32.unsqueeze(-1)
-        if _is_cuda:
-            if schedule_metadata is None:
+            # Reuse metadata precomputed by init_forward_metadata when present.
+            schedule_metadata = getattr(
+                metadata, "paged_mqa_schedule_metadata", None
+            )
+
+            # DG-native q=[B,next_n,H,D] is faster than expanded
+            # q=[B*next_n,1,H,D] for target_verify with next_n>=2.
+            B = metadata.get_seqlens_int32().shape[0]
+            next_n = q_offset // B if B > 0 else 0
+            ctx_2d = getattr(metadata, "paged_mqa_ctx_lens_2d", None)
+            use_dg_native = (
+                _is_cuda
+                and forward_batch.forward_mode.is_target_verify()
+                and next_n >= 2
+                and ctx_2d is not None
+                and ctx_2d.shape == (B, next_n)
+            )
+
+            if use_dg_native:
+                seqlens_32_2d = ctx_2d
+            elif seqlens_32.dim() == 2:
+                seqlens_32_2d = seqlens_32
+            else:
+                seqlens_32_2d = seqlens_32.unsqueeze(-1)
+            if _is_cuda and schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
-        assert len(kv_cache_fp8.shape) == 2
-        block_kv = page_size
-        num_heads_kv = 1
-        head_dim_with_sf = 132
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
-        assert len(weights.shape) == 3
-        weights = weights.squeeze(2)
+            assert len(kv_cache_fp8.shape) == 2
+            block_kv = page_size
+            num_heads_kv = 1
+            head_dim_with_sf = 132
+            kv_cache_fp8 = kv_cache_fp8.view(
+                kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
+            assert len(weights.shape) == 3
+            weights = weights.squeeze(2)
 
-        if _is_hip:
-            from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+            if _is_hip:
+                from aiter.ops.triton.pa_mqa_logits import (
+                    deepgemm_fp8_paged_mqa_logits,
+                )
 
-            q_fp8 = q_fp8.unsqueeze(1)
-            batch_size, next_n, heads, _ = q_fp8.shape
-            logits = torch.empty(
-                (batch_size * next_n, max_seq_len),
-                device=q_fp8.device,
-                dtype=torch.float32,
-            )
-            deepgemm_fp8_paged_mqa_logits(
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                logits,
-                seqlens_32,
-                block_tables,
-                max_seq_len,
-                Preshuffle=_use_aiter_preshuffle,
-                KVBlockSize=block_kv,
-            )
-        elif use_dg_native:
-            # block_tables[::next_n] de-expands dsa_backend's repeat_interleave
-            # without a copy (DG only checks `stride(1) == 1`).
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8[:q_offset].view(B, next_n, q_fp8.shape[1], q_fp8.shape[2]),
-                kv_cache_fp8,
-                weights[:q_offset],
-                seqlens_32_2d,
-                block_tables[::next_n],
-                schedule_metadata,
-                max_seq_len,
-                clean_logits=False,
-            )
-        else:
-            q_fp8 = q_fp8.unsqueeze(1)
-            logits = deep_gemm.fp8_paged_mqa_logits(
-                q_fp8[:q_offset],
-                kv_cache_fp8,
-                weights[:q_offset],
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                clean_logits=False,
-            )
+                q_fp8 = q_fp8.unsqueeze(1)
+                batch_size, next_n, heads, _ = q_fp8.shape
+                logits = torch.empty(
+                    (batch_size * next_n, max_seq_len),
+                    device=q_fp8.device,
+                    dtype=torch.float32,
+                )
+                deepgemm_fp8_paged_mqa_logits(
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    logits,
+                    seqlens_32,
+                    block_tables,
+                    max_seq_len,
+                    Preshuffle=_use_aiter_preshuffle,
+                    KVBlockSize=block_kv,
+                )
+            elif use_dg_native:
+                # block_tables[::next_n] de-expands dsa_backend's
+                # repeat_interleave without a copy.
+                logits = deep_gemm.fp8_paged_mqa_logits(
+                    q_fp8[:q_offset].view(
+                        B, next_n, q_fp8.shape[1], q_fp8.shape[2]
+                    ),
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32_2d,
+                    block_tables[::next_n],
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=False,
+                )
+            else:
+                q_fp8 = q_fp8.unsqueeze(1)
+                logits = deep_gemm.fp8_paged_mqa_logits(
+                    q_fp8[:q_offset],
+                    kv_cache_fp8,
+                    weights[:q_offset],
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    clean_logits=False,
+                )
 
         # NOTE(dark): logits should be cleaned in topk_transform
         topk_result = metadata.topk_transform(logits, self.index_topk)
@@ -1575,7 +1614,7 @@ class Indexer(MultiPlatformOp):
 
         if self.use_glm_sm89_dsa_fallback:
             return _select_glm_sm89_fallback_topk(
-                self, q_fp8, weights, forward_batch, layer_id
+                self, q_fp8, weights, forward_batch, metadata, layer_id
             )
 
         if _is_cuda or _is_hip:

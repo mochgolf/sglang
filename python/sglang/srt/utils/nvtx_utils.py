@@ -18,14 +18,14 @@ A span has two independent emitters:
 * ``record_function`` -- emitted whenever a torch profiler is active, so spans
   show up in torch/Perfetto traces for free (no env, no extra package).
 * ``nvtx`` range -- emitted only when the caller opts in via ``nvtx_enabled``
-  (wired to a per-subsystem ``SGLANG_ENABLE_NVTX_*`` gate) and the ``nvtx``
-  package is importable, for Nsight Systems timelines.
+  (wired to a per-subsystem ``SGLANG_ENABLE_NVTX_*`` gate), for Nsight Systems
+  timelines. The optional ``nvtx`` package is preferred, with
+  ``torch.cuda.nvtx`` as the built-in fallback.
 
 Decoupling the two lets every annotation site -- scheduler stages, batch-overlap
 ops, and the speculative-decoding / forward spans -- share one primitive.
 """
 
-import logging
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial, wraps
 from typing import Optional
@@ -33,8 +33,6 @@ from typing import Optional
 import torch
 
 from sglang.srt.environ import envs
-
-logger = logging.getLogger(__name__)
 
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()
@@ -44,14 +42,12 @@ if _SCHEDULER_NVTX or _OPERATIONS_NVTX:
     try:
         import nvtx as _nvtx_module  # type: ignore
     except ImportError:
-        logger.warning(
-            "An SGLANG_ENABLE_NVTX_* flag is set, but the `nvtx` package is "
-            "missing. NVTX markers are disabled; torch profiler spans still emit."
-        )
+        pass
 
-NVTX_AVAILABLE = _nvtx_module is not None
-# Per-subsystem nvtx gates: emit nvtx ranges only when the flag is set AND the
-# package is importable. The record_function path is independent of both.
+NVTX_AVAILABLE = _nvtx_module is not None or hasattr(torch.cuda, "nvtx")
+# Per-subsystem nvtx gates: emit nvtx ranges only when the flag is set and an
+# optional-package or built-in emitter is available. The record_function path
+# is independent of both.
 NVTX_SCHEDULER_ENABLED = _SCHEDULER_NVTX and NVTX_AVAILABLE
 NVTX_OPERATIONS_ENABLED = _OPERATIONS_NVTX and NVTX_AVAILABLE
 
@@ -68,6 +64,15 @@ _NULL_CONTEXT = nullcontext()
 
 
 @contextmanager
+def _torch_nvtx_range(debug_name: str):
+    torch.cuda.nvtx.range_push(debug_name)
+    try:
+        yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
+@contextmanager
 def _profile_range_impl(
     debug_name: str, color: Optional[str], record: bool, nvtx_enabled: bool
 ):
@@ -77,7 +82,12 @@ def _profile_range_impl(
         if nvtx_enabled:
             if color is None:
                 color = _NVTX_COLOR_MAP.get(debug_name)
-            stack.enter_context(_nvtx_module.annotate(debug_name, color=color))
+            nvtx_context = (
+                _nvtx_module.annotate(debug_name, color=color)
+                if _nvtx_module is not None
+                else _torch_nvtx_range(debug_name)
+            )
+            stack.enter_context(nvtx_context)
         yield
 
 

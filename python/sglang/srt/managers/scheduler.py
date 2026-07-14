@@ -15,6 +15,7 @@
 
 import dataclasses
 import faulthandler
+import json
 import logging
 import os
 import signal
@@ -25,7 +26,18 @@ from collections import deque
 from contextlib import contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import Any, Deque, Dict, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Deque,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
@@ -287,6 +299,378 @@ TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
 _is_npu = is_npu()
+
+_SM89_DECODE_RESIDUAL_EXPECTED_KT_LAYER_IDS = tuple(range(3, 78))
+_SM89_DECODE_RESIDUAL_EXPECTED_INDEXER_LAYER_IDS = (
+    0,
+    1,
+    2,
+    *range(6, 75, 4),
+)
+
+
+def _derive_sm89_decode_residual_layer_ids(
+    *,
+    num_hidden_layers: int,
+    first_k_dense_replace: int,
+    index_topk_freq: int,
+    index_skip_topk_offset: Optional[int] = None,
+    indexer_types: Optional[Sequence[str]] = None,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    if not (0 <= first_k_dense_replace <= num_hidden_layers):
+        raise ValueError("first_k_dense_replace must be within the model layers")
+    if index_topk_freq <= 0:
+        raise ValueError("index_topk_freq must be positive")
+    if index_skip_topk_offset is not None and index_skip_topk_offset <= 0:
+        raise ValueError("index_skip_topk_offset must be positive")
+
+    kt_layers = tuple(range(first_k_dense_replace, num_hidden_layers))
+    if index_skip_topk_offset is None:
+        indexer_layers = tuple(
+            layer_id
+            for layer_id in range(num_hidden_layers)
+            if max(layer_id - 1, 0) % index_topk_freq == 0
+        )
+    else:
+        indexer_layers = tuple(
+            layer_id
+            for layer_id in range(num_hidden_layers)
+            if max(layer_id - index_skip_topk_offset + 1, 0)
+            % index_topk_freq
+            == 0
+        )
+
+    if indexer_types is not None:
+        if len(indexer_types) != num_hidden_layers:
+            raise ValueError("indexer_types must cover every hidden layer")
+        unknown_types = set(indexer_types) - {"full", "shared"}
+        if unknown_types:
+            raise ValueError(f"unknown indexer_types entries: {unknown_types}")
+        typed_indexer_layers = tuple(
+            layer_id
+            for layer_id, indexer_type in enumerate(indexer_types)
+            if indexer_type == "full"
+        )
+        if typed_indexer_layers != indexer_layers:
+            raise ValueError(
+                "indexer_types disagree with index_topk_freq/"
+                "index_skip_topk_offset"
+            )
+        indexer_layers = typed_indexer_layers
+    return kt_layers, indexer_layers
+
+
+@dataclasses.dataclass(slots=True)
+class _SM89DecodeResidualMarkerState:
+    emit: Callable[[str], None]
+    begin_decode_aggregate: Optional[Callable[[int], None]] = None
+    end_decode_aggregate: Optional[Callable[[int], Any]] = None
+    rid: Optional[str] = None
+    completion_tokens: int = 0
+    accepted_decode_results: int = 0
+    discarded_decode_results: int = 0
+    decode_forward_count: int = 0
+    _pending_forward_ids: set[int] = dataclasses.field(default_factory=set)
+    _accounted_forward_ids: set[int] = dataclasses.field(default_factory=set)
+    _aggregate_session_nonce: Optional[int] = None
+    _aggregate_end_attempted: bool = False
+    _ended: bool = False
+    _failed: bool = False
+
+    @staticmethod
+    def is_target_rid(rid: str) -> bool:
+        return rid.startswith("residual:") and len(rid) > len("residual:")
+
+    def _fail(self, message: str) -> None:
+        self._failed = True
+        raise RuntimeError(f"SM89 residual marker accounting failed: {message}")
+
+    def _require_active_rid(self, rid: str) -> None:
+        if self._failed:
+            raise RuntimeError("SM89 residual marker accounting is failed closed")
+        if self._ended:
+            self._fail("target work appended after PROFILE_END")
+        if self.rid != rid:
+            self._fail(f"target RID changed from {self.rid!r} to {rid!r}")
+
+    @staticmethod
+    def _require_nonnegative_int(value: Any, name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{name} must be a nonnegative integer")
+        return value
+
+    def _begin_aggregate(self, forward_id: int) -> None:
+        if self.begin_decode_aggregate is None and self.end_decode_aggregate is None:
+            return
+        if self.begin_decode_aggregate is None or self.end_decode_aggregate is None:
+            self._fail("aggregate ABI is incomplete")
+        try:
+            self._aggregate_session_nonce = self._require_nonnegative_int(
+                forward_id, "aggregate session nonce"
+            )
+            self.begin_decode_aggregate(self._aggregate_session_nonce)
+        except Exception as exc:
+            self._fail(f"aggregate begin failed: {exc}")
+
+    def _validate_aggregate(self, aggregate: Any, launched: int) -> None:
+        stage_groups = {
+            "cpuinfer": ("submit_callback", "task", "sync_callback", "sync_wait"),
+            "tp_moe": ("total", "merge"),
+            "amx_m1": (
+                "setup",
+                "q_input",
+                "gate_up",
+                "activation",
+                "q_down",
+                "down",
+                "weighted_sum",
+                "total",
+            ),
+        }
+        if not isinstance(aggregate, dict) or set(aggregate) != set(stage_groups):
+            self._fail("aggregate schema has unexpected top-level fields")
+
+        first_count = 75 * min(launched, 64)
+        second_count = 75 * max(launched - 64, 0)
+        total_count = 75 * launched
+        for group_name, stage_names in stage_groups.items():
+            group = aggregate[group_name]
+            if not isinstance(group, dict) or set(group) != set(stage_names):
+                self._fail(f"aggregate schema has invalid {group_name} stages")
+            for stage_name in stage_names:
+                stage = group[stage_name]
+                if not isinstance(stage, dict) or set(stage) != {
+                    "first",
+                    "second",
+                    "total",
+                }:
+                    self._fail(
+                        f"aggregate schema has invalid {group_name}.{stage_name} buckets"
+                    )
+                values: dict[str, tuple[int, int]] = {}
+                for bucket_name in ("first", "second", "total"):
+                    value = stage[bucket_name]
+                    if not isinstance(value, dict) or set(value) != {"ns", "count"}:
+                        self._fail(
+                            "aggregate schema has invalid "
+                            f"{group_name}.{stage_name}.{bucket_name} value"
+                        )
+                    try:
+                        values[bucket_name] = (
+                            self._require_nonnegative_int(
+                                value["ns"],
+                                f"aggregate {group_name}.{stage_name}.{bucket_name}.ns",
+                            ),
+                            self._require_nonnegative_int(
+                                value["count"],
+                                f"aggregate {group_name}.{stage_name}.{bucket_name}.count",
+                            ),
+                        )
+                    except ValueError as exc:
+                        self._fail(str(exc))
+
+                first_ns, observed_first_count = values["first"]
+                second_ns, observed_second_count = values["second"]
+                total_ns, observed_total_count = values["total"]
+                if (
+                    observed_first_count != first_count
+                    or observed_second_count != second_count
+                    or observed_total_count != total_count
+                ):
+                    self._fail(
+                        "aggregate counts disagree with scheduler decode forward count"
+                    )
+                if (
+                    observed_first_count + observed_second_count != observed_total_count
+                    or first_ns + second_ns != total_ns
+                ):
+                    self._fail("aggregate bucket identities are inconsistent")
+
+    def _end_aggregate(self, launched: int) -> None:
+        if self.begin_decode_aggregate is None and self.end_decode_aggregate is None:
+            return
+        if self.end_decode_aggregate is None or self._aggregate_session_nonce is None:
+            self._fail("aggregate session was not started")
+        if self._aggregate_end_attempted:
+            self._fail("aggregate session ended more than once")
+        self._aggregate_end_attempted = True
+        try:
+            aggregate = self.end_decode_aggregate(self._aggregate_session_nonce)
+        except Exception as exc:
+            self._fail(f"aggregate end failed: {exc}")
+        self._validate_aggregate(aggregate, launched)
+        assert self.rid is not None
+        self.emit(
+            f"PROFILE_KT rid={self.rid} aggregate="
+            f"{json.dumps(aggregate, sort_keys=True, separators=(',', ':'))}"
+        )
+
+    def record_launch(
+        self,
+        *,
+        forward_id: int,
+        rid: str,
+        completion_tokens: int,
+        max_new_tokens: int,
+    ) -> bool:
+        if not self.is_target_rid(rid):
+            return False
+        if self._failed:
+            raise RuntimeError("SM89 residual marker accounting is failed closed")
+        if self._ended:
+            self._fail("target work appended after PROFILE_END")
+
+        if self.rid is None:
+            if max_new_tokens != 128:
+                self._fail("target request max_new_tokens must be 128")
+            if completion_tokens != 0:
+                self._fail("first decode completion baseline must be 0")
+            self._begin_aggregate(forward_id)
+            self.rid = rid
+            self.emit(f"PROFILE_BEGIN rid={rid}")
+        else:
+            self._require_active_rid(rid)
+
+        if self.completion_tokens == 128:
+            self._fail("target decode launched after exact completion")
+        if (
+            forward_id in self._pending_forward_ids
+            or forward_id in self._accounted_forward_ids
+        ):
+            self._fail(f"duplicate target launch for forward {forward_id}")
+
+        self._pending_forward_ids.add(forward_id)
+        self.decode_forward_count += 1
+        return True
+
+    def prepare_result(self, *, forward_id: int, rid: str) -> None:
+        self._require_active_rid(rid)
+        if forward_id in self._accounted_forward_ids:
+            self._fail(f"duplicate target result for forward {forward_id}")
+        if forward_id not in self._pending_forward_ids:
+            self._fail(f"unknown target result for forward {forward_id}")
+
+    def record_result(
+        self,
+        *,
+        forward_id: int,
+        rid: str,
+        accepted: bool,
+        completion_tokens: int,
+    ) -> None:
+        self.prepare_result(forward_id=forward_id, rid=rid)
+
+        if accepted:
+            expected_completion_tokens = self.accepted_decode_results + 2
+            if completion_tokens != expected_completion_tokens:
+                self._fail(
+                    "accepted target result did not advance exactly one "
+                    "completion token"
+                )
+            if self.accepted_decode_results >= 127:
+                self._fail("accepted more than 127 target decode results")
+            self.accepted_decode_results += 1
+        else:
+            if self.accepted_decode_results != 127 or completion_tokens != 128:
+                self._fail("discarded target result preceded exact completion")
+            self.discarded_decode_results += 1
+
+        self.completion_tokens = completion_tokens
+        self._pending_forward_ids.remove(forward_id)
+        self._accounted_forward_ids.add(forward_id)
+
+        if self.accepted_decode_results == 127 and not self._pending_forward_ids:
+            self._finalize()
+
+    def _finalize(self) -> None:
+        discarded = self.discarded_decode_results
+        launched = self.decode_forward_count
+        if self.completion_tokens != 128:
+            self._fail("completion token count is not 128")
+        if self.accepted_decode_results != 127:
+            self._fail("accepted decode result count is not 127")
+        if discarded != launched - 127:
+            self._fail("discarded result count does not equal launched count minus 127")
+        if self.accepted_decode_results + discarded != launched:
+            self._fail("accepted and discarded results do not account for every launch")
+        if self._pending_forward_ids or len(self._accounted_forward_ids) != launched:
+            self._fail("target results remain unaccounted")
+
+        assert self.rid is not None
+        self._end_aggregate(launched)
+        self.emit(
+            f"PROFILE_ACCOUNTING rid={self.rid} completion_tokens=128 "
+            f"accepted_intervals=127 decode_forward_count={launched} "
+            f"discarded_overlap_forward_count={discarded}"
+        )
+        self.emit(f"PROFILE_END rid={self.rid}")
+        self._ended = True
+
+    def assert_drained(self) -> None:
+        if self._failed:
+            raise RuntimeError("SM89 residual marker accounting is failed closed")
+        if self.rid is None:
+            return
+        if self._pending_forward_ids:
+            self._fail(
+                f"{len(self._pending_forward_ids)} target results remain unaccounted"
+            )
+        if not self._ended:
+            self._fail("target request did not reach exact completion")
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class _SM89DecodeResidualResultObservation:
+    state: _SM89DecodeResidualMarkerState
+    req: Req
+    forward_id: int
+    completion_tokens_before: int
+    discard: bool
+
+
+def _emit_sm89_decode_residual_marker(marker: str) -> None:
+    print(marker, flush=True)
+
+
+def _create_sm89_decode_residual_marker_state(
+    environment: Mapping[str, str],
+    *,
+    tp_rank: int,
+    emit: Callable[[str], None] = _emit_sm89_decode_residual_marker,
+    begin_decode_aggregate: Optional[Callable[[int], None]] = None,
+    end_decode_aggregate: Optional[Callable[[int], Any]] = None,
+) -> Optional[_SM89DecodeResidualMarkerState]:
+    enabled = (
+        tp_rank == 0
+        and environment.get("SGLANG_GLM_DSA_SM89_PROFILE") == "0"
+        and environment.get("SGLANG_SM89_DECODE_AGGREGATE_PROFILE") in ("0", "1")
+    )
+    if not enabled:
+        return None
+    if environment["SGLANG_SM89_DECODE_AGGREGATE_PROFILE"] == "0":
+        return _SM89DecodeResidualMarkerState(emit=emit)
+
+    if (begin_decode_aggregate is None) != (end_decode_aggregate is None):
+        raise RuntimeError("SM89 residual aggregate ABI must provide begin and end")
+    if begin_decode_aggregate is None:
+        try:
+            from kt_kernel.kt_kernel_ext import (
+                begin_decode_aggregate as installed_begin_decode_aggregate,
+            )
+            from kt_kernel.kt_kernel_ext import (
+                end_decode_aggregate as installed_end_decode_aggregate,
+            )
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError("SM89 residual aggregate ABI is unavailable") from exc
+        begin_decode_aggregate = installed_begin_decode_aggregate
+        end_decode_aggregate = installed_end_decode_aggregate
+    if not callable(begin_decode_aggregate) or not callable(end_decode_aggregate):
+        raise RuntimeError("SM89 residual aggregate ABI is unavailable")
+    return _SM89DecodeResidualMarkerState(
+        emit=emit,
+        begin_decode_aggregate=begin_decode_aggregate,
+        end_decode_aggregate=end_decode_aggregate,
+    )
 
 
 class Scheduler(
@@ -974,6 +1358,31 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
         self._engine_paused = False
+        self._sm89_decode_residual_marker_state = (
+            _create_sm89_decode_residual_marker_state(
+                os.environ,
+                tp_rank=self.ps.tp_rank,
+            )
+        )
+        if self._sm89_decode_residual_marker_state is not None:
+            hf_text_config = self.model_config.hf_text_config
+            actual_layers = _derive_sm89_decode_residual_layer_ids(
+                num_hidden_layers=self.model_config.num_hidden_layers,
+                first_k_dense_replace=self.model_config.first_k_dense_replace,
+                index_topk_freq=getattr(hf_text_config, "index_topk_freq", 1),
+                index_skip_topk_offset=getattr(
+                    hf_text_config, "index_skip_topk_offset", None
+                ),
+                indexer_types=getattr(hf_text_config, "indexer_types", None),
+            )
+            expected_layers = (
+                _SM89_DECODE_RESIDUAL_EXPECTED_KT_LAYER_IDS,
+                _SM89_DECODE_RESIDUAL_EXPECTED_INDEXER_LAYER_IDS,
+            )
+            if actual_layers != expected_layers:
+                self._sm89_decode_residual_marker_state._fail(
+                    "profile model does not have the exact GLM-5.2 layer layout"
+                )
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = self.server_args.chunked_prefill_size
@@ -3097,6 +3506,70 @@ class Scheduler(
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
 
+    def _sm89_decode_residual_target_req(
+        self, batch: ScheduleBatch
+    ) -> Optional[Req]:
+        state = getattr(self, "_sm89_decode_residual_marker_state", None)
+        if state is None or not batch.forward_mode.is_decode():
+            return None
+
+        targets = [req for req in batch.reqs if state.is_target_rid(req.rid)]
+        if len(targets) > 1:
+            state._fail("one decode batch contains multiple residual target requests")
+        return targets[0] if targets else None
+
+    def _record_sm89_decode_residual_launch(self, batch: ScheduleBatch) -> None:
+        req = self._sm89_decode_residual_target_req(batch)
+        if req is None:
+            return
+        state = self._sm89_decode_residual_marker_state
+        assert state is not None
+        if not batch.spec_algorithm.is_none():
+            state._fail("residual target request must use non-speculative decode")
+        state.record_launch(
+            forward_id=batch.forward_iter,
+            rid=req.rid,
+            completion_tokens=len(req.output_ids),
+            max_new_tokens=req.sampling_params.max_new_tokens,
+        )
+
+    def _prepare_sm89_decode_residual_result(
+        self, batch: ScheduleBatch
+    ) -> Optional[_SM89DecodeResidualResultObservation]:
+        req = self._sm89_decode_residual_target_req(batch)
+        if req is None:
+            return None
+        state = self._sm89_decode_residual_marker_state
+        assert state is not None
+        state.prepare_result(forward_id=batch.forward_iter, rid=req.rid)
+        return _SM89DecodeResidualResultObservation(
+            state=state,
+            req=req,
+            forward_id=batch.forward_iter,
+            completion_tokens_before=len(req.output_ids),
+            discard=req.finished() or req.is_retracted,
+        )
+
+    @staticmethod
+    def _complete_sm89_decode_residual_result(
+        observation: Optional[_SM89DecodeResidualResultObservation],
+    ) -> None:
+        if observation is None:
+            return
+
+        completion_tokens = len(observation.req.output_ids)
+        expected_delta = 0 if observation.discard else 1
+        if completion_tokens != observation.completion_tokens_before + expected_delta:
+            observation.state._fail(
+                "target result output length disagrees with accepted/discarded state"
+            )
+        observation.state.record_result(
+            forward_id=observation.forward_id,
+            rid=observation.req.rid,
+            accepted=not observation.discard,
+            completion_tokens=completion_tokens,
+        )
+
     @contextmanager
     def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
         """Make SB transactional across one forward (overlap and non-overlap).
@@ -3163,6 +3636,8 @@ class Scheduler(
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
             return self._run_batch_prebuilt(batch)
+
+        self._record_sm89_decode_residual_launch(batch)
 
         # Run forward
         if self.is_generation:
@@ -3370,6 +3845,7 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        residual_observation = self._prepare_sm89_decode_residual_result(batch)
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
@@ -3385,6 +3861,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
 
+        self._complete_sm89_decode_residual_result(residual_observation)
         self.metrics_reporter.log_batch_result_stats(batch, result)
 
         # Emit forward pass metrics (every iteration when enabled)

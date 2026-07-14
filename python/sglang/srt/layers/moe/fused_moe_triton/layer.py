@@ -23,6 +23,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.attention.dsa.sm89_debug import (
+    glm_dsa_sm89_nsys_enabled,
     glm_dsa_sm89_profile_enabled,
     profile_region,
 )
@@ -1118,8 +1119,9 @@ class FusedMoE(torch.nn.Module):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
         profile = glm_dsa_sm89_profile_enabled()
+        annotate = profile or glm_dsa_sm89_nsys_enabled()
 
-        if profile:
+        if annotate:
             with profile_region("fused_moe.dispatch", profile):
                 dispatch_output = self.dispatcher.dispatch(
                     hidden_states=hidden_states, topk_output=topk_output
@@ -1129,7 +1131,7 @@ class FusedMoE(torch.nn.Module):
                 hidden_states=hidden_states, topk_output=topk_output
             )
 
-        if profile:
+        if annotate:
             with profile_region("fused_moe.run_moe_core", profile):
                 combine_input = self.run_moe_core(
                     dispatch_output=dispatch_output,
@@ -1142,7 +1144,7 @@ class FusedMoE(torch.nn.Module):
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
-            if profile:
+            if annotate:
                 with profile_region("fused_moe.combine", profile):
                     final_hidden_states = self.dispatcher.combine(
                         combine_input=combine_input
@@ -1158,7 +1160,7 @@ class FusedMoE(torch.nn.Module):
             ].contiguous()
 
         if self.reduce_results and (self.moe_tp_size > 1 or self.moe_ep_size > 1):
-            if profile:
+            if annotate:
                 with profile_region("fused_moe.all_reduce", profile):
                     final_hidden_states = tensor_model_parallel_all_reduce(
                         final_hidden_states

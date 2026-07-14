@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import json
 import os
 import tempfile
@@ -732,35 +733,198 @@ class TestGlmSm89DsaFallback(CustomTestCase):
         self.assertEqual(metadata.topk_backend, DSATopKBackend.SGL_KERNEL)
         self.assertFalse(metadata.force_unfused_topk)
 
-    def test_glm_sm89_fallback_indexer_uses_graph_off_forward_indexer(self):
-        from sglang.srt.layers.attention.dsa import dsa_indexer
+    def _call_glm_sm89_fallback_selector(
+        self,
+        dsa_indexer,
+        fake_indexer,
+        fake_q,
+        fake_weights,
+        fake_forward_batch,
+        fake_metadata,
+        layer_id,
+    ):
+        kwargs = {"layer_id": layer_id}
+        if "metadata" in inspect.signature(
+            dsa_indexer._select_glm_sm89_fallback_topk
+        ).parameters:
+            kwargs["metadata"] = fake_metadata
+        return dsa_indexer._select_glm_sm89_fallback_topk(
+            fake_indexer,
+            fake_q,
+            fake_weights,
+            fake_forward_batch,
+            **kwargs,
+        )
 
-        fake_topk = object()
+    def test_glm_sm89_forward_cuda_passes_resolved_metadata_to_selector(self):
+        from sglang.srt.layers.attention.dsa import dsa_indexer
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        indexer = object.__new__(dsa_indexer.Indexer)
+        torch.nn.Module.__init__(indexer)
+        indexer.alt_stream = None
+        indexer.dsa_enable_prefill_cp = False
+        indexer.use_glm_sm89_dsa_fallback = True
+        indexer.block_size = 128
+        indexer.scale_fmt = None
+        indexer.n_heads = 32
+        indexer.weights_proj = SimpleNamespace()
+
+        query = object()
+        key = object()
+        q_fp8 = object()
+        q_scale = object()
+        weights = object()
+        indexer._get_q_k_bf16 = MagicMock(return_value=(query, key))
+        indexer._store_index_k_cache = MagicMock()
+        indexer._get_logits_head_gate = MagicMock(return_value=weights)
+
+        x = torch.empty(1, 16)
+        q_lora = torch.empty(1, 16)
+        positions = torch.zeros(1, dtype=torch.int64)
+        forward_batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        metadata = object()
+        attn_backend = SimpleNamespace(
+            get_indexer_metadata=MagicMock(return_value=metadata)
+        )
+        expected = object()
+
+        with (
+            patch.object(
+                dsa_indexer, "is_in_tc_piecewise_cuda_graph", return_value=False
+            ),
+            patch.object(dsa_indexer, "get_attn_backend", return_value=attn_backend),
+            patch(
+                "sglang.srt.layers.attention.dsa.triton_kernel.act_quant",
+                return_value=(q_fp8, q_scale),
+            ),
+            patch.object(
+                dsa_indexer,
+                "_select_glm_sm89_fallback_topk",
+                return_value=expected,
+            ) as mock_select,
+        ):
+            result = indexer.forward_cuda(
+                x,
+                q_lora,
+                positions,
+                forward_batch,
+                layer_id=7,
+            )
+
+        self.assertIs(result, expected)
+        mock_select.assert_called_once_with(
+            indexer,
+            q_fp8,
+            weights,
+            forward_batch,
+            metadata,
+            7,
+        )
+
+    def test_glm_sm89_fallback_indexer_routes_decode_like_modes_to_paged(self):
+        from sglang.srt.layers.attention.dsa import dsa_indexer
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        for forward_mode in (
+            ForwardMode.DECODE,
+            ForwardMode.IDLE,
+            ForwardMode.TARGET_VERIFY,
+            ForwardMode.DRAFT_EXTEND_V2,
+        ):
+            with self.subTest(forward_mode=forward_mode):
+                paged_topk = object()
+                eager_topk = object()
+                fake_q = MagicMock()
+                fake_q.contiguous.return_value = "q-contiguous"
+                fake_weights = object()
+                fake_forward_batch = SimpleNamespace(forward_mode=forward_mode)
+                fake_metadata = object()
+                fake_indexer = SimpleNamespace(
+                    index_topk=64,
+                    _get_topk_paged=MagicMock(return_value=paged_topk),
+                    forward_indexer=MagicMock(return_value=eager_topk),
+                )
+
+                with (
+                    patch.object(
+                        dsa_indexer,
+                        "is_in_tc_piecewise_cuda_graph",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        dsa_indexer,
+                        "_broadcast_indexer_topk_from_rank0",
+                        side_effect=lambda topk: topk,
+                    ),
+                    patch.object(
+                        dsa_indexer,
+                        "maybe_capture_indexer_topk",
+                        side_effect=lambda _, topk: topk,
+                    ),
+                ):
+                    result = self._call_glm_sm89_fallback_selector(
+                        dsa_indexer,
+                        fake_indexer,
+                        fake_q,
+                        fake_weights,
+                        fake_forward_batch,
+                        fake_metadata,
+                        layer_id=7,
+                    )
+
+                self.assertIs(result, paged_topk)
+                fake_indexer._get_topk_paged.assert_called_once_with(
+                    fake_forward_batch,
+                    7,
+                    fake_q,
+                    fake_weights,
+                    fake_metadata,
+                )
+                fake_indexer.forward_indexer.assert_not_called()
+
+    def test_glm_sm89_fallback_indexer_keeps_eager_prefill(self):
+        from sglang.srt.layers.attention.dsa import dsa_indexer
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        eager_topk = object()
         fake_q = MagicMock()
         fake_q.contiguous.return_value = "q-contiguous"
         fake_weights = object()
-        fake_forward_batch = object()
+        fake_forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        fake_metadata = object()
         fake_indexer = SimpleNamespace(
             index_topk=64,
-            forward_indexer=MagicMock(return_value=fake_topk),
+            _get_topk_paged=MagicMock(),
+            forward_indexer=MagicMock(return_value=eager_topk),
         )
 
-        with patch.object(
-            dsa_indexer, "is_in_tc_piecewise_cuda_graph", return_value=False
-        ), patch.object(
-            dsa_indexer,
-            "_broadcast_indexer_topk_from_rank0",
-            side_effect=lambda topk: topk,
-        ), patch.object(
-            dsa_indexer, "maybe_capture_indexer_topk", side_effect=lambda _, topk: topk
+        with (
+            patch.object(
+                dsa_indexer, "is_in_tc_piecewise_cuda_graph", return_value=False
+            ),
+            patch.object(
+                dsa_indexer,
+                "_broadcast_indexer_topk_from_rank0",
+                side_effect=lambda topk: topk,
+            ),
+            patch.object(
+                dsa_indexer,
+                "maybe_capture_indexer_topk",
+                side_effect=lambda _, topk: topk,
+            ),
         ):
-            self.assertIs(
-                dsa_indexer._select_glm_sm89_fallback_topk(
-                    fake_indexer, fake_q, fake_weights, fake_forward_batch, layer_id=7
-                ),
-                fake_topk,
+            result = self._call_glm_sm89_fallback_selector(
+                dsa_indexer,
+                fake_indexer,
+                fake_q,
+                fake_weights,
+                fake_forward_batch,
+                fake_metadata,
+                layer_id=7,
             )
 
+        self.assertIs(result, eager_topk)
         fake_indexer.forward_indexer.assert_called_once_with(
             "q-contiguous",
             fake_weights,
@@ -768,18 +932,24 @@ class TestGlmSm89DsaFallback(CustomTestCase):
             topk=64,
             layer_id=7,
         )
+        fake_indexer._get_topk_paged.assert_not_called()
 
     def test_glm_sm89_fallback_indexer_rejects_piecewise_cuda_graph(self):
         from sglang.srt.layers.attention.dsa import dsa_indexer
 
-        fake_indexer = SimpleNamespace(index_topk=64)
-        fake_q = MagicMock()
+        fake_indexer = object()
 
         with patch.object(
             dsa_indexer, "is_in_tc_piecewise_cuda_graph", return_value=True
-        ), self.assertRaisesRegex(RuntimeError, "graph-off"):
-            dsa_indexer._select_glm_sm89_fallback_topk(
-                fake_indexer, fake_q, object(), object(), layer_id=0
+        ), self.assertRaisesRegex(RuntimeError, "TC-piecewise CUDA graph"):
+            self._call_glm_sm89_fallback_selector(
+                dsa_indexer,
+                fake_indexer,
+                object(),
+                object(),
+                object(),
+                None,
+                layer_id=0,
             )
 
     def test_glm_sm89_hisparse_fails_fast(self):

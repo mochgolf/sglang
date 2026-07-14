@@ -222,7 +222,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
-from sglang.srt.utils.nvtx_utils import profile_range
+from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 from sglang.srt.utils.offloader import (
     create_offloader_from_server_args,
     get_offloader,
@@ -2919,7 +2919,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
         # Step span
-        step_span_ctx = profile_range(_build_step_span_name(forward_batch))
+        step_span_ctx = operations_nvtx_range(
+            _build_step_span_name(forward_batch, self.tp_rank)
+        )
 
         canary_ctx = (
             context_tuple(
@@ -3285,10 +3287,12 @@ def _unwrap_tensor(tensor, tp_rank, device):
     return tensor.to(device)
 
 
-def _build_step_span_name(forward_batch: ForwardBatch) -> str:
+def _build_step_span_name(forward_batch: ForwardBatch, tp_rank: int) -> str:
     """Build a profile-trace span name for one forward step."""
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
+    if mode.is_decode():
+        return f"model.step.tp{tp_rank}.decode"
     if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
         return f"step[EXTEND bs={bs} toks={ext_toks}]"

@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -59,6 +59,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.sm89_debug import profile_region
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
@@ -2249,6 +2250,16 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
+@contextmanager
+def _deepseek_layer_profile_context(layer_id: int):
+    with ExitStack() as stack:
+        stack.enter_context(
+            get_global_expert_distribution_recorder().with_current_layer(layer_id)
+        )
+        stack.enter_context(profile_region(f"model.layer.{layer_id}"))
+        yield
+
+
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -2482,11 +2493,10 @@ class DeepseekV2Model(nn.Module):
             topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
-            ctx = (
-                nullcontext()
-                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
-                else get_global_expert_distribution_recorder().with_current_layer(i)
-            )
+            if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE):
+                ctx = nullcontext()
+            else:
+                ctx = _deepseek_layer_profile_context(i)
             with ctx:
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
