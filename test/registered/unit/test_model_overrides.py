@@ -80,6 +80,8 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "kv_cache_dtype",
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
+                    "dsa_paged_mqa_logits_backend",
+                    "dsa_topk_backend",
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
@@ -2014,6 +2016,45 @@ class TestDeclarationValidation(CustomTestCase):
         args = _FakeArgs()
         with self.assertRaises(ValueError):
             validate_declarations(args, [("src", {"nope": 1})])
+
+
+class TestGlmSm89DsaResolution(_IsolatedPublish):
+    def test_post_process_resolves_sm89_defaults_and_preserves_explicit_topk(self):
+        from sglang.srt.arg_groups.overrides import (
+            _dsa_split_backend_resolution,
+            materialize_declarations,
+            run_post_process_pass,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="dummy",
+            device="cuda",
+            kv_cache_dtype="fp8_e4m3",
+            dsa_topk_backend="flashinfer",
+        )
+        object.__setattr__(
+            args,
+            "get_model_config",
+            lambda: SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+            ),
+        )
+        object.__setattr__(args, "_declarations_materialized", False)
+
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            patch("torch.cuda.get_device_capability", return_value=(8, 9)),
+            patch.object(overrides_module, "is_npu", return_value=False),
+            patch.object(overrides_module, "is_xpu", return_value=False),
+        ):
+            run_post_process_pass(args, _dsa_split_backend_resolution)
+            materialize_declarations(args)
+
+        self.assertEqual(args.dsa_prefill_backend, "sm89_triton")
+        self.assertEqual(args.dsa_decode_backend, "sm89_cuda")
+        self.assertEqual(args.dsa_paged_mqa_logits_backend, "sm89")
+        self.assertEqual(args.dsa_topk_backend, "flashinfer")
 
 
 if __name__ == "__main__":

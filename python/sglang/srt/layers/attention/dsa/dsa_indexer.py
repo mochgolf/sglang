@@ -352,6 +352,80 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def _should_use_dsa_indexer_fusion(
+    *,
+    paged_mqa_logits_backend: DSAPagedMQALogitsBackend,
+    is_neox_style: bool,
+) -> bool:
+    return (
+        _is_cuda
+        and not paged_mqa_logits_backend.is_sm89()
+        and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
+        and not is_neox_style
+    )
+
+
+def _validate_sm89_topk_mode(indexer, forward_batch: ForwardBatch) -> None:
+    forward_mode = forward_batch.forward_mode
+    if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
+        raise RuntimeError(
+            "The SM89 DSA indexer does not support speculative "
+            "target-verify or draft-extend-v2 modes."
+        )
+    if getattr(forward_batch, "attn_cp_metadata", None) is not None:
+        raise RuntimeError(
+            "The SM89 DSA indexer does not support prefill context parallel."
+        )
+    if indexer.num_init_tokens != 0 or indexer.num_local_tokens != 0:
+        raise RuntimeError(
+            "The SM89 DSA indexer requires num_init_tokens and "
+            "num_local_tokens to be zero."
+        )
+    if not forward_mode.is_idle() and _is_in_piecewise_or_breakable_cuda_graph():
+        raise RuntimeError(
+            "The SM89 DSA indexer does not support piecewise/breakable CUDA "
+            "graph prefill; use full decode CUDA graph or disable prefill graph."
+        )
+
+
+def _select_sm89_topk(
+    indexer,
+    q_fp8: torch.Tensor,
+    weights: torch.Tensor,
+    forward_batch: ForwardBatch,
+    metadata: BaseIndexerMetadata,
+    layer_id: int,
+) -> torch.Tensor:
+    _validate_sm89_topk_mode(indexer, forward_batch)
+    forward_mode = forward_batch.forward_mode
+    if forward_mode.is_idle():
+        topk_result = torch.full(
+            (q_fp8.shape[0], indexer.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=q_fp8.device,
+        )
+    elif forward_mode.is_decode():
+        topk_result = indexer._get_topk_paged(
+            forward_batch,
+            layer_id,
+            q_fp8,
+            weights,
+            metadata,
+        )
+    else:
+        topk_result = indexer.forward_indexer(
+            q_fp8.contiguous(),
+            weights,
+            forward_batch,
+            topk=indexer.index_topk,
+            layer_id=layer_id,
+        )
+
+    topk_result = _broadcast_indexer_topk_from_rank0(topk_result)
+    return maybe_capture_indexer_topk(layer_id, topk_result)
+
+
 class Indexer(MultiPlatformOp):
     _MQA_LOGITS_BYTES_PER_ELEM = 4
     _MQA_LOGITS_STATIC_SKIP_ELEMS = 8_000_000
@@ -390,10 +464,12 @@ class Indexer(MultiPlatformOp):
         self.index_topk = index_topk
         self.q_lora_rank = q_lora_rank
         self.layer_id = layer_id
-        self.use_dsa_indexer_fusion = (
-            _is_cuda
-            and not envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get()
-            and not is_neox_style
+        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
+            get_server_args().dsa_paged_mqa_logits_backend
+        )
+        self.use_dsa_indexer_fusion = _should_use_dsa_indexer_fusion(
+            paged_mqa_logits_backend=self.paged_mqa_logits_backend,
+            is_neox_style=is_neox_style,
         )
         self.alt_stream = alt_stream
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
@@ -404,7 +480,13 @@ class Indexer(MultiPlatformOp):
             self.cp_size = None
             self.cp_rank = None
         if _is_cuda:
-            self.sm_count = deep_gemm.get_num_sms()
+            self.sm_count = (
+                torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).multi_processor_count
+                if self.paged_mqa_logits_backend.is_sm89()
+                else deep_gemm.get_num_sms()
+            )
             self.half_device_sm_count = ceil_align(self.sm_count // 2, 8)
             pp_size = get_server_args().pp_size
             self.logits_with_pp_recv = pp_size > 1 and not get_pp_group().is_last_rank
@@ -468,17 +550,15 @@ class Indexer(MultiPlatformOp):
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
 
-        self.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.resolve(
-            get_server_args().dsa_paged_mqa_logits_backend
-        )
-
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
         # request to receive the PP proxy tensor or output from the previous stage, occupying one SM resource.
         # Model execution runs in parallel with the recv operation, so the SMs available to the indexer must be reduced
         # by 1. Currently, the last rank starts the send result + recv request only after waiting for execution results.
-        if self.logits_with_pp_recv:
+        if self.paged_mqa_logits_backend.is_sm89():
+            yield
+        elif self.logits_with_pp_recv:
             pp_recv_sm_count = 1
             with deep_gemm_wrapper.configure_deep_gemm_num_sms(
                 self.sm_count - pp_recv_sm_count
@@ -567,9 +647,14 @@ class Indexer(MultiPlatformOp):
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
-            with deep_gemm_wrapper.configure_deep_gemm_num_sms(
-                self.half_device_sm_count
-            ):
+            sm_context = (
+                contextlib.nullcontext()
+                if self.paged_mqa_logits_backend.is_sm89()
+                else deep_gemm_wrapper.configure_deep_gemm_num_sms(
+                    self.half_device_sm_count
+                )
+            )
+            with sm_context:
                 query, _ = self.wq_b(q_lora)
                 query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
                 q_rope, _ = torch.split(
@@ -913,9 +998,6 @@ class Indexer(MultiPlatformOp):
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
-        # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
-        # otherwise fall back to computing it here.
-        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         assert len(q_fp8.shape) == 3
         # attn_tp_size > 1 or MAX_LEN padding mode can leave padding in the
         # hidden states; q_offset is the real (unpadded) q length.
@@ -923,6 +1005,7 @@ class Indexer(MultiPlatformOp):
 
         B = metadata.get_seqlens_int32().shape[0]
         next_n = q_offset // B if B > 0 else 0
+        use_sm89 = self.paged_mqa_logits_backend.is_sm89()
         use_cute_dsl = (
             self.paged_mqa_logits_backend.is_cutedsl()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -958,78 +1041,100 @@ class Indexer(MultiPlatformOp):
             seqlens_32_2d = seqlens_32
         else:
             seqlens_32_2d = seqlens_32.unsqueeze(-1)
-        if _is_cuda:
+        schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+        if _is_cuda and not use_sm89:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32_2d, blocksize, self.sm_count
                 )
 
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = page_size
-        num_heads_kv = 1
-        head_dim_with_sf = 132
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
         assert len(weights.shape) == 3
-        weights = weights.squeeze(2)
+        if use_sm89:
+            if not forward_batch.forward_mode.is_decode_or_idle():
+                raise RuntimeError(
+                    "The SM89 paged DSA indexer currently supports decode/idle only."
+                )
+            if next_n != 1:
+                raise RuntimeError(
+                    "The SM89 paged DSA indexer requires one query token per request."
+                )
+            from sglang.srt.layers.attention.dsa.sm89_paged_indexer import (
+                sm89_paged_fp8_index_logits,
+            )
 
-        if self.paged_mqa_logits_backend.is_aiter():
-            logits = aiter_paged_mqa_logits(
-                q_fp8,
+            logits = sm89_paged_fp8_index_logits(
+                q_fp8[:q_offset].unsqueeze(1).contiguous(),
                 kv_cache_fp8,
-                weights,
+                weights[:q_offset].squeeze(2).contiguous(),
                 seqlens_32,
                 block_tables,
                 max_seq_len,
-                preshuffle=_use_aiter_preshuffle,
-                kv_block_size=block_kv,
-            )
-        elif use_cute_dsl:
-            logits = cutedsl_paged_mqa_logits(
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                metadata.get_seqlens_int32(),
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                q_offset=q_offset,
-                B=B,
-                next_n=next_n,
-                is_target_verify=forward_batch.forward_mode.is_target_verify(),
-                dsl_expand_factor=dsl_expand_factor,
-                dsl_atom=dsl_atom,
-                blocksize=blocksize,
-                sm_count=self.sm_count,
-                get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
-            )
-        elif use_dg_native:
-            logits = deepgemm_paged_mqa_logits_native(
-                deep_gemm.fp8_paged_mqa_logits,
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                q_offset=q_offset,
-                B=B,
-                next_n=next_n,
             )
         else:
-            logits = deepgemm_paged_mqa_logits_split(
-                deep_gemm.fp8_paged_mqa_logits,
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                q_offset=q_offset,
+            block_kv = page_size
+            num_heads_kv = 1
+            head_dim_with_sf = 132
+            kv_cache_fp8 = kv_cache_fp8.view(
+                kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
             )
+            weights = weights.squeeze(2)
+            if self.paged_mqa_logits_backend.is_aiter():
+                logits = aiter_paged_mqa_logits(
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    seqlens_32,
+                    block_tables,
+                    max_seq_len,
+                    preshuffle=_use_aiter_preshuffle,
+                    kv_block_size=block_kv,
+                )
+            elif use_cute_dsl:
+                logits = cutedsl_paged_mqa_logits(
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    metadata.get_seqlens_int32(),
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    q_offset=q_offset,
+                    B=B,
+                    next_n=next_n,
+                    is_target_verify=forward_batch.forward_mode.is_target_verify(),
+                    dsl_expand_factor=dsl_expand_factor,
+                    dsl_atom=dsl_atom,
+                    blocksize=blocksize,
+                    sm_count=self.sm_count,
+                    get_paged_mqa_logits_metadata_fn=deep_gemm.get_paged_mqa_logits_metadata,
+                )
+            elif use_dg_native:
+                logits = deepgemm_paged_mqa_logits_native(
+                    deep_gemm.fp8_paged_mqa_logits,
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    q_offset=q_offset,
+                    B=B,
+                    next_n=next_n,
+                )
+            else:
+                logits = deepgemm_paged_mqa_logits_split(
+                    deep_gemm.fp8_paged_mqa_logits,
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    q_offset=q_offset,
+                )
 
         # NOTE(dark): logits should be cleaned in topk_transform
         self._mask_init_and_local_tokens(logits, seqlens_32)
@@ -1581,7 +1686,7 @@ class Indexer(MultiPlatformOp):
 
         for i in range(forward_batch.batch_size):
             seq_len = forward_batch.seq_lens[i].item()
-            q_len = (
+            q_len = int(
                 forward_batch.extend_seq_lens_cpu[i]
                 if forward_batch.forward_mode.is_extend()
                 else 1
@@ -1614,6 +1719,14 @@ class Indexer(MultiPlatformOp):
                 k_fp8,
                 k_scale,
             )
+            if forward_batch.forward_mode.is_extend() and q_len > 1:
+                prefix_len = seq_len - q_len
+                future_mask = torch.ones(
+                    (q_len, q_len), dtype=torch.bool, device=index_score.device
+                ).triu_(diagonal=1)
+                index_score[:, :, prefix_len:seq_len].masked_fill_(
+                    future_mask, float("-inf")
+                )
             end_pos = seq_len
             topk_indices = index_score.topk(min(topk, end_pos), dim=-1)[1].squeeze(0)
 
@@ -1760,6 +1873,9 @@ class Indexer(MultiPlatformOp):
         else:
             metadata = None
 
+        if self.paged_mqa_logits_backend.is_sm89():
+            _validate_sm89_topk_mode(self, forward_batch)
+
         enable_dual_stream = (
             self.alt_stream is not None
             and get_is_capture_mode()
@@ -1809,6 +1925,7 @@ class Indexer(MultiPlatformOp):
         elif (
             is_graph_dsa_split_op_surface(forward_batch)
             and not self.dsa_enable_prefill_cp
+            and not self.paged_mqa_logits_backend.is_sm89()
         ):
             # Default path for non-CP prefill under PCG/BCG: run the whole indexer
             # (q/k proj, head gate, k-cache store, topk) as a single eager split op
@@ -1967,6 +2084,16 @@ class Indexer(MultiPlatformOp):
                 weights = self._apply_q_scale_and_softmax_scale(weights, q_scale)
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
+
+        if self.paged_mqa_logits_backend.is_sm89():
+            return _select_sm89_topk(
+                self,
+                q_fp8,
+                weights,
+                forward_batch,
+                metadata,
+                layer_id,
+            )
 
         if _is_cuda or _is_hip:
             # In piecewise/breakable CUDA graph, any access to seq_lens_cpu

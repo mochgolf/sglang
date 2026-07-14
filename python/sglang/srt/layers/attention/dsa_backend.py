@@ -323,7 +323,13 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
 
 
 _DSA_IMPL_T: TypeAlias = Literal[
-    "flashmla_sparse", "flashmla_kv", "fa3", "tilelang", "trtllm"
+    "flashmla_sparse",
+    "flashmla_kv",
+    "fa3",
+    "sm89_cuda",
+    "sm89_triton",
+    "tilelang",
+    "trtllm",
 ]
 
 
@@ -354,6 +360,10 @@ class DeepseekSparseAttnBackend(
         )
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        architectures = (
+            getattr(model_runner.model_config.hf_config, "architectures", None) or []
+        )
+        self.model_arch = architectures[0] if architectures else None
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -378,6 +388,9 @@ class DeepseekSparseAttnBackend(
             model_runner.server_args.dsa_prefill_backend
         )
         self.dsa_decode_impl: _DSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.dsa_paged_mqa_logits_backend = (
+            model_runner.server_args.dsa_paged_mqa_logits_backend
+        )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
@@ -430,23 +443,31 @@ class DeepseekSparseAttnBackend(
                 )
 
         # Speculative decoding
+        self.speculative_algorithm = model_runner.server_args.speculative_algorithm
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = (
             model_runner.server_args.speculative_num_draft_tokens
         )
         self.speculative_step_id = speculative_step_id
-        self.use_fused_topk = should_use_dsa_fused_topk(
-            model_runner.server_args, seed_dsa_topk_from_draft_extend
+        self.use_fused_topk = (
+            self.dsa_paged_mqa_logits_backend != "sm89"
+            and should_use_dsa_fused_topk(
+                model_runner.server_args, seed_dsa_topk_from_draft_extend
+            )
         )
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
-            print_warning_once(
-                "Disabling fused DSA top-k for IndexShare under PD disaggregation."
+            reason = (
+                "the SM89 paged indexer backend"
+                if self.dsa_paged_mqa_logits_backend == "sm89"
+                else "IndexShare under PD disaggregation"
             )
+            print_warning_once(f"Disabling fused DSA top-k for {reason}.")
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        self._validate_sm89_backend_config()
 
         # Allocate global workspace buffer for TRT-LLM kernels (ragged attention on SM100/B200, or trtllm decode)
         if self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm":
@@ -460,6 +481,64 @@ class DeepseekSparseAttnBackend(
             )
         else:
             self.workspace_buffer = None
+
+    def _validate_sm89_backend_config(self) -> None:
+        if self.dsa_prefill_impl == "sm89_cuda":
+            raise ValueError(
+                "sm89_cuda is a decode-only DSA backend; use sm89_triton for prefill."
+            )
+        if self.dsa_decode_impl == "sm89_triton":
+            raise ValueError(
+                "sm89_triton is a prefill-only DSA backend; use sm89_cuda for decode."
+            )
+
+        uses_sm89 = (
+            self.dsa_prefill_impl == "sm89_triton"
+            or self.dsa_decode_impl == "sm89_cuda"
+            or self.dsa_paged_mqa_logits_backend == "sm89"
+        )
+        if not uses_sm89:
+            return
+        if self.model_arch not in {"GlmMoeDsaForCausalLM", "GlmMoeDsaModel"}:
+            raise ValueError("SM89 DSA backends currently require a GLM DSA model.")
+        if self.device_capability != (8, 9):
+            raise ValueError(
+                "SM89 DSA backends require CUDA SM89; "
+                f"got capability={self.device_capability}."
+            )
+        if self.kv_cache_dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "SM89 DSA backends require FP8 E4M3 KV cache; "
+                f"got {self.kv_cache_dtype}."
+            )
+        if (
+            self.dsa_prefill_impl != "sm89_triton"
+            or self.dsa_decode_impl != "sm89_cuda"
+        ):
+            raise ValueError(
+                "SM89 DSA backends require the complete SM89 DSA backend set: "
+                "prefill=sm89_triton, decode=sm89_cuda, paged_mqa=sm89."
+            )
+        if self.dsa_paged_mqa_logits_backend != "sm89":
+            raise ValueError(
+                "SM89 DSA backends require the SM89 paged MQA indexer backend."
+            )
+        if self.speculative_algorithm is not None:
+            raise ValueError(
+                "SM89 DSA backends do not currently support speculative decoding; "
+                f"got speculative_algorithm={self.speculative_algorithm!r}."
+            )
+
+    def _should_build_paged_mqa_schedule(self, forward_mode: ForwardMode) -> bool:
+        return (
+            self.dsa_paged_mqa_logits_backend != "sm89"
+            and is_cuda()
+            and (
+                forward_mode.is_decode_or_idle()
+                or forward_mode.is_target_verify()
+                or forward_mode.is_draft_extend_v2()
+            )
+        )
 
     def _make_aiter_dsa_decode_metadata_buffer(
         self,
@@ -646,7 +725,7 @@ class DeepseekSparseAttnBackend(
         # target-verify / draft-extend, whose expanded row count is exactly what v2
         # sees -- otherwise the helper's plan-present assertion fires. None only
         # when the fold is disabled; such metadata is never dispatched to v2.
-        if not envs.SGLANG_OPT_USE_TOPK_V2.get():
+        if not self.use_fused_topk or not envs.SGLANG_OPT_USE_TOPK_V2.get():
             return None
         from sglang.jit_kernel.dsv4.topk import plan_topk_v2
 
@@ -959,11 +1038,7 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_batch.forward_mode.is_decode_or_idle()
-            or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
-        ):
+        if self._should_build_paged_mqa_schedule(forward_batch.forward_mode):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_batch.forward_mode,
                 cache_seqlens_int32,
@@ -1303,11 +1378,7 @@ class DeepseekSparseAttnBackend(
 
         paged_mqa_schedule_metadata = None
         paged_mqa_ctx_lens_2d = None
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
-        ):
+        if self._should_build_paged_mqa_schedule(forward_mode):
             paged_mqa_ctx_lens_2d = self._build_paged_mqa_schedule_2d_ctx_lens(
                 forward_mode, cache_seqlens_int32, seqlens_expanded, bs
             )
@@ -1581,11 +1652,7 @@ class DeepseekSparseAttnBackend(
                 metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if is_cuda() and (
-            forward_mode.is_decode_or_idle()
-            or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
-        ):
+        if self._should_build_paged_mqa_schedule(forward_mode):
             if forward_mode.is_draft_extend_v2():
                 schedule_seqlens_expanded = metadata.dsa_seqlens_expanded
             else:
@@ -1786,7 +1853,7 @@ class DeepseekSparseAttnBackend(
         # this replay (the captured graph holds stale data otherwise, which can
         # deadlock the kernel when the runtime work decomposition diverges from
         # the captured one).
-        if is_cuda():
+        if self._should_build_paged_mqa_schedule(forward_mode):
             if forward_mode.is_decode_or_idle():
                 seqlens_32_2d = _to_2d_context_lens(metadata.cache_seqlens_int32, bs)
             else:
@@ -2018,6 +2085,18 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
+        elif dsa_impl == "sm89_triton":
+            return self._forward_sm89_triton(
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                q_nope=q_nope,
+                page_table=page_table_1,
+                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                page_size=1,
+            )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
                 q_rope=q_rope,
@@ -2161,6 +2240,18 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
             )
+        elif self.dsa_decode_impl == "sm89_cuda":
+            return self._forward_sm89_cuda_decode(
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                q_nope=q_nope,
+                page_table=page_table_1,
+                cache_seqlens=metadata.dsa_cache_seqlens_int32,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+                page_size=1,
+            )
         elif self.dsa_decode_impl == "tilelang":
             # Cat-skip (HIP-only): when caller passes q_rope=None on HIP, q_all
             # has already been set to a zero-copy view of q in the else branch
@@ -2204,6 +2295,104 @@ class DeepseekSparseAttnBackend(
 
         else:
             assert False, f"Unsupported {self.dsa_decode_impl = }"
+
+    def _validate_sm89_sparse_mla_inputs(
+        self,
+        *,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        q_nope: torch.Tensor,
+        page_size: int,
+    ) -> None:
+        if self.model_arch not in {"GlmMoeDsaForCausalLM", "GlmMoeDsaModel"}:
+            raise ValueError("SM89 sparse MLA currently requires a GLM DSA model.")
+        if self.device_capability != (8, 9):
+            raise ValueError(
+                "SM89 sparse MLA requires CUDA SM89; "
+                f"got capability={self.device_capability}."
+            )
+        if page_size != 1:
+            raise ValueError("SM89 sparse MLA requires page_size=1.")
+        if kv_cache.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "SM89 sparse MLA requires FP8 E4M3 KV cache; " f"got {kv_cache.dtype}."
+            )
+        if v_head_dim != 512 or q_nope.shape[-1] != 512 or q_rope.shape[-1] != 64:
+            raise ValueError(
+                "SM89 sparse MLA GLM dimensions require v_head_dim=512, "
+                "q_nope_dim=512, and q_rope_dim=64; "
+                f"got {v_head_dim=}, q_nope_dim={q_nope.shape[-1]}, "
+                f"q_rope_dim={q_rope.shape[-1]}."
+            )
+
+    def _forward_sm89_triton(
+        self,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        q_nope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        sm_scale: float,
+        logit_cap: float,
+        page_size: int,
+    ) -> torch.Tensor:
+        self._validate_sm89_sparse_mla_inputs(
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            v_head_dim=v_head_dim,
+            q_nope=q_nope,
+            page_size=page_size,
+        )
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_prefill_triton,
+        )
+
+        return sm89_sparse_mla_prefill_triton(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            sm_scale=sm_scale,
+            logit_cap=logit_cap,
+            v_head_dim=v_head_dim,
+        )
+
+    def _forward_sm89_cuda_decode(
+        self,
+        q_rope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        v_head_dim: int,
+        q_nope: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        sm_scale: float,
+        logit_cap: float,
+        page_size: int,
+    ) -> torch.Tensor:
+        self._validate_sm89_sparse_mla_inputs(
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            v_head_dim=v_head_dim,
+            q_nope=q_nope,
+            page_size=page_size,
+        )
+        from sglang.srt.layers.attention.dsa.sm89_sparse_mla import (
+            sm89_sparse_mla_decode_cuda,
+        )
+
+        return sm89_sparse_mla_decode_cuda(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            sm_scale=sm_scale,
+            logit_cap=logit_cap,
+            v_head_dim=v_head_dim,
+        )
 
     def _forward_fa3(
         self,

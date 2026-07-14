@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from enum import Enum
 
-from sglang.srt.utils import is_hip, is_sm100_supported
+from sglang.srt.utils import get_device_capability, is_cuda, is_hip, is_sm100_supported
 
 
 class DSAPagedMQALogitsBackend(Enum):
     DEEPGEMM = "deepgemm"
     CUTEDSL = "cutedsl"
     AITER = "aiter"
+    SM89 = "sm89"
 
     def is_deepgemm(self) -> bool:
         return self == DSAPagedMQALogitsBackend.DEEPGEMM
@@ -18,6 +19,9 @@ class DSAPagedMQALogitsBackend(Enum):
 
     def is_aiter(self) -> bool:
         return self == DSAPagedMQALogitsBackend.AITER
+
+    def is_sm89(self) -> bool:
+        return self == DSAPagedMQALogitsBackend.SM89
 
     @staticmethod
     def resolve(value: str) -> DSAPagedMQALogitsBackend:
@@ -33,6 +37,12 @@ class DSAPagedMQALogitsBackend(Enum):
             return DSAPagedMQALogitsBackend.DEEPGEMM
         if value == "aiter":
             raise ValueError("dsa_paged_mqa_logits_backend='aiter' requires ROCm.")
+        if value == "sm89":
+            if not is_cuda() or get_device_capability() != (8, 9):
+                raise ValueError(
+                    "dsa_paged_mqa_logits_backend='sm89' requires CUDA SM89."
+                )
+            return DSAPagedMQALogitsBackend.SM89
         if value == "cutedsl":
             if not is_sm100_supported():
                 raise ValueError(

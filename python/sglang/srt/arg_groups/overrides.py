@@ -1204,7 +1204,11 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     from sglang.srt.configs.model_config import is_deepseek_dsa
 
     hf_config = view.get_model_config().hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
+    architectures = getattr(hf_config, "architectures", None)
+    if not architectures:
+        return {}
+    model_arch = architectures[0]
+    if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
         return {}
     if not is_deepseek_dsa(hf_config):
         return {}
@@ -1213,7 +1217,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
 
     import torch
 
-    major, _ = torch.cuda.get_device_capability()
+    major, minor = torch.cuda.get_device_capability()
     kv_cache_dtype = view.kv_cache_dtype
     user_set_prefill = view.dsa_prefill_backend is not None
     user_set_decode = view.dsa_decode_backend is not None
@@ -1232,6 +1236,50 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         logger.warning(
             f"HiSparse enabled ({kv_cache_dtype}): using DSA backends "
             f"prefill={prefill}, decode={decode}."
+        )
+        return declared
+
+    is_glm_dsa = model_arch in {"GlmMoeDsaForCausalLM", "GlmMoeDsaModel"}
+    requested_sm89 = is_glm_dsa and (
+        view.dsa_prefill_backend in {"sm89_triton", "sm89_cuda"}
+        or view.dsa_decode_backend in {"sm89_triton", "sm89_cuda"}
+        or view.dsa_paged_mqa_logits_backend == "sm89"
+    )
+    default_sm89 = (
+        is_glm_dsa
+        and (major, minor) == (8, 9)
+        and kv_cache_dtype == "fp8_e4m3"
+        and not user_set_prefill
+        and not user_set_decode
+    )
+    if requested_sm89 or default_sm89:
+        if (
+            (user_set_prefill and view.dsa_prefill_backend != "sm89_triton")
+            or (user_set_decode and view.dsa_decode_backend != "sm89_cuda")
+            or (view.dsa_paged_mqa_logits_backend not in {None, "auto", "sm89"})
+        ):
+            raise ValueError(
+                "SM89 DSA backends require the complete SM89 DSA backend set: "
+                "prefill=sm89_triton, decode=sm89_cuda, paged_mqa=sm89."
+            )
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "sm89_triton"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "sm89_cuda"
+        if view.dsa_paged_mqa_logits_backend == "auto":
+            declared["dsa_paged_mqa_logits_backend"] = "sm89"
+        if view.dsa_topk_backend == "sgl-kernel":
+            declared["dsa_topk_backend"] = "torch"
+        logger.warning(
+            "Using SM89 GLM DSA backends: prefill=%s, decode=%s, "
+            "paged_mqa=%s, topk=%s.",
+            declared.get("dsa_prefill_backend", view.dsa_prefill_backend),
+            declared.get("dsa_decode_backend", view.dsa_decode_backend),
+            declared.get(
+                "dsa_paged_mqa_logits_backend",
+                view.dsa_paged_mqa_logits_backend,
+            ),
+            declared.get("dsa_topk_backend", view.dsa_topk_backend),
         )
         return declared
 
