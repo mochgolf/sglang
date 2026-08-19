@@ -598,7 +598,10 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Both symmetric and asymmetric weight quant are handled by
         # CompressedTensorsWNA16 via the Marlin kernel path; asymmetric
         # checkpoints carry a weight zero-point.
-        return is_channel_group and input_quant_none and is_static
+        # WNA16 is int weight-only (W4A16/W8A16-int); float8 weight-only
+        # (W8A16-FP8) must fall through to CompressedTensorsW8A16Fp8.
+        is_int_weight = weight_quant.type == QuantizationType.INT
+        return is_channel_group and input_quant_none and is_static and is_int_weight
 
     def _is_mxint4a16(self, weight_quant: BaseModel, input_quant: BaseModel) -> bool:
         input_quant_none = input_quant is None
