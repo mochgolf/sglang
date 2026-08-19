@@ -168,7 +168,16 @@ def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
     """
     if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
         return
+    from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
+
+    # The fused kernel feeds down_proj a prequantized (fp4, scale) tuple, which
+    # the Marlin runner cannot consume: Marlin is the W4A16 fallback for
+    # SM80-SM90 and requires BF16/FP16 activations. FlashInfer's W4A4 FP4 GEMM
+    # backends (cudnn/cutlass/cute-dsl) only support SM100+, so on Ada/consumer
+    # parts with --fp4-gemm-backend marlin the fusion must stay disabled.
+    if get_fp4_gemm_runner_backend().is_marlin():
+        return
 
     if not (
         isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
