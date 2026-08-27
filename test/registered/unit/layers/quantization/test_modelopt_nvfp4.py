@@ -8,6 +8,9 @@ import torch.nn as nn
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
 from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.parameter import PerTensorScaleParameter
+from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+    _repack_moe_weights_for_marlin,
+)
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
@@ -134,6 +137,26 @@ class TestModelOptNvfp4(CustomTestCase):
         self.assertIsNone(layer.w13_blockscale_swizzled)
         self.assertIsNone(layer.w2_blockscale_swizzled)
         swizzle.assert_not_called()
+
+    @patch(
+        "sglang.srt.layers.quantization.marlin_utils_fp4.gptq_marlin_repack",
+        create=True,
+    )
+    def test_moe_marlin_repack_matches_legacy_stack(self, repack):
+        weight = torch.arange(4 * 8 * 8, dtype=torch.uint8).reshape(4, 8, 8)
+        perm = torch.empty(0, dtype=torch.int)
+
+        def transform(b_q_weight, **_):
+            return b_q_weight.flip(0).contiguous()
+
+        repack.side_effect = transform
+        expected = torch.stack(
+            [transform(weight[i].view(torch.int32).T.contiguous()) for i in range(4)]
+        )
+
+        actual = _repack_moe_weights_for_marlin(weight, perm, size_k=16, size_n=8)
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     @patch(
         "sglang.srt.layers.quantization.modelopt_quant.envs."

@@ -25,6 +25,30 @@ ScalarType, scalar_types = get_scalar_types()
 logger = logging.getLogger(__name__)
 
 
+def _repack_moe_weights_for_marlin(
+    weight: torch.Tensor,
+    perm: torch.Tensor,
+    size_k: int,
+    size_n: int,
+) -> torch.Tensor:
+    """Repack experts directly into the final tensor without a second full copy."""
+    output = None
+    for i in range(weight.shape[0]):
+        qweight = weight[i].view(torch.int32).T.contiguous()
+        repacked = gptq_marlin_repack(
+            b_q_weight=qweight,
+            perm=perm,
+            size_k=size_k,
+            size_n=size_n,
+            num_bits=4,
+        )
+        if output is None:
+            output = repacked.new_empty((weight.shape[0], *repacked.shape))
+        output[i].copy_(repacked)
+    assert output is not None
+    return output
+
+
 def nvfp4_marlin_process_scales(marlin_scales: torch.Tensor) -> torch.Tensor:
     if not (marlin_scales >= 0).all():
         # NVFP4 ModelOpt scales are expected to be non-negative. Keep this as
@@ -368,18 +392,7 @@ def prepare_moe_mxfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             size_n, size_k = hidden_size, padded_intermediate_size
         assert weight.shape == (num_experts, size_n, size_k // 2)
 
-        tensor_list = []
-        for i in range(num_experts):
-            qweight = weight[i].view(torch.int32).T.contiguous()
-            marlin_qweight = gptq_marlin_repack(
-                b_q_weight=qweight,
-                perm=perm,
-                size_k=size_k,
-                size_n=size_n,
-                num_bits=4,
-            )
-            tensor_list.append(marlin_qweight)
-        return torch.stack(tensor_list)
+        return _repack_moe_weights_for_marlin(weight, perm, size_k, size_n)
 
     def _permute_scales(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
         if is_w13:
@@ -442,6 +455,13 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         raise ValueError(
             f"NVFP4 Marlin MoE requires group_size=16, got {layer.quant_config.group_size}."
         )
+    if any(
+        getattr(layer, name, None) is not None
+        for name in ("w13_blockscale_swizzled", "w2_blockscale_swizzled")
+    ):
+        raise RuntimeError(
+            "NVFP4 Marlin must not retain CUTLASS blockscale buffers."
+        )
 
     w13 = layer.w13_weight.data
     w2 = layer.w2_weight.data
@@ -487,18 +507,7 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
             size_n, size_k = hidden_size, intermediate_size
         assert weight.shape == (num_experts, size_n, size_k // 2)
 
-        tensor_list = []
-        for i in range(num_experts):
-            qweight = weight[i].view(torch.int32).T.contiguous()
-            marlin_qweight = gptq_marlin_repack(
-                b_q_weight=qweight,
-                perm=perm,
-                size_k=size_k,
-                size_n=size_n,
-                num_bits=4,
-            )
-            tensor_list.append(marlin_qweight)
-        return torch.stack(tensor_list)
+        return _repack_moe_weights_for_marlin(weight, perm, size_k, size_n)
 
     def _permute_scales(scales: torch.Tensor, is_w13: bool) -> torch.Tensor:
         scales = scales.to(param_dtype)
@@ -533,13 +542,17 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
     layer.w13_weight = torch.nn.Parameter(
         _repack_weight(w13, True), requires_grad=False
     )
+    del w13
     layer.w2_weight = torch.nn.Parameter(_repack_weight(w2, False), requires_grad=False)
+    del w2
     layer.w13_weight_scale = torch.nn.Parameter(
         _permute_scales(w13_scale, True), requires_grad=False
     )
+    del w13_scale
     layer.w2_weight_scale = torch.nn.Parameter(
         _permute_scales(w2_scale, False), requires_grad=False
     )
+    del w2_scale
     layer.w13_weight_scale_2 = torch.nn.Parameter(
         _process_global_scale(w13_global_scale), requires_grad=False
     )
