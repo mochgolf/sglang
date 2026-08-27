@@ -1,14 +1,17 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 
 from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLinear
+from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
+    ModelOptNvFp4FusedMoEMethod,
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -102,6 +105,35 @@ class TestModelOptNvfp4(CustomTestCase):
         torch.testing.assert_close(layer.input_scale, torch.ones(1))
         default_weight_loader(layer.input_scale, torch.tensor(0.25))
         torch.testing.assert_close(layer.input_scale, torch.tensor([0.25]))
+
+    @patch(
+        "sglang.srt.layers.quantization.modelopt_quant.get_moe_runner_backend",
+        return_value=MoeRunnerBackend.MARLIN,
+    )
+    @patch("sglang.srt.layers.quantization.modelopt_quant.swizzle_blockscale")
+    def test_marlin_skips_cutlass_blockscale_buffers(self, swizzle, _):
+        config = ModelOptFp4Config(
+            is_checkpoint_nvfp4_serialized=True,
+            group_size=16,
+            use_per_token_activation=False,
+        )
+        method = ModelOptNvFp4FusedMoEMethod(config)
+        layer = nn.Module()
+        layer.num_experts = layer.num_local_experts = 4
+        layer.moe_runner_config = SimpleNamespace(is_gated=True)
+
+        method.create_weights(
+            layer,
+            num_experts=4,
+            hidden_size=256,
+            intermediate_size_per_partition=128,
+            params_dtype=torch.bfloat16,
+            weight_loader=default_weight_loader,
+        )
+
+        self.assertIsNone(layer.w13_blockscale_swizzled)
+        self.assertIsNone(layer.w2_blockscale_swizzled)
+        swizzle.assert_not_called()
 
     @patch(
         "sglang.srt.layers.quantization.modelopt_quant.envs."
