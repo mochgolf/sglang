@@ -157,6 +157,9 @@ class TestModelOptNvfp4(CustomTestCase):
         actual = _repack_moe_weights_for_marlin(weight, perm, size_k=16, size_n=8)
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        self.assertEqual(
+            actual.untyped_storage().data_ptr(), weight.untyped_storage().data_ptr()
+        )
 
     @patch(
         "sglang.srt.layers.quantization.modelopt_quant.envs."

@@ -31,7 +31,7 @@ def _repack_moe_weights_for_marlin(
     size_k: int,
     size_n: int,
 ) -> torch.Tensor:
-    """Repack experts directly into the final tensor without a second full copy."""
+    """Repack each expert into its byte-equivalent loader storage."""
     output = None
     for i in range(weight.shape[0]):
         qweight = weight[i].view(torch.int32).T.contiguous()
@@ -43,7 +43,10 @@ def _repack_moe_weights_for_marlin(
             num_bits=4,
         )
         if output is None:
-            output = repacked.new_empty((weight.shape[0], *repacked.shape))
+            assert weight[0].nbytes == repacked.nbytes
+            output = weight.view(torch.int32).view(
+                weight.shape[0], *repacked.shape
+            )
         output[i].copy_(repacked)
     assert output is not None
     return output
@@ -543,8 +546,6 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         _repack_weight(w13, True), requires_grad=False
     )
     del w13
-    # Return the retired loader-format storage before allocating the final w2.
-    torch.cuda.empty_cache()
     layer.w2_weight = torch.nn.Parameter(_repack_weight(w2, False), requires_grad=False)
     del w2
     layer.w13_weight_scale = torch.nn.Parameter(
