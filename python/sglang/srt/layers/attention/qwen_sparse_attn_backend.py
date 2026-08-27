@@ -1696,7 +1696,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             scratch_capacity,
             k_buffer.shape[1],
             k_buffer.shape[2],
-            k_buffer.dtype,
+            q.dtype,
             k_buffer.device,
         )
         qwen_sparse_kv_extraction_compact_triton(
