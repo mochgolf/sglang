@@ -543,6 +543,8 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         _repack_weight(w13, True), requires_grad=False
     )
     del w13
+    # Return the retired loader-format storage before allocating the final w2.
+    torch.cuda.empty_cache()
     layer.w2_weight = torch.nn.Parameter(_repack_weight(w2, False), requires_grad=False)
     del w2
     layer.w13_weight_scale = torch.nn.Parameter(
