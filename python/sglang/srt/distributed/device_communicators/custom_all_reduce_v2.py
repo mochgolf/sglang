@@ -487,4 +487,6 @@ def can_use_custom_all_reduce_v2(
         supported_world_size=supported,
         cls_name="CustomAllReduceV2",
     )
-    return full_nvlink is True
+    return full_nvlink is True or (
+        full_nvlink is False and _FORCE_PULL_SIZE_KB == 0
+    )
