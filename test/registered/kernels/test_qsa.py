@@ -1151,6 +1151,29 @@ def test_qsa_idle_metadata_builds_empty_rows():
         assert attn_backend.forward_metadata.indexer_metadata.out_cache_loc.numel() == 0
 
 
+def test_qsa_gpu_only_metadata_uses_host_allocator_bound():
+    class NoDeviceReadback:
+        def max(self):
+            raise AssertionError("device sequence lengths must not be read on host")
+
+    forward_batch = SimpleNamespace(
+        seq_lens_cpu=None,
+        kv_allocated_lens_cpu=[17, 33],
+        spec_info=SimpleNamespace(draft_token_num=4),
+    )
+    assert (
+        QwenSparseAttnBackend._speculative_max_row_length(
+            forward_batch, NoDeviceReadback()
+        )
+        == 33
+    )
+    forward_batch.seq_lens_cpu = torch.tensor([12], dtype=torch.int32)
+    forward_batch.spec_info = SimpleNamespace()
+    assert QwenSparseAttnBackend._speculative_max_row_length(
+        forward_batch, torch.tensor([12], dtype=torch.int32)
+    ) == 12
+
+
 def test_qsa_decode_requires_one_query_row_per_request():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     backend = QwenSparseAttnBackend(runner)

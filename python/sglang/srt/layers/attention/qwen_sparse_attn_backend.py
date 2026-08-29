@@ -201,10 +201,8 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     # GPU-only serving: compressed addressing is arithmetic and the graph
     # replay refresh runs on device, so graphed decode iterations never need
-    # the FutureMap's resolved CPU lengths.  Eager spec paths (bs above the
-    # graph range, or graphs disabled) pay one explicit readback per forward
-    # instead of the resolved mirror -- an accepted trade for dropping the
-    # per-iteration scheduler sync on the graphed serving path.
+    # the FutureMap's resolved CPU lengths. Eager paths use the allocator's
+    # host-resident length upper bound and likewise avoid a device readback.
     needs_cpu_seq_lens: bool = False
 
     def __init__(self, runner=None) -> None:
@@ -284,19 +282,25 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         Row lengths live only on device there (they come from the batch's
         positions, which depend on the accepted-token count), so bound them
-        with the host-resident request lengths plus the draft window instead
-        of syncing every forward. A few extra columns are harmless; a missing
-        CPU mirror falls back to one small readback.
+        with host-resident allocator metadata instead of syncing every
+        forward. A few extra columns are harmless.
         """
         seq_lens_cpu = forward_batch.seq_lens_cpu
+        allocated_lens = getattr(forward_batch, "kv_allocated_lens_cpu", None)
+        if seq_lens_cpu is None and allocated_lens:
+            return max(1, max(allocated_lens))
         if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
             logger.warning_once(
-                "QSA speculative metadata without CPU request lengths: the "
-                "token-slot bound reads them back once per forward"
+                "QSA metadata has neither CPU request lengths nor allocator "
+                "bounds; the token-slot bound reads back once per forward"
             )
             return max(1, int(sequence_lengths.max()))
-        spec_info = forward_batch.spec_info
-        draft_window = int(spec_info.draft_token_num) if spec_info is not None else 0
+        spec_info = getattr(forward_batch, "spec_info", None)
+        draft_window = (
+            int(getattr(spec_info, "draft_token_num", 0) or 0)
+            if spec_info is not None
+            else 0
+        )
         return max(1, int(seq_lens_cpu.max()) + draft_window)
 
     @staticmethod
@@ -321,7 +325,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             # those tail rows to request row 0, mirroring the CUDA-graph
             # speculative layout padding, so gathers stay in bounds.
             repeats = extend_seq_lens[:batch_size].to(dtype=torch.long)
-            real_rows = int(repeats.sum().item())
+            real_rows = getattr(forward_batch, "num_token_non_padded_cpu", None)
+            if real_rows is None:
+                extend_seq_lens_cpu = getattr(
+                    forward_batch, "extend_seq_lens_cpu", None
+                )
+                real_rows = (
+                    sum(extend_seq_lens_cpu[:batch_size])
+                    if extend_seq_lens_cpu is not None
+                    else int(repeats.sum().item())
+                )
+            real_rows = int(real_rows)
             if real_rows > num_rows:
                 raise ValueError(
                     "QSA speculative query rows are fewer than the extend "
@@ -334,6 +348,7 @@ class QwenSparseAttnBackend(AttentionBackend):
                     device=forward_batch.req_pool_indices.device,
                 ),
                 repeats,
+                output_size=real_rows,
             )
             padding = num_rows - real_rows
             if padding:
@@ -650,10 +665,9 @@ class QwenSparseAttnBackend(AttentionBackend):
         else:
             sequence_lengths = forward_batch.seq_lens.to(torch.int32)
             batch_size = sequence_lengths.numel()
-            if forward_batch.seq_lens_cpu is not None:
-                max_length = int(forward_batch.seq_lens_cpu[:batch_size].max())
-            else:
-                max_length = int(sequence_lengths.max())
+            max_length = self._speculative_max_row_length(
+                forward_batch, sequence_lengths
+            )
             row_req_pool_indices = forward_batch.req_pool_indices[:batch_size]
             token_slot_table = self.req_to_token[
                 row_req_pool_indices.long(), :max_length
