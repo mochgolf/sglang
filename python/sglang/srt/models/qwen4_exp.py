@@ -49,7 +49,9 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
+    get_forward_context,
     get_req_to_token_pool,
+    has_forward_context,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -72,6 +74,11 @@ def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
     if forward_batch._original_forward_mode is not None:
         return forward_batch._original_forward_mode
     return forward_batch.forward_mode
+
+
+def _stable_prefill_hc(forward_batch: ForwardBatch) -> bool:
+    del forward_batch
+    return has_forward_context() and get_forward_context().stable_prefill
 
 
 def _get_processed_token_count(
@@ -1303,7 +1310,9 @@ class Qwen4ExpLayerExtensionMixin:
                     ple_query, forward_batch, ple_batch
                 )
 
-        hidden_states, residual = self.attn_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.attn_hyper_connection.mix(
+            hidden_states, stable=_stable_prefill_hc(forward_batch)
+        )
         return hidden_states, residual
 
     def _prepare_qwen4_exp_mlp(
@@ -1315,7 +1324,9 @@ class Qwen4ExpLayerExtensionMixin:
         if not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
         hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
-        hidden_states, residual = self.mlp_hyper_connection.mix(hidden_states)
+        hidden_states, residual = self.mlp_hyper_connection.mix(
+            hidden_states, stable=_stable_prefill_hc(forward_batch)
+        )
         return hidden_states, residual
 
     def _qwen4_exp_use_dp_moe_gather(self) -> bool:
@@ -1665,7 +1676,9 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         _commit_ple_batch(ple_batch, forward_batch)
 
         hc_hidden_states = hidden_states
-        hidden_states, _ = self.hyper_connection_mixer.mix(hidden_states)
+        hidden_states, _ = self.hyper_connection_mixer.mix(
+            hidden_states, stable=_stable_prefill_hc(forward_batch)
+        )
         if not forward_batch.forward_mode.is_idle():
             return hidden_states, hc_hidden_states
 

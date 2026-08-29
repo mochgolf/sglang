@@ -76,6 +76,21 @@ def test_fused_hc_mix_no_less_accurate_than_eager():
     assert fused_err <= eager_err * 1.5 + 1e-6
 
 
+def test_stable_fused_hc_mix_is_exact_across_replays():
+    x, w_down, w_up = _make_inputs(12, torch.bfloat16)
+    outputs = [
+        fused_hc_mix(
+            x, w_down, w_up, HC_COUNT, HIDDEN_SIZE, stable=True
+        )
+        for _ in range(10)
+    ]
+    assert all(torch.equal(outputs[0], output) for output in outputs[1:])
+    ref = _reference_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    torch.testing.assert_close(
+        outputs[0].to(torch.float64), ref, **_TOLERANCES[torch.bfloat16]
+    )
+
+
 def test_fused_hc_mix_gate_rejects_prefill_rows():
     x, w_down, w_up = _make_inputs(_FUSED_MIX_MAX_ROWS + 1, torch.bfloat16)
     assert not fused_hc_mix_supported(x, w_down, w_up)

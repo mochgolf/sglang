@@ -1,9 +1,14 @@
 """Qwen4/Qwen3.5 MTP ModelOpt routing uses the real module prefix."""
 
 import os
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.layers.hyperconnection import GatedResidual
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
@@ -15,6 +20,10 @@ from sglang.srt.layers.quantization.modelopt_quant import (
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner.eager_runner import _use_stable_prefill
+from sglang.srt.models import qwen4_exp
 from sglang.srt.models.qwen3_5_mtp import (
     _MTP_ROUTED_EXPERTS_PREFIX,
     _mtp_quant_config,
@@ -70,6 +79,85 @@ def _mixed_config(exclude_modules, *, with_mtp_experts):
 
 
 class TestQwen4ExpMtpModelOpt(CustomTestCase):
+    def test_stable_hc_mix_falls_back_when_fused_path_is_unsupported(self):
+        layer = GatedResidual.__new__(GatedResidual)
+        torch.nn.Module.__init__(layer)
+        layer.hc_count = 2
+        layer.hidden_size = 4
+        layer.params_dtype = torch.float32
+        layer.config = SimpleNamespace(hc_per_branch_norm=True)
+        layer.hc_norm = torch.nn.Identity()
+        layer.input_mix_weight_down = torch.nn.Linear(8, 2, bias=False)
+        layer.input_mix_weight_up = torch.nn.Linear(2, 8, bias=False)
+        layer._jit_mix_ok = False
+        expected = torch.ones((3, 4))
+        layer._mix_compute = Mock(return_value=expected)
+
+        with patch(
+            "sglang.srt.layers.hyperconnection.fused_hc_mix_supported",
+            return_value=False,
+        ):
+            got, _ = layer.mix(torch.ones((3, 8)), stable=True)
+        self.assertIs(got, expected)
+        layer._mix_compute.assert_called_once()
+
+    def test_stable_prefill_uses_forward_scope(self):
+        batch = SimpleNamespace()
+        self.assertFalse(qwen4_exp._stable_prefill_hc(batch))
+        with forward_context(
+            ForwardContext(attn_backend=SimpleNamespace(), stable_prefill=True)
+        ):
+            self.assertTrue(qwen4_exp._stable_prefill_hc(batch))
+
+    def test_stable_prefill_uses_original_target_mode(self):
+        target = SimpleNamespace(is_draft_worker=False)
+        with patch.object(
+            envs.SGLANG_STABLE_PREFILL, "get", return_value=True
+        ):
+            self.assertTrue(
+                _use_stable_prefill(
+                    SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
+                        _original_forward_mode=None,
+                    ),
+                    target,
+                )
+            )
+            for original_mode in (
+                ForwardMode.DECODE,
+                ForwardMode.TARGET_VERIFY,
+                ForwardMode.DRAFT_EXTEND_V2,
+            ):
+                with self.subTest(original_mode=original_mode):
+                    self.assertFalse(
+                        _use_stable_prefill(
+                            SimpleNamespace(
+                                forward_mode=ForwardMode.EXTEND,
+                                _original_forward_mode=original_mode,
+                            ),
+                            target,
+                        )
+                    )
+            self.assertFalse(
+                _use_stable_prefill(
+                    SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
+                        _original_forward_mode=None,
+                    ),
+                    SimpleNamespace(is_draft_worker=True),
+                )
+            )
+            self.assertFalse(
+                _use_stable_prefill(
+                    SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
+                        _original_forward_mode=None,
+                    ),
+                    target,
+                    cp_v2_active=True,
+                )
+            )
+
     def test_online_fp8_lm_head_forces_marlin_without_global_override(self):
         config = _serialized_fp4_config(["lm_head"])
         layer = ParallelLMHead.__new__(ParallelLMHead)
