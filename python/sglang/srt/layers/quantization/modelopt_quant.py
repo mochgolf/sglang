@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.utils.common import (
+    get_bool_env_var,
     get_device_capability,
     is_cuda,
     is_sm120_supported,
@@ -1323,6 +1324,39 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         return self.runner.run(dispatch_output, quant_info)
 
 
+class _Fp8LmHeadLinearMethod(Fp8LinearMethod):
+    def __init__(self, quant_config: Fp8Config):
+        super().__init__(quant_config)
+        self.use_marlin = True
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        weight = layer.weight.data
+        qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+        scales = torch.empty(
+            (weight.shape[0], 1), dtype=torch.float32, device=weight.device
+        )
+        for start in range(0, weight.shape[0], 4096):
+            stop = min(start + 4096, weight.shape[0])
+            source = weight[start:stop].float()
+            amax = source.abs().amax(dim=1, keepdim=True)
+            scale = torch.where(amax > 0, amax / 448.0, torch.zeros_like(amax))
+            safe_scale = torch.where(amax > 0, scale, torch.ones_like(scale))
+            qweight[start:stop] = (source / safe_scale).clamp(-448, 448).to(
+                torch.float8_e4m3fn
+            )
+            scales[start:stop] = scale
+        layer.weight = Parameter(qweight.t(), requires_grad=False)
+        layer.weight_scale = Parameter(scales.t().contiguous(), requires_grad=False)
+        layer.input_scale = None
+        if self.use_marlin:
+            from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+                prepare_fp8_layer_for_marlin,
+            )
+
+            prepare_fp8_layer_for_marlin(layer, size_k_first=True)
+            del layer.input_scale
+
+
 class ModelOptFp4Config(ModelOptQuantConfig):
     """Supported ModelOpt FP4 paths:
 
@@ -1541,6 +1575,19 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        if (
+            get_bool_env_var("SGLANG_QWEN38_FP8_LM_HEAD")
+            and isinstance(layer, ParallelLMHead)
+            and (prefix == "lm_head" or prefix.endswith(".lm_head"))
+        ):
+            logger.warning("Using online FP8 lm_head for %s", prefix)
+            return _Fp8LmHeadLinearMethod(
+                Fp8Config(
+                    is_checkpoint_fp8_serialized=False,
+                    activation_scheme="dynamic",
+                )
+            )
 
         if not self.is_checkpoint_nvfp4_serialized:
             if isinstance(layer, (LinearBase, ParallelLMHead)):

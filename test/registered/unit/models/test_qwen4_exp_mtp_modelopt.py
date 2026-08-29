@@ -1,11 +1,14 @@
 """Qwen4/Qwen3.5 MTP ModelOpt routing uses the real module prefix."""
 
+import os
 import unittest
 from unittest.mock import patch
 
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
+from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.layers.quantization.modelopt_quant import (
+    _Fp8LmHeadLinearMethod,
     ModelOptFp4Config,
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4FusedMoEMethod,
@@ -67,6 +70,29 @@ def _mixed_config(exclude_modules, *, with_mtp_experts):
 
 
 class TestQwen4ExpMtpModelOpt(CustomTestCase):
+    def test_online_fp8_lm_head_forces_marlin_without_global_override(self):
+        config = _serialized_fp4_config(["lm_head"])
+        layer = ParallelLMHead.__new__(ParallelLMHead)
+
+        def init_without_marlin(method, quant_config):
+            method.quant_config = quant_config
+            method.use_marlin = False
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "SGLANG_QWEN38_FP8_LM_HEAD": "1",
+                    "SGLANG_FORCE_FP8_MARLIN": "0",
+                },
+            ),
+            patch.object(Fp8LinearMethod, "__init__", init_without_marlin),
+        ):
+            method = config.get_quant_method(layer, "lm_head")
+
+        self.assertIsInstance(method, _Fp8LmHeadLinearMethod)
+        self.assertTrue(method.use_marlin)
+
     def test_stock_broad_mtp_ignore_stays_unquantized(self):
         config = _mixed_config(["mtp*", "mtp.layers.0*"], with_mtp_experts=False)
 
