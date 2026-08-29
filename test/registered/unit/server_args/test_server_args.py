@@ -2228,5 +2228,38 @@ class TestTwoBatchOverlapBackend(CustomTestCase):
         args._check_two_batch_overlap()
 
 
+class TestStablePrefillCompatibility(CustomTestCase):
+    def _args(self):
+        args = ServerArgs(model_path="dummy")
+        args.cuda_graph_config = CudaGraphConfig()
+        args.cuda_graph_config.prefill.backend = Backend.DISABLED
+        args.enable_two_batch_overlap = False
+        args.enable_single_batch_overlap = False
+        args.enable_pdmux = False
+        return args
+
+    def test_serial_eager_prefill_is_allowed(self):
+        args = self._args()
+        with patch.object(envs.SGLANG_STABLE_PREFILL, "get", return_value=True):
+            args._check_stable_prefill()
+
+    def test_graph_and_multistream_prefill_are_rejected(self):
+        for field, value in (
+            ("cuda_graph_config.prefill.backend", Backend.BREAKABLE),
+            ("enable_two_batch_overlap", True),
+            ("enable_single_batch_overlap", True),
+            ("enable_pdmux", True),
+        ):
+            args = self._args()
+            if field == "cuda_graph_config.prefill.backend":
+                args.cuda_graph_config.prefill.backend = value
+            else:
+                setattr(args, field, value)
+            with self.subTest(field=field), patch.object(
+                envs.SGLANG_STABLE_PREFILL, "get", return_value=True
+            ), self.assertRaisesRegex(ValueError, "serial eager prefill"):
+                args._check_stable_prefill()
+
+
 if __name__ == "__main__":
     unittest.main()

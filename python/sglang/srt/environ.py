@@ -962,6 +962,10 @@ class Envs:
     # Route decode-size HC mix through the fused CuTe split-K GEMM pair
     # instead of the persistent Triton mix.
     SGLANG_HC_MIX_CUDA = EnvBool(True)
+    # Keep extend/prefill numerics stable without slowing decode CUDA graphs.
+    # This stabilizes Marlin MoE row order and avoids atomic HC accumulation
+    # only while an extend batch is executing.
+    SGLANG_STABLE_PREFILL = EnvBool(False)
     # Log each distinct (m, n, k) the BF16 GEMM dispatch sees (allowlist tuning).
     SGLANG_BF16_GEMM_LOG_SHAPES = EnvBool(False)
     # Split the HC combine gate dot across CTAs instead of one CTA per row.

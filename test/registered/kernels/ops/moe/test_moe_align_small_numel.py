@@ -210,5 +210,51 @@ def test_runner_defers_for_ignore_invalid_expert():
     )
 
 
+@pytest.mark.parametrize(
+    "num_tokens,block_size", [(12, 8), (844, 32), (2048, 48)]
+)
+def test_runner_stable_prefill_order(num_tokens, block_size):
+    """Marlin prefill can request canonical intra-expert order."""
+    torch.manual_seed(4)
+    num_experts, topk = 512, 10
+    topk_ids = torch.randint(
+        0, num_experts, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    reference = _reference(topk_ids, block_size, num_experts)
+    first = runner_moe_align_block_size(
+        topk_ids, block_size, num_experts, stable=True
+    )
+    _assert_exact(first, reference, block_size)
+    second = runner_moe_align_block_size(
+        topk_ids, block_size, num_experts, stable=True
+    )
+    total = reference[2]
+    blocks = total // block_size
+    assert torch.equal(first[0][:total], second[0][:total])
+    assert torch.equal(first[1][:blocks], second[1][:blocks])
+
+
+def test_runner_stable_prefill_order_skewed():
+    """The bounded sort's ordered-scan fallback covers hot experts."""
+    num_tokens, topk, num_experts, block_size = 64, 8, 512, 16
+    topk_ids = torch.zeros((num_tokens, topk), dtype=torch.int32, device="cuda")
+    got = runner_moe_align_block_size(
+        topk_ids, block_size, num_experts, stable=True
+    )
+    _assert_exact(got, _reference(topk_ids, block_size, num_experts), block_size)
+
+
+def test_runner_stable_prefill_order_cuda_small_batch():
+    """Stable mode must not read the cumsum omitted by CUDA's small path."""
+    torch.manual_seed(5)
+    num_tokens, topk, num_experts, block_size = 100, 8, 31, 16
+    # Leave most buckets empty to exercise the no-write path too.
+    topk_ids = torch.randint(0, 7, (num_tokens, topk), dtype=torch.int32, device="cuda")
+    got = runner_moe_align_block_size(
+        topk_ids, block_size, num_experts, stable=True
+    )
+    _assert_exact(got, _reference(topk_ids, block_size, num_experts), block_size)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

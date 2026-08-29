@@ -6,10 +6,25 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.model_executor.forward_context import (
+    get_forward_context,
+    has_forward_context,
+)
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_cuda = is_cuda()
+
+
+def _stable_moe_align_enabled() -> bool:
+    if has_forward_context() and get_forward_context().stable_prefill:
+        return True
+    try:
+        return bool(get_exec().deterministic.enable_deterministic_inference)
+    except ValueError:
+        return False
+
 
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
@@ -260,7 +275,10 @@ def fused_marlin_moe(
         )
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, global_num_experts
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            stable=_stable_moe_align_enabled(),
         )
 
     if workspace is None:

@@ -9145,6 +9145,24 @@ class ServerArgs:
                 "(DeepSeek-V4 non-EP DP TBO path)."
             )
 
+    def _check_stable_prefill(self):
+        if not envs.SGLANG_STABLE_PREFILL.get():
+            return
+        incompatible = []
+        if self.cuda_graph_config.prefill.backend != Backend.DISABLED:
+            incompatible.append("prefill CUDA graph")
+        if self.enable_two_batch_overlap:
+            incompatible.append("two-batch overlap")
+        if self.enable_single_batch_overlap:
+            incompatible.append("single-batch overlap")
+        if self.enable_pdmux:
+            incompatible.append("PD-multiplexing")
+        if incompatible:
+            raise ValueError(
+                "SGLANG_STABLE_PREFILL=1 requires serial eager prefill; disable "
+                + ", ".join(incompatible)
+            )
+
     def check_server_args(self):
         # Check parallel size constraints
         if self.ep_join_mode != "scale":
@@ -9313,6 +9331,7 @@ class ServerArgs:
 
         # Check two batch overlap backend requirement.
         self._check_two_batch_overlap()
+        self._check_stable_prefill()
 
         # Check communications compression
         if self.enable_quant_communications and self.tp_size == 1:

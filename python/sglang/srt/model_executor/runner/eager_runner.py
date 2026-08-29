@@ -37,10 +37,15 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     create_chunked_prefix_cache_kv_indices,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
+    get_forward_context,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
@@ -71,6 +76,18 @@ _is_hip = is_hip()
 if TYPE_CHECKING:
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+def _use_stable_prefill(
+    forward_batch: ForwardBatch, model_runner, *, cp_v2_active: bool = False
+) -> bool:
+    mode = forward_batch._original_forward_mode or forward_batch.forward_mode
+    return (
+        envs.SGLANG_STABLE_PREFILL.get()
+        and not model_runner.is_draft_worker
+        and not cp_v2_active
+        and mode == ForwardMode.EXTEND
+    )
 
 
 class EagerRunner(BaseRunner):
@@ -314,7 +331,14 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        with device_timer_ctx(model_runner.device_timer, category):
+        stable_ctx = (
+            forward_context(replace(get_forward_context(), stable_prefill=True))
+            if _use_stable_prefill(
+                forward_batch, model_runner, cp_v2_active=cp_v2_active
+            )
+            else contextlib.nullcontext()
+        )
+        with device_timer_ctx(model_runner.device_timer, category), stable_ctx:
             pcg_runner = model_runner.prefill_cuda_graph_runner
             if (
                 _is_hip
