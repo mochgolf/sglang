@@ -1,38 +1,17 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import torch
-
-from sglang.kernels.jit.utils import (
-    cache_once,
-    is_arch_support_pdl,
-    load_jit,
-    make_cpp_args,
-)
-
-if TYPE_CHECKING:
-    from tvm_ffi.module import Module
 
 _FAST_TOPK_SUPPORTED_K = (512, 2048)
 
 
-@cache_once
-def _jit_fast_topk_module(topk: int) -> Module:
-    """Compile and cache the JIT fast top-k module for a given k."""
-    # Checks on the compile key live here, not in `fast_topk`: `cache_once`
-    # keys on `topk`, so this runs once per specialisation.
+def _check_topk(topk: int) -> None:
     if topk not in _FAST_TOPK_SUPPORTED_K:
         raise RuntimeError(
             f"Unsupported topk {topk}. Supported: {_FAST_TOPK_SUPPORTED_K}"
         )
-    args = make_cpp_args(topk, is_arch_support_pdl())
-    return load_jit(
-        "fast_topk",
-        *args,
-        cuda_files=["elementwise/fast_topk.cuh"],
-        cuda_wrappers=[("fast_topk", f"FastTopKKernel<{args}>::run")],
-    )
 
 
 def fast_topk(
@@ -47,7 +26,7 @@ def fast_topk(
     Row b selects the `topk` largest values in
     ``score[b, row_starts[b] : row_starts[b] + lengths[b]]`` and returns their
     indices relative to ``row_starts[b]``. Slots beyond ``lengths[b]`` are -1.
-    Output order within a row is unspecified (atomic collection order).
+    Output order is deterministic for fixed inputs but otherwise unspecified.
 
     Parameters
     ----------
@@ -60,11 +39,20 @@ def fast_topk(
     -------
     CUDA int32 tensor [B, topk]
     """
+    _check_topk(topk)
     batch = score.shape[0]
-    if row_starts is None:
-        row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
-    indices = score.new_empty((batch, topk), dtype=torch.int32)
+    offsets = torch.zeros(batch, dtype=torch.int32, device=score.device)
+    starts = None
+    if row_starts is not None:
+        starts = row_starts.to(device=score.device, dtype=torch.int32).contiguous()
 
-    module = _jit_fast_topk_module(topk)
-    module.fast_topk(score, row_starts, indices, lengths)
-    return indices
+    from flashinfer import top_k_ragged_transform
+
+    return top_k_ragged_transform(
+        score.contiguous(),
+        offsets,
+        lengths.to(device=score.device, dtype=torch.int32).contiguous(),
+        topk,
+        deterministic=True,
+        row_starts=starts,
+    )

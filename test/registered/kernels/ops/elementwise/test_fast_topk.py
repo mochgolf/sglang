@@ -83,6 +83,24 @@ def test_fast_topk_ragged_with_row_starts(topk):
 
 
 @pytest.mark.parametrize("topk", [512, 2048])
+def test_fast_topk_ragged_ignores_larger_values_outside_window(topk):
+    width = topk + 1024
+    score = torch.randn(4, width, dtype=torch.float32, device="cuda")
+    row_starts = torch.tensor([0, 17, 63, 100], dtype=torch.int32, device="cuda")
+    lengths = torch.tensor(
+        [0, 1, topk - 1, topk + 1], dtype=torch.int32, device="cuda"
+    )
+    positions = torch.arange(width, device="cuda").unsqueeze(0)
+    valid = (positions >= row_starts[:, None]) & (
+        positions < row_starts[:, None] + lengths[:, None]
+    )
+    score.masked_fill_(~valid, 1e30)
+
+    indices = fast_topk(score, lengths, topk, row_starts=row_starts)
+    _check_topk_values(score, lengths, indices, topk, row_starts)
+
+
+@pytest.mark.parametrize("topk", [512, 2048])
 def test_fast_topk_row_stride(topk):
     torch.manual_seed(0)
     batch, length = 8, 4096
@@ -90,8 +108,12 @@ def test_fast_topk_row_stride(topk):
     score = base[:, :length]  # stride(0) == 2*length, stride(1) == 1
     lengths = torch.full((batch,), length, dtype=torch.int32, device="cuda")
 
-    indices = fast_topk(score, lengths, topk)
-    _check_topk_values(score, lengths, indices, topk, None)
+    expected = fast_topk(score, lengths, topk)
+    _check_topk_values(score, lengths, expected, topk, None)
+    for _ in range(3):
+        indices = fast_topk(score, lengths, topk)
+        _check_topk_values(score, lengths, indices, topk, None)
+        assert torch.equal(indices, expected)
 
 
 @pytest.mark.parametrize("topk", [512, 2048])
@@ -115,8 +137,12 @@ def test_fast_topk_duplicate_heavy(topk, fill):
         score = torch.full((batch, length), 3.25, dtype=torch.float32, device="cuda")
     lengths = torch.full((batch,), length, dtype=torch.int32, device="cuda")
 
-    indices = fast_topk(score, lengths, topk)
-    _check_topk_values(score, lengths, indices, topk, None)
+    expected = fast_topk(score, lengths, topk)
+    _check_topk_values(score, lengths, expected, topk, None)
+    for _ in range(3):
+        indices = fast_topk(score, lengths, topk)
+        _check_topk_values(score, lengths, indices, topk, None)
+        assert torch.equal(indices, expected)
 
 
 @pytest.mark.parametrize("topk", [512, 2048])
@@ -130,6 +156,63 @@ def test_fast_topk_negative_and_zero(topk):
 
     indices = fast_topk(score, lengths, topk)
     _check_topk_values(score, lengths, indices, topk, None)
+
+
+@pytest.mark.parametrize(
+    "topk,length,narrow",
+    [
+        (512, 30_938, True),
+        (512, 65_504, True),
+        (2048, 262_144, True),
+    ],
+)
+def test_fast_topk_candidate_buffer_overflow(topk, length, narrow):
+    """Concentrated threshold bins must not silently truncate candidates."""
+
+    torch.manual_seed(0)
+    score = torch.randn(4, length, dtype=torch.float32, device="cuda")
+    if narrow:
+        score = score.mul_(0.1).add_(10.0)
+    lengths = torch.full((4,), length, dtype=torch.int32, device="cuda")
+
+    expected = fast_topk(score, lengths, topk)
+    _check_topk_values(score, lengths, expected, topk, None)
+    for _ in range(3):
+        actual = fast_topk(score, lengths, topk)
+        _check_topk_values(score, lengths, actual, topk, None)
+        assert torch.equal(actual, expected)
+
+
+def test_fast_topk_cuda_graph_replay():
+    topk, length = 512, 65_504
+    score = torch.empty(4, length, dtype=torch.float32, device="cuda")
+    lengths = torch.full((4,), length, dtype=torch.int32, device="cuda")
+
+    score.normal_().mul_(0.1).add_(10.0)
+    for _ in range(3):
+        fast_topk(score, lengths, topk)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        indices = [fast_topk(score, lengths, topk) for _ in range(13)]
+
+    for seed in range(1, 21):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        score.copy_(
+            torch.randn(
+                score.shape,
+                generator=generator,
+                dtype=score.dtype,
+                device=score.device,
+            )
+            .mul_(0.1)
+            .add_(10.0)
+        )
+        graph.replay()
+        for output in indices:
+            _check_topk_values(score, lengths, output, topk, None)
+            assert torch.equal(output, indices[0])
 
 
 def test_fast_topk_unsupported_k():
