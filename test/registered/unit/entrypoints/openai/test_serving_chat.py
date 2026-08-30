@@ -63,6 +63,8 @@ class _MockTokenizerManager:
 
     def __init__(self):
         self.model_config = Mock(is_multimodal=False)
+        self.model_config.get_default_sampling_params.return_value = {}
+        self.preferred_sampling_params = None
         self.server_args = Mock(
             model_path="deepseek-ai/DeepSeek-V4-Flash",
             revision=None,
@@ -176,6 +178,32 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(chat.tool_call_parser, "qwen25")
         self.assertIsNone(chat.reasoning_parser)
         self.assertEqual(self.tm.server_args.tool_call_parser, "auto")
+
+    def test_preferred_sampling_params_override_model_defaults(self):
+        self.tm.model_config.get_default_sampling_params.return_value = {
+            "temperature": 1.0,
+            "top_k": 20,
+            "top_p": 0.95,
+        }
+        self.tm.preferred_sampling_params = {"temperature": 0.0}
+
+        chat = OpenAIServingChat(self.tm, self.template_manager)
+
+        self.assertEqual(
+            chat.default_sampling_params,
+            {"temperature": 0.0, "top_k": 20, "top_p": 0.95},
+        )
+        explicit = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            temperature=0.7,
+        )
+        self.assertEqual(
+            explicit.to_sampling_params([], chat.default_sampling_params)[
+                "temperature"
+            ],
+            0.7,
+        )
 
     def test_the_xgrammar_gate_follows_the_overlay(self):
         """A detected `reasoning_parser` must gate xgrammar, not the seed's "auto"."""
