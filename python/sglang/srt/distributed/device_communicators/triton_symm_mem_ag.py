@@ -517,6 +517,10 @@ class MultimemAllGatherer:
     def _build(self, x: torch.Tensor):
         if x.dim() != 2 or x.dtype != torch.bfloat16:
             return None
+        if x.is_cuda and torch.cuda.get_device_capability(x.device)[0] < 9:
+            # multimem PTX requires SM90+; avoid a pointless cross-rank
+            # symmetric-memory rendezvous on Ada and fall back to NCCL.
+            return None
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             # Can't allocate under capture; retry later.
             return self._UNINIT
