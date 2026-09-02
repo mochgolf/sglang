@@ -12,6 +12,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from contextlib import contextmanager
 from copy import deepcopy
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field, fields, replace
 from functools import cached_property
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -254,6 +255,9 @@ class _Dumper:
     def __init__(self, *, config: DumperConfig):
         self._config = config
         self._state = _DumperState()
+        self._forward_metadata = ContextVar(
+            "sglang_dumper_forward_metadata", default=None
+        )
         self._non_intrusives: list[_NonIntrusiveDumper] = []
         self._grafter = _Grafter(config=config)
 
@@ -356,6 +360,14 @@ class _Dumper:
         self._state.global_ctx = {
             k: v for k, v in (self._state.global_ctx | kwargs).items() if v is not None
         }
+
+    @contextmanager
+    def forward_metadata_context(self, metadata: Optional[dict]):
+        token = self._forward_metadata.set(metadata)
+        try:
+            yield
+        finally:
+            self._forward_metadata.reset(token)
 
     def ctx(
         self,
@@ -489,6 +501,7 @@ class _Dumper:
             **extra_kwargs,
             **self._state.global_ctx,
         )
+        forward_metadata = self._forward_metadata.get() or {}
 
         if (f := self._config.filter) is not None and not _evaluate_filter(f, tags):
             return
@@ -507,7 +520,11 @@ class _Dumper:
                 value=value,
                 save=save,
                 step=step,
-                meta_only_fields={**(value_meta_only_fields or {}), **recompute_meta},
+                meta_only_fields={
+                    **(value_meta_only_fields or {}),
+                    **recompute_meta,
+                    **forward_metadata,
+                },
             )
 
         if enable_curr_grad and isinstance(value, torch.Tensor):
@@ -522,7 +539,11 @@ class _Dumper:
                 value=g,
                 save=save,
                 step=step,
-                meta_only_fields={**(grad_meta_only_fields or {}), **recompute_meta},
+                meta_only_fields={
+                    **(grad_meta_only_fields or {}),
+                    **recompute_meta,
+                    **forward_metadata,
+                },
             )
 
         if enable_future_grad:
@@ -531,7 +552,7 @@ class _Dumper:
                 tensor=value,
                 extra_kwargs=extra_kwargs,
                 save=save,
-                meta_only_fields=grad_meta_only_fields or {},
+                meta_only_fields={**(grad_meta_only_fields or {}), **forward_metadata},
             )
 
     def _register_dump_grad_hook(
@@ -607,11 +628,11 @@ class _Dumper:
         if save and (self._config.enable_output_file or capturing):
             output_data = {
                 "value": value,
-                "meta": dict(
+                "meta": {
                     **full_kwargs,
                     **self._static_meta,
                     **(meta_only_fields or {}),
-                ),
+                },
             }
 
             if capturing:

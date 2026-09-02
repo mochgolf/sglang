@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import regex as re
@@ -1575,6 +1576,55 @@ class ModelOptFp4Config(ModelOptQuantConfig):
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+
+        use_qkvz_wna16 = get_bool_env_var("SGLANG_QWEN38_GDN_QKVZ_WNA16")
+        layer_filter = os.environ.get("SGLANG_QWEN38_GDN_QKVZ_WNA16_LAYERS")
+        if use_qkvz_wna16 and layer_filter and prefix.endswith(".linear_attn.in_proj_qkvz"):
+            match = re.search(r"\.layers\.(\d+)\.linear_attn\.in_proj_qkvz$", prefix)
+            if match is None:
+                raise ValueError(f"Cannot resolve qkvz layer from prefix: {prefix}")
+            selected = {int(value) for value in layer_filter.split(",")}
+            use_qkvz_wna16 = int(match.group(1)) in selected
+
+        if (
+            use_qkvz_wna16
+            and isinstance(layer, LinearBase)
+            and prefix.endswith(".linear_attn.in_proj_qkvz")
+        ):
+            try:
+                group_size = int(
+                    os.environ.get("SGLANG_QWEN38_GDN_QKVZ_WNA16_GROUP_SIZE", "128")
+                )
+            except ValueError as exc:
+                raise ValueError("qkvz WNA16 group size must be 32, 64, or 128") from exc
+            if group_size not in {32, 64, 128}:
+                raise ValueError("qkvz WNA16 group size must be 32, 64, or 128")
+            symmetric_value = os.environ.get(
+                "SGLANG_QWEN38_GDN_QKVZ_WNA16_SYMMETRIC", "1"
+            )
+            if symmetric_value not in {"0", "1"}:
+                raise ValueError("qkvz WNA16 symmetric flag must be 0 or 1")
+            symmetric = symmetric_value == "1"
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsLinearMethod,
+            )
+            from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+                CompressedTensorsWNA16,
+            )
+
+            layer.scheme = CompressedTensorsWNA16(
+                strategy="group",
+                num_bits=8,
+                group_size=group_size,
+                symmetric=symmetric,
+            )
+            logger.warning(
+                "Using %s INT8 G%d WNA16 qkvz for %s",
+                "symmetric" if symmetric else "asymmetric",
+                group_size,
+                prefix,
+            )
+            return CompressedTensorsLinearMethod(self)
 
         if (
             get_bool_env_var("SGLANG_QWEN38_FP8_LM_HEAD")

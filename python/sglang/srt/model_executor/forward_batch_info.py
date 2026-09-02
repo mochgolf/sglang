@@ -28,10 +28,14 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import json
 import warnings
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from enum import IntEnum, auto
+from enum import Enum, IntEnum, auto
 from functools import total_ordering
+from itertools import count
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import torch
@@ -74,6 +78,231 @@ if TYPE_CHECKING:
 _skip_attn_backend_init_warned = False
 
 _is_npu = is_npu()
+
+
+# Process-local physical-forward sequence. Target and draft ModelRunner
+# instances in one worker import this same module, so they share one counter.
+_PROCESS_FORWARD_INDEX = count()
+
+
+def next_process_forward_index() -> int:
+    """Return the next process-local physical forward index."""
+    return next(_PROCESS_FORWARD_INDEX)
+
+
+class CapturePhase(str, Enum):
+    PREFILL = "prefill"
+    DRAFT_PREFILL = "draft_prefill"
+    DRAFT_DECODE = "draft_decode"
+    TARGET_VERIFY = "target_verify"
+    DRAFT_EXTEND = "draft_extend"
+
+
+class CaptureRunnerRole(str, Enum):
+    TARGET = "target"
+    DRAFT = "draft"
+
+
+_FORWARD_CAPTURE_CONTEXT: ContextVar[Optional[dict]] = ContextVar(
+    "sglang_forward_capture_context", default=None
+)
+
+
+def _validate_forward_capture_context(metadata: dict) -> None:
+    if not isinstance(metadata, dict):
+        raise TypeError("forward capture context must be a dict")
+    try:
+        phase = CapturePhase(metadata["phase"])
+        runner_role = CaptureRunnerRole(metadata["runner_role"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"invalid forward capture context: {metadata!r}") from exc
+
+    spec_step = metadata.get("spec_step")
+    if spec_step is not None and (
+        isinstance(spec_step, bool)
+        or not isinstance(spec_step, int)
+        or spec_step < 0
+    ):
+        raise ValueError(f"invalid spec_step in forward capture context: {metadata!r}")
+
+    expected = {
+        (CapturePhase.PREFILL, CaptureRunnerRole.TARGET): None,
+        (CapturePhase.DRAFT_PREFILL, CaptureRunnerRole.DRAFT): None,
+        (CapturePhase.DRAFT_DECODE, CaptureRunnerRole.DRAFT): "required",
+        (CapturePhase.TARGET_VERIFY, CaptureRunnerRole.TARGET): None,
+        (CapturePhase.DRAFT_EXTEND, CaptureRunnerRole.DRAFT): None,
+    }.get((phase, runner_role), "invalid")
+    if expected == "invalid" or (expected == "required") != (spec_step is not None):
+        raise ValueError(f"invalid phase/runner/spec_step combination: {metadata!r}")
+
+
+@contextmanager
+def forward_capture_context(
+    *,
+    phase: CapturePhase | str,
+    runner_role: CaptureRunnerRole | str,
+    spec_step: Optional[int] = None,
+):
+    metadata = {
+        "phase": CapturePhase(phase).value,
+        "runner_role": CaptureRunnerRole(runner_role).value,
+        "spec_step": spec_step,
+    }
+    _validate_forward_capture_context(metadata)
+    token = _FORWARD_CAPTURE_CONTEXT.set(metadata)
+    try:
+        yield
+    finally:
+        _FORWARD_CAPTURE_CONTEXT.reset(token)
+
+
+def get_forward_capture_context() -> Optional[dict]:
+    metadata = _FORWARD_CAPTURE_CONTEXT.get()
+    if metadata is None:
+        return None
+    _validate_forward_capture_context(metadata)
+    return dict(metadata)
+
+
+def validate_forward_capture_metadata(metadata: dict) -> None:
+    """Fail closed on incomplete or tampered capture metadata."""
+    required = {
+        "phase",
+        "runner_role",
+        "spec_step",
+        "forward_iter",
+        "forward_index",
+        "rids",
+        "positions",
+        "seq_lens",
+        "num_token_non_padded",
+        "num_padding",
+        "batch_size",
+        "tp_rank",
+        "tp_size",
+        "forward_index_scope",
+        "forward_index_key",
+        "metadata_value_mode",
+        "snapshot_stage",
+        "graph_mode",
+        "overlap_mode",
+    }
+    if not isinstance(metadata, dict) or not required.issubset(metadata):
+        missing = (
+            sorted(required - set(metadata))
+            if isinstance(metadata, dict)
+            else required
+        )
+        raise ValueError(f"incomplete forward capture metadata; missing={missing}")
+    _validate_forward_capture_context(
+        {
+            "phase": metadata["phase"],
+            "runner_role": metadata["runner_role"],
+            "spec_step": metadata["spec_step"],
+        }
+    )
+    for key in ("forward_index", "batch_size", "tp_rank"):
+        value = metadata[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"invalid {key} in forward capture metadata: {metadata!r}")
+    if (
+        isinstance(metadata["tp_size"], bool)
+        or not isinstance(metadata["tp_size"], int)
+        or metadata["tp_size"] <= 0
+    ):
+        raise ValueError(f"invalid tp_size in forward capture metadata: {metadata!r}")
+    if metadata["forward_iter"] is not None and (
+        isinstance(metadata["forward_iter"], bool)
+        or not isinstance(metadata["forward_iter"], int)
+    ):
+        raise ValueError(
+            f"invalid forward_iter in forward capture metadata: {metadata!r}"
+        )
+    if metadata["num_token_non_padded"] is not None and (
+        isinstance(metadata["num_token_non_padded"], bool)
+        or not isinstance(metadata["num_token_non_padded"], int)
+        or metadata["num_token_non_padded"] < 0
+    ):
+        raise ValueError(
+            f"invalid num_token_non_padded in forward capture metadata: {metadata!r}"
+        )
+    if metadata["num_padding"] is not None and (
+        isinstance(metadata["num_padding"], bool)
+        or not isinstance(metadata["num_padding"], int)
+        or metadata["num_padding"] < 0
+    ):
+        raise ValueError(
+            f"invalid num_padding in forward capture metadata: {metadata!r}"
+        )
+    if not isinstance(metadata["rids"], list) or not all(
+        isinstance(rid, str) for rid in metadata["rids"]
+    ):
+        raise ValueError(f"invalid rids in forward capture metadata: {metadata!r}")
+    for field in ("positions", "seq_lens"):
+        if metadata[field] != {
+            "source": "dumper_core",
+            "record_name": field,
+            "join_key": "forward_index_key",
+        }:
+            raise ValueError(f"invalid {field} record reference: {metadata!r}")
+    if metadata["forward_index_scope"] != "process-local":
+        raise ValueError(f"invalid forward_index_scope: {metadata!r}")
+    if tuple(metadata["forward_index_key"]) != (
+        metadata["tp_rank"],
+        metadata["forward_index"],
+    ):
+        raise ValueError(f"invalid forward_index_key: {metadata!r}")
+    if metadata["metadata_value_mode"] != "core_artifact_join":
+        raise ValueError(f"invalid metadata_value_mode: {metadata!r}")
+    if metadata["snapshot_stage"] != "post_eager_prepare":
+        raise ValueError(f"invalid snapshot_stage: {metadata!r}")
+    if metadata["graph_mode"] != "eager" or metadata["overlap_mode"] != "off":
+        raise ValueError("capture instrumentation requires eager, non-overlap forwards")
+
+
+def build_forward_capture_metadata(
+    forward_batch: "ForwardBatch",
+    *,
+    forward_index: int,
+    tp_rank: int,
+    tp_size: int,
+) -> Optional[dict]:
+    context = get_forward_capture_context()
+    if context is None:
+        return None
+    # Do not touch device tensors here. Positions and sequence lengths are
+    # already emitted as dumper core records; consumers join those records by
+    # ``forward_index_key`` after capture.
+    num_token_non_padded = getattr(forward_batch, "num_token_non_padded_cpu", None)
+    metadata = {
+        **context,
+        "forward_iter": getattr(forward_batch, "forward_iter", None),
+        "forward_index": forward_index,
+        "rids": list(getattr(forward_batch, "rids", None) or []),
+        "positions": {
+            "source": "dumper_core",
+            "record_name": "positions",
+            "join_key": "forward_index_key",
+        },
+        "seq_lens": {
+            "source": "dumper_core",
+            "record_name": "seq_lens",
+            "join_key": "forward_index_key",
+        },
+        "num_token_non_padded": num_token_non_padded,
+        "num_padding": getattr(forward_batch, "num_padding", None),
+        "batch_size": int(forward_batch.batch_size),
+        "tp_rank": int(tp_rank),
+        "tp_size": int(tp_size),
+        "forward_index_scope": "process-local",
+        "forward_index_key": (int(tp_rank), int(forward_index)),
+        "metadata_value_mode": "core_artifact_join",
+        "snapshot_stage": "post_eager_prepare",
+        "graph_mode": "eager",
+        "overlap_mode": "off",
+    }
+    validate_forward_capture_metadata(metadata)
+    return metadata
 
 
 def _elastic_should_preserve_local_token_counts(
@@ -417,6 +646,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # the graph runners for backends whose seq-len fill value is ambiguous
     # (QSA's fill is 1, a legal real length); None outside replay.
     num_padding: Optional[int] = None
+    # Scheduler iteration copied for capture metadata; does not affect execution.
+    forward_iter: Optional[int] = None
 
     # For input embeddings
     input_embeds: Optional[torch.Tensor] = None
@@ -813,6 +1044,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens_cpu=batch.encoder_lens_cpu,
             lora_ids=[req.lora_id for req in batch.reqs],
             rids=[req.rid for req in batch.reqs],
+            forward_iter=batch.forward_iter,
             # Compound (carry their own device tensors)
             sampling_info=batch.sampling_info,
             spec_info=batch.spec_info,
@@ -1836,3 +2068,172 @@ def _bootstrap_rooms_to_tensor(
 def _stable_hash_str_to_i64(rid: str) -> int:
     digest = hashlib.blake2b(rid.encode("utf-8"), digest_size=8).digest()
     return int.from_bytes(digest, "little", signed=True)
+
+
+def run_forward_capture_selfcheck() -> None:
+    """CPU-only contract check for the explicit NEXTN capture metadata."""
+    from pathlib import Path
+    from tempfile import TemporaryDirectory
+    from types import SimpleNamespace
+
+    from sglang.srt.debug_utils.dumper import DumperConfig, _Dumper
+    from sglang.srt.runtime_context import get_parallel
+
+    assert {phase.value for phase in CapturePhase} == {
+        "prefill",
+        "draft_prefill",
+        "draft_decode",
+        "target_verify",
+        "draft_extend",
+    }
+    # These tensors represent the already-padded batch. The metadata carries
+    # only their dumper-core record references, so building it does not read a
+    # device tensor; root and nested records carry the post-padding values.
+    batch = SimpleNamespace(
+        batch_size=3,
+        forward_iter=7,
+        rids=["r0", "r1", "r2"],
+        positions=torch.tensor([3, 4, 0], dtype=torch.int64),
+        seq_lens=torch.tensor([4, 5, 1], dtype=torch.int64),
+        num_token_non_padded_cpu=2,
+        num_padding=1,
+    )
+    first_index = next_process_forward_index()
+    with forward_capture_context(
+        phase=CapturePhase.DRAFT_DECODE,
+        runner_role=CaptureRunnerRole.DRAFT,
+        spec_step=0,
+    ):
+        metadata = build_forward_capture_metadata(
+            batch, forward_index=first_index, tp_rank=1, tp_size=2
+        )
+    assert metadata["phase"] == "draft_decode"
+    assert metadata["runner_role"] == "draft"
+    assert metadata["spec_step"] == 0
+    assert all(
+        key in metadata
+        for key in (
+            "phase",
+            "runner_role",
+            "spec_step",
+            "forward_iter",
+            "forward_index",
+            "rids",
+            "positions",
+            "seq_lens",
+            "num_token_non_padded",
+            "num_padding",
+            "batch_size",
+            "tp_rank",
+            "tp_size",
+        )
+    )
+    assert tuple(metadata["forward_index_key"]) == (1, first_index)
+    assert metadata["snapshot_stage"] == "post_eager_prepare"
+    assert metadata["metadata_value_mode"] == "core_artifact_join"
+    assert metadata["positions"]["source"] == "dumper_core"
+    assert metadata["seq_lens"]["record_name"] == "seq_lens"
+    assert json.loads(json.dumps(metadata))["forward_index_key"] == [1, first_index]
+
+    # Minimal root/nested dumper integration: every record from the same
+    # forward receives the same join key, while the core values remain the
+    # post-padding tensors captured by the existing dumper path.
+    dumper = _Dumper(
+        config=DumperConfig(
+            enable=True,
+            enable_output_file=False,
+            enable_output_console=False,
+        )
+    )
+    with dumper.forward_metadata_context(metadata):
+        with dumper.capture_output() as captured:
+            dumper.dump("positions", batch.positions)
+            dumper.dump("seq_lens", batch.seq_lens)
+            dumper.dump("gdn_nested", torch.tensor([1]))
+    assert captured["positions"]["value"].tolist() == [3, 4, 0]
+    assert captured["seq_lens"]["value"].tolist() == [4, 5, 1]
+    assert captured["positions"]["meta"]["forward_index_key"] == (
+        1,
+        first_index,
+    )
+    assert captured["seq_lens"]["meta"]["forward_index_key"] == (
+        1,
+        first_index,
+    )
+    assert captured["gdn_nested"]["meta"]["forward_index_key"] == (
+        1,
+        first_index,
+    )
+    with dumper.forward_metadata_context(metadata):
+        try:
+            with dumper.forward_metadata_context(None):
+                raise RuntimeError("selfcheck nested context")
+        except RuntimeError:
+            pass
+        with dumper.capture_output() as restored:
+            dumper.dump("restored", torch.tensor([1]))
+        assert restored["restored"]["meta"]["forward_index_key"] == (
+            1,
+            first_index,
+        )
+    assert dumper._forward_metadata.get() is None
+
+    # A filename rank tag and same-key forward metadata must coexist. The
+    # literal-unpack metadata construction in dumper.py keeps the metadata
+    # tp_rank when filename tags use that key too.
+    with TemporaryDirectory() as temp_dir:
+        ranked_dumper = _Dumper(
+            config=DumperConfig(
+                enable=True,
+                dir=temp_dir,
+                exp_name="tp-rank",
+                enable_output_file=True,
+                enable_output_console=False,
+                include_parallel_rank_in_filename=True,
+            )
+        )
+        with get_parallel().override(tp_rank=1, tp_size=2):
+            with ranked_dumper.forward_metadata_context(metadata):
+                ranked_dumper.dump("positions", batch.positions)
+        ranked_files = list(Path(temp_dir).rglob("*.pt"))
+        assert len(ranked_files) == 1
+        assert "tp_rank=1" in ranked_files[0].name
+        saved = torch.load(ranked_files[0], map_location="cpu")
+        assert saved["meta"]["tp_rank"] == metadata["tp_rank"] == 1
+        assert saved["meta"]["forward_index_key"] == metadata["forward_index_key"]
+
+    second_index = next_process_forward_index()
+    assert second_index > first_index  # shared by target/draft runner instances
+
+    emitted_steps = []
+    for spec_step in range(3):
+        if spec_step == 2:  # V2's final step has no model forward.
+            continue
+        with forward_capture_context(
+            phase=CapturePhase.DRAFT_DECODE,
+            runner_role=CaptureRunnerRole.DRAFT,
+            spec_step=spec_step,
+        ):
+            emitted_steps.append(get_forward_capture_context()["spec_step"])
+    assert emitted_steps == [0, 1]
+
+    tampered = dict(metadata, phase="decode")
+    try:
+        validate_forward_capture_metadata(tampered)
+    except (TypeError, ValueError):
+        pass
+    else:
+        raise AssertionError("tampered phase was not rejected")
+
+    tampered_mode = dict(metadata, graph_mode="cuda_graph")
+    try:
+        validate_forward_capture_metadata(tampered_mode)
+    except (TypeError, ValueError):
+        pass
+    else:
+        raise AssertionError("graph mode was not rejected")
+
+
+if __name__ == "__main__":
+    run_forward_capture_selfcheck()
+    print("forward capture selfcheck: PASS")

@@ -317,6 +317,25 @@ bool is_valid_config(
   COMMON_GET_IF_M234(W_TYPE, 8, 4, 128)  \
   COMMON_GET_IF_M234(W_TYPE, 4, 8, 128)
 
+// Integer-zero-point U8 is not part of the upstream common instantiations.
+// Keep the added surface to group size 32, which is the qualified W8A16 path.
+#define U8_ZP_G32_GET_IF_M1(N_BLOCKS, K_BLOCKS, NUM_THREADS)          \
+  _GET_IF(host::kU8, 1, N_BLOCKS, K_BLOCKS, true, 2, NUM_THREADS, false)  \
+  _GET_IF(host::kU8, 1, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define U8_ZP_G32_GET_IF_M234(N_BLOCKS, K_BLOCKS, NUM_THREADS)         \
+  _GET_IF(host::kU8, 2, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(host::kU8, 3, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false) \
+  _GET_IF(host::kU8, 4, N_BLOCKS, K_BLOCKS, false, 2, NUM_THREADS, false)
+
+#define U8_ZP_G32_GET_IF()            \
+  U8_ZP_G32_GET_IF_M1(8, 8, 256)      \
+  U8_ZP_G32_GET_IF_M1(8, 4, 128)      \
+  U8_ZP_G32_GET_IF_M1(4, 8, 128)      \
+  U8_ZP_G32_GET_IF_M234(16, 4, 256)   \
+  U8_ZP_G32_GET_IF_M234(8, 4, 128)    \
+  U8_ZP_G32_GET_IF_M234(4, 8, 128)
+
 #define BIGGROUP_GET_IF_M1(W_TYPE, N_BLOCKS, K_BLOCKS, NUM_THREADS)     \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, -1, NUM_THREADS, false)  \
   _GET_IF(W_TYPE, 1, N_BLOCKS, K_BLOCKS, true, 8, NUM_THREADS, false)   \
@@ -412,6 +431,7 @@ MarlinFuncPtr get_marlin_kernel(
   COMMON_GET_IF(host::kU4)
   COMMON_GET_IF(host::kU4B8)
   COMMON_GET_IF(host::kU8B128)
+  U8_ZP_G32_GET_IF()
 
   FP4_GET_IF(host::kFE2M1f)
 

@@ -12,8 +12,11 @@ from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    CapturePhase,
+    CaptureRunnerRole,
     ForwardBatch,
     ForwardMode,
+    forward_capture_context,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_utils import (
@@ -559,11 +562,15 @@ def run_eagle_verify(
     # eagle_prepare_for_verify marked the batch in exactly that case; the
     # non-cuda-graph path stays unmarked and gets forward_extend's init
     # (post-pad).
-    forward_batch_output = target_worker.forward_batch_generation(
-        batch=None,
-        forward_batch=verify_forward_batch,
-        is_verify=True,
-    )
+    with forward_capture_context(
+        phase=CapturePhase.TARGET_VERIFY,
+        runner_role=CaptureRunnerRole.TARGET,
+    ):
+        forward_batch_output = target_worker.forward_batch_generation(
+            batch=None,
+            forward_batch=verify_forward_batch,
+            is_verify=True,
+        )
     logits_output = forward_batch_output.logits_output
 
     # Generate vocab mask for constrained decoding

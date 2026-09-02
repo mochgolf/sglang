@@ -96,6 +96,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
+    build_forward_capture_metadata,
+    get_forward_capture_context,
+    next_process_forward_index,
 )
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
@@ -1647,6 +1650,23 @@ class ModelRunner:
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Physical forwards share one process-local counter across target and
+        # draft ModelRunner instances. It is observation-only and may have
+        # gaps when capture is disabled.
+        forward_index = next_process_forward_index()
+        capture_enabled = (
+            dumper.may_enable and get_forward_capture_context() is not None
+        )
+        overlap_enabled = (
+            not getattr(self.server_args, "disable_overlap_schedule", True)
+            or getattr(self.server_args, "enable_two_batch_overlap", False)
+            or getattr(self.server_args, "enable_single_batch_overlap", False)
+        )
+        if capture_enabled and overlap_enabled:
+            raise RuntimeError(
+                "NEXTN capture requires disable_overlap_schedule and no overlap mode"
+            )
+
         if has_forward_context():
             ctx_mgr = contextlib.nullcontext()
         else:
@@ -1673,6 +1693,10 @@ class ModelRunner:
 
             # Replay cuda graph if applicable
             if can_run_graph:
+                if capture_enabled:
+                    raise RuntimeError(
+                        "NEXTN capture does not cover decode CUDA-graph replay"
+                    )
                 ret = self.decode_cuda_graph_runner.execute(
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
@@ -1695,13 +1719,25 @@ class ModelRunner:
             if dwdp_mgr is not None:
                 dwdp_mgr.prefetch_first_layers()
 
+            capture_metadata_ctx = contextlib.nullcontext()
+            if capture_enabled:
+                capture_metadata_ctx = dumper.forward_metadata_context(
+                    build_forward_capture_metadata(
+                        forward_batch,
+                        forward_index=forward_index,
+                        tp_rank=self.ps.tp_rank,
+                        tp_size=self.ps.tp_size,
+                    )
+                )
+
             if forward_batch.forward_mode.is_split_prefill():
                 # Layer-split mode; stays on ModelRunner, not the eager runner.
-                ret = self.forward_split_prefill(
-                    forward_batch,
-                    reinit_attn_backend=reinit_attn_backend,
-                    forward_count=split_forward_count,
-                )
+                with capture_metadata_ctx:
+                    ret = self.forward_split_prefill(
+                        forward_batch,
+                        reinit_attn_backend=reinit_attn_backend,
+                        forward_count=split_forward_count,
+                    )
             elif (
                 forward_batch.forward_mode.is_extend(include_draft_extend_v2=True)
                 and not isinstance(self.prefill_cuda_graph_runner, EagerRunner)
@@ -1711,6 +1747,10 @@ class ModelRunner:
                     self.prefill_cuda_graph_runner, forward_batch
                 )
             ):
+                if capture_enabled:
+                    raise RuntimeError(
+                        "NEXTN capture does not cover prefill CUDA-graph replay"
+                    )
                 # Prefill cuda graph (piecewise).
                 kwargs = self._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
                 category = (
@@ -1728,9 +1768,10 @@ class ModelRunner:
                 can_run_graph = True
             else:
                 # Eager: decode / extend / idle dispatched inside the runner.
-                ret = self.eager_runner.execute(
-                    forward_batch, pp_proxy_tensors=pp_proxy_tensors
-                )
+                with capture_metadata_ctx:
+                    ret = self.eager_runner.execute(
+                        forward_batch, pp_proxy_tensors=pp_proxy_tensors
+                    )
 
             if (
                 forward_batch.global_num_tokens_cpu is not None

@@ -7,6 +7,7 @@ from typing import List, Optional
 import torch
 
 from sglang.kernels.ops.speculative.topk1 import draft_topk1_postprocess
+from sglang.srt.debug_utils.dumper import dumper
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
@@ -40,7 +41,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    CapturePhase,
+    CaptureRunnerRole,
+    ForwardBatch,
+    forward_capture_context,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -612,6 +619,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         with canary_outside_ctx:
             # Run draft
             if can_run_decode_cuda_graph:
+                if dumper.may_enable:
+                    raise RuntimeError(
+                        "NEXTN capture does not cover draft CUDA-graph replay"
+                    )
                 parent_list, top_scores_index, draft_tokens, draft_probs = (
                     self.cuda_graph_runner.execute(forward_batch)
                 )
@@ -735,6 +746,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         ForwardContext(
                             attn_backend=self.draft_attn_backend.attn_backends[i]
                         )
+                    ),
+                    forward_capture_context(
+                        phase=CapturePhase.DRAFT_DECODE,
+                        runner_role=CaptureRunnerRole.DRAFT,
+                        spec_step=i,
                     ),
                     canary_index_ctx,
                 ):
@@ -898,7 +914,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        with (
+            canary_ctx,
+            forward_capture_context(
+                phase=CapturePhase.DRAFT_PREFILL,
+                runner_role=CaptureRunnerRole.DRAFT,
+            ),
+        ):
             logits_output = self.draft_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
@@ -1012,8 +1034,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             if (c := self.draft_runner.canary_manager) is not None
             else contextlib.nullcontext()
         )
-        with canary_ctx:
+        capture_ctx = (
+            forward_capture_context(
+                phase=CapturePhase.DRAFT_EXTEND,
+                runner_role=CaptureRunnerRole.DRAFT,
+            )
+            if dumper.may_enable
+            else contextlib.nullcontext()
+        )
+        with canary_ctx, capture_ctx:
             if can_run_decode_cuda_graph:
+                if dumper.may_enable:
+                    raise RuntimeError(
+                        "NEXTN capture does not cover draft-extend CUDA-graph replay"
+                    )
                 draft_logits_output = self.cuda_graph_runner_for_draft_extend.execute(
                     forward_batch
                 )
@@ -1201,9 +1235,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 if self.speculative_algorithm.is_standalone()
                 else CaptureHiddenMode.FULL
             )
-            batch_output = self.target_worker.forward_batch_generation(
-                batch, capture_hidden_mode=target_capture_mode
-            )
+            with forward_capture_context(
+                phase=CapturePhase.PREFILL,
+                runner_role=CaptureRunnerRole.TARGET,
+            ):
+                batch_output = self.target_worker.forward_batch_generation(
+                    batch, capture_hidden_mode=target_capture_mode
+                )
 
             # Spec_v2 convention: batch.seq_lens = length BEFORE this iter's tokens.
             # Extend processed L prompt tokens; next verify iter expects same L.
