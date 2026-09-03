@@ -865,6 +865,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 ).pin_memory(),
                 persistent=False,
             )
+            logger.info(
+                "PLE pinned-host int8 row-scale mode enabled: %d rows/rank",
+                source_weight.shape[0],
+            )
         del embedding.weight
         self._block_d = triton.next_power_of_2(self.embedding_dim)
 
@@ -2213,13 +2217,14 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 isinstance(emb, Qwen4ExpPinnedHostEmbedding)
                 and emb.ple_row_scale_mode
             ):
-                missing = int(
-                    torch.isnan(emb.row_scale.data[: emb.org_vocab_size]).sum()
-                )
+                # only this rank's org-vocab rows are shipped; padding rows at
+                # the partition tail are never gathered (kernel in_range mask)
+                n_rows = emb.num_org_embeddings_per_partition
+                missing = int(torch.isnan(emb.row_scale.data[:n_rows]).sum())
                 if missing:
                     raise ValueError(
                         f"PLE row_scale shards missing for {mod_prefix}: "
-                        f"{missing} of {emb.org_vocab_size} rows unloaded"
+                        f"{missing} of {n_rows} rows unloaded"
                     )
 
         if skipped_visual_count > 0:
