@@ -9,7 +9,12 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups import parallel_hook, pd_disaggregation_hook, serving_hook
+from sglang.srt.arg_groups import (
+    parallel_hook,
+    pd_disaggregation_hook,
+    serving_hook,
+    validation_hook,
+)
 from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
@@ -122,7 +127,7 @@ class TestPrepareServerArgs(CustomTestCase):
                     ple_offload_embedding=True,
                     **generic_offload,
                 )
-                args._handle_offload_compatibility()
+                validation_hook.check_offload_compatibility(args)
 
     def test_weight_cache_daemon_allows_static_eplb(self):
         args = ServerArgs(
@@ -2966,7 +2971,7 @@ class TestStablePrefillCompatibility(CustomTestCase):
     def test_serial_eager_prefill_is_allowed(self):
         args = self._args()
         with patch.object(envs.SGLANG_STABLE_PREFILL, "get", return_value=True):
-            args._check_stable_prefill()
+            validation_hook.check_stable_prefill(args)
 
     def test_graph_and_multistream_prefill_are_rejected(self):
         for field, value in (
@@ -2983,7 +2988,7 @@ class TestStablePrefillCompatibility(CustomTestCase):
             with self.subTest(field=field), patch.object(
                 envs.SGLANG_STABLE_PREFILL, "get", return_value=True
             ), self.assertRaisesRegex(ValueError, "serial eager prefill"):
-                args._check_stable_prefill()
+                validation_hook.check_stable_prefill(args)
 
 
 if __name__ == "__main__":

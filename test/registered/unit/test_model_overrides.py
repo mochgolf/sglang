@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
+from sglang.srt.arg_groups import validation_hook
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
@@ -632,7 +633,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     )
             sa = self._construct(*qwen4, cpu_offload_gb=1)
             with self.assertRaisesRegex(ValueError, "cannot be combined"):
-                sa._handle_offload_compatibility()
+                validation_hook.check_offload_compatibility(sa)
         with override_platform(is_cuda=False):
             # Qwen4Exp is on the mamba extra-buffer allow-list, and the
             # extra-buffer validator requires an FLA-capable platform; pin

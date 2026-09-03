@@ -4154,42 +4154,10 @@ class ServerArgs:
     def enable_mamba_extra_buffer_lazy(self) -> bool:
         return mamba_extra_buffer_lazy_of(resolving_view(self))
 
-    def _check_stable_prefill(self):
-        if not envs.SGLANG_STABLE_PREFILL.get():
-            return
-        cfg = resolving_view(self)
-        incompatible = []
-        if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
-            incompatible.append("prefill CUDA graph")
-        if cfg.enable_two_batch_overlap:
-            incompatible.append("two-batch overlap")
-        if cfg.enable_single_batch_overlap:
-            incompatible.append("single-batch overlap")
-        if cfg.enable_pdmux:
-            incompatible.append("PD-multiplexing")
-        if incompatible:
-            raise ValueError(
-                "SGLANG_STABLE_PREFILL=1 requires serial eager prefill; disable "
-                + ", ".join(incompatible)
-            )
-
-    def _handle_offload_compatibility(self):
-        cfg = resolving_view(self)
-        if cfg.ple_offload_embedding and (
-            cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
-        ):
-            raise ValueError(
-                "--ple-offload-embedding cannot be combined with "
-                "--cpu-offload-gb or --offload-group-size: generic layer offload "
-                "would stage the pinned PLE embedding back to the device."
-            )
-
     def check_server_args(self):
         from sglang.srt.arg_groups.validation_hook import check_server_args
 
         check_server_args(self)
-        self._handle_offload_compatibility()
-        self._check_stable_prefill()
 
     def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
         """``load_format`` overrides the seed's: a draft runner loading under

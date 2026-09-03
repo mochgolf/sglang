@@ -17,6 +17,8 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
@@ -198,6 +200,8 @@ def check_server_args(server_args: Any):
 
     # Check two batch overlap backend requirement.
     check_two_batch_overlap(server_args)
+    check_offload_compatibility(server_args)
+    check_stable_prefill(server_args)
 
     # Check communications compression
     if cfg.enable_quant_communications and cfg.tp_size == 1:
@@ -441,4 +445,36 @@ def check_two_batch_overlap(server_args: Any):
             "When enabling two batch overlap without an EP a2a backend "
             "(moe_a2a_backend='none'), --enable-dp-attention is required "
             "(DeepSeek-V4 non-EP DP TBO path)."
+        )
+
+
+def check_offload_compatibility(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.ple_offload_embedding and (
+        cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
+    ):
+        raise ValueError(
+            "--ple-offload-embedding cannot be combined with "
+            "--cpu-offload-gb or --offload-group-size: generic layer offload "
+            "would stage the pinned PLE embedding back to the device."
+        )
+
+
+def check_stable_prefill(server_args: Any):
+    if not envs.SGLANG_STABLE_PREFILL.get():
+        return
+    cfg = resolving_view(server_args)
+    incompatible = []
+    if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
+        incompatible.append("prefill CUDA graph")
+    if cfg.enable_two_batch_overlap:
+        incompatible.append("two-batch overlap")
+    if cfg.enable_single_batch_overlap:
+        incompatible.append("single-batch overlap")
+    if cfg.enable_pdmux:
+        incompatible.append("PD-multiplexing")
+    if incompatible:
+        raise ValueError(
+            "SGLANG_STABLE_PREFILL=1 requires serial eager prefill; disable "
+            + ", ".join(incompatible)
         )
