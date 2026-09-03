@@ -502,6 +502,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 torch.float8_e4m3fn
                 if (quant_config is not None and quant_config.get_name() == "fp8")
                 or getattr(config, "ple_embedding_dtype", None) == "float8_e4m3fn"
+                else torch.int8
+                if getattr(config, "ple_embedding_dtype", None) == "int8"
                 else torch.bfloat16
             ),
             output_dtype=torch.bfloat16,
@@ -730,6 +732,7 @@ def _gather_ple_embedding_from_pinned_kernel(
     tp_vocab_start,
     tp_vocab_end,
     is_fp8: tl.constexpr,
+    is_int8: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row_id = tl.program_id(0)
@@ -740,6 +743,8 @@ def _gather_ple_embedding_from_pinned_kernel(
     mask = offsets < embedding_dim
     if is_fp8:
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.float8e4nv))
+    elif is_int8:
+        weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.int8))
     else:
         weight_ptr = weight_ptr.to(tl.int64).to(tl.pointer_type(tl.bfloat16))
     values = tl.load(
@@ -786,10 +791,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             raise NotImplementedError(
                 "PLE embedding offload requires an unquantized embedding table"
             )
-        if embedding.weight.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        if embedding.weight.dtype not in (
+            torch.bfloat16,
+            torch.float8_e4m3fn,
+            torch.int8,
+        ):
             raise TypeError(
-                "PLE embedding offload requires bfloat16 or fp8 weights, got "
-                f"{embedding.weight.dtype}"
+                "PLE embedding offload requires bfloat16, fp8, or int8 weights, "
+                f"got {embedding.weight.dtype}"
             )
         if embedding.num_added_embeddings:
             raise NotImplementedError(
@@ -861,6 +870,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                 tp_vocab_start=self.shard_indices.org_vocab_start_index,
                 tp_vocab_end=self.shard_indices.org_vocab_end_index,
                 is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                is_int8=self.weight.dtype == torch.int8,
                 BLOCK_D=self._block_d,
             )
         return output
@@ -1928,6 +1938,17 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         "downcasting is lossy",
                         loaded_weight.dtype,
                     )
+            if loaded_weight.dtype == torch.int8 and emb.weight.dtype != torch.int8:
+                raise ValueError(
+                    "int8 PLE checkpoint shards require "
+                    'text_config.ple_embedding_dtype="int8" (the offload path '
+                    "cannot auto-switch table storage)"
+                )
+            if emb.weight.dtype == torch.int8 and loaded_weight.dtype != torch.int8:
+                raise ValueError(
+                    "PLE embedding storage is int8 but checkpoint shards are "
+                    f"{loaded_weight.dtype}; rebuild the table as int8"
+                )
             shard_size = (
                 emb.org_vocab_size + ple_num_sync_shards - 1
             ) // ple_num_sync_shards
