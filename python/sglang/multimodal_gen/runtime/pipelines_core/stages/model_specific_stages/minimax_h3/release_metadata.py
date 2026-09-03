@@ -63,7 +63,7 @@ class MiniMaxH3ReleaseMetadata:
         partition = raw.get("partition")
         if partition not in {"fl2va", "ref2va"}:
             raise ValueError(
-                "model_index.json._minimax_h3.partition must be one of " "fl2va, ref2va"
+                "model_index.json._minimax_h3.partition must be one of fl2va, ref2va"
             )
         tasks = _string_list(raw.get("tasks"), "model_index.json._minimax_h3.tasks")
         aliases = raw.get("task_aliases", {})
@@ -147,6 +147,11 @@ class MiniMaxH3PartitionAdmissionStage(PipelineStage):
         if not isinstance(task, str) or not task.strip():
             raise ValueError("MiniMax H3 request task must be a non-empty string")
         self.metadata.canonical_task(task)
+        if batch.num_inference_steps < 2:
+            raise ValueError(
+                "MiniMax H3 requires num_inference_steps >= 2 because its "
+                "video/audio sigma schedules include both interval endpoints"
+            )
         quality = getattr(batch.sampling_params, "quality", "lossless")
         if quality not in QUALITY_LEVELS:
             raise ValueError(
