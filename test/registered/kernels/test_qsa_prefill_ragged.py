@@ -313,9 +313,9 @@ def test_tilelang_prefill_raw_kernel_no_stray_writes_nonzero_starts(keys: int):
     logits = _run_raw_prefill_kernel(q, k, starts, ends)
     torch.cuda.synchronize()
     stray = _stray_write_count(logits, starts, ends)
-    assert (
-        stray == 0
-    ), f"Raw prefill kernel (keys={keys}) wrote {stray} stray pre-mask values"
+    assert stray == 0, (
+        f"Raw prefill kernel (keys={keys}) wrote {stray} stray pre-mask values"
+    )
 
 
 def test_tilelang_prefill_mask_kernel_is_idempotent_on_clean_logits():
