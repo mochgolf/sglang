@@ -148,6 +148,14 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
                 "fused_conv_window_scatter_with_mask"
             )
         )
+        circular_patch = (
+            contextlib.nullcontext()
+            if fold
+            else patch(
+                "sglang.kernels.ops.attention.fla."
+                "gdn_replayssm_spec_decode.commit_gdn_replayssm_circular"
+            )
+        )
 
         with (
             patch(
@@ -159,6 +167,7 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
                 return_value=256,
             ),
             commit_patch,
+            circular_patch,
             conv_patch,
         ):
             commit_mamba_states_after_verify(
