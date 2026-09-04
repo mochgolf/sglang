@@ -333,19 +333,7 @@ def _repack_moe_fp4_weight_for_marlin(
     perm: torch.Tensor,
 ) -> torch.Tensor:
     assert weight.shape == (num_experts, size_n, size_k // 2)
-
-    tensor_list = []
-    for i in range(num_experts):
-        qweight = weight[i].view(torch.int32).T.contiguous()
-        marlin_qweight = gptq_marlin_repack(
-            b_q_weight=qweight,
-            perm=perm,
-            size_k=size_k,
-            size_n=size_n,
-            num_bits=4,
-        )
-        tensor_list.append(marlin_qweight)
-    return torch.stack(tensor_list)
+    return _repack_moe_weights_for_marlin(weight, perm, size_k, size_n)
 
 
 def _permute_moe_fp4_scales_for_marlin(
@@ -566,13 +554,13 @@ def prepare_moe_nvfp4_layer_for_marlin(layer: torch.nn.Module) -> None:
         ),
         requires_grad=False,
     )
+    del w13
     layer.w2_weight = torch.nn.Parameter(
         _repack_moe_fp4_weight_for_marlin(
             w2, num_experts=num_experts, size_n=w2_size_n, size_k=w2_size_k, perm=perm
         ),
         requires_grad=False,
     )
-    del w13
     del w2
     layer.w13_weight_scale = torch.nn.Parameter(
         _permute_moe_fp4_scales_for_marlin(

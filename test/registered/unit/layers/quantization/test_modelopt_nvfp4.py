@@ -9,7 +9,7 @@ from sglang.srt.layers.linear import MergedColumnParallelLinear, QKVParallelLine
 from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.parameter import PerTensorScaleParameter
 from sglang.srt.layers.quantization.marlin_utils_fp4 import (
-    _repack_moe_weights_for_marlin,
+    _repack_moe_fp4_weight_for_marlin,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -154,7 +154,9 @@ class TestModelOptNvfp4(CustomTestCase):
             [transform(weight[i].view(torch.int32).T.contiguous()) for i in range(4)]
         )
 
-        actual = _repack_moe_weights_for_marlin(weight, perm, size_k=16, size_n=8)
+        actual = _repack_moe_fp4_weight_for_marlin(
+            weight, num_experts=4, size_k=16, size_n=8, perm=perm
+        )
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         self.assertEqual(
