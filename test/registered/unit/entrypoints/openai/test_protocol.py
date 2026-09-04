@@ -192,6 +192,26 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(params["min_new_tokens"], 5)
         self.assertEqual(params["stop"], ["</s>"])
 
+    def test_penalty_sampling_param_precedence(self):
+        messages = [{"role": "user", "content": "Hi"}]
+        preferred = {"frequency_penalty": 0.3, "presence_penalty": 0.2}
+
+        omitted = ChatCompletionRequest(model="x", messages=messages)
+        params = omitted.to_sampling_params([], preferred)
+        self.assertEqual(params["frequency_penalty"], 0.3)
+        self.assertEqual(params["presence_penalty"], 0.2)
+
+        explicit_zero = ChatCompletionRequest(
+            model="x", messages=messages, frequency_penalty=0, presence_penalty=0
+        )
+        params = explicit_zero.to_sampling_params([], preferred)
+        self.assertEqual(params["frequency_penalty"], 0)
+        self.assertEqual(params["presence_penalty"], 0)
+
+        params = omitted.to_sampling_params([], {})
+        self.assertEqual(params["frequency_penalty"], 0)
+        self.assertEqual(params["presence_penalty"], 0)
+
     def test_chat_completion_tool_choice_validation(self):
         """Test tool choice validation logic"""
         messages = [{"role": "user", "content": "Hello"}]

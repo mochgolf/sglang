@@ -957,6 +957,8 @@ class ChatCompletionRequest(BaseModel):
         "top_p": 1.0,
         "top_k": -1,
         "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
         "repetition_penalty": 1.0,
     }
 
@@ -1088,7 +1090,7 @@ class ChatCompletionRequest(BaseModel):
 
         def get_param(param_name: str):
             value = getattr(self, param_name)
-            if value is None:
+            if value is None or param_name not in self.model_fields_set:
                 return model_generation_config.get(
                     param_name, self._DEFAULT_SAMPLING_PARAMS[param_name]
                 )
@@ -1111,8 +1113,8 @@ class ChatCompletionRequest(BaseModel):
             "top_p": get_param("top_p"),
             "top_k": get_param("top_k"),
             "min_p": get_param("min_p"),
-            "presence_penalty": self.presence_penalty,
-            "frequency_penalty": self.frequency_penalty,
+            "presence_penalty": get_param("presence_penalty"),
+            "frequency_penalty": get_param("frequency_penalty"),
             "repetition_penalty": get_param("repetition_penalty"),
             "regex": self.regex,
             "ebnf": self.ebnf,
