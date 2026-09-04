@@ -1,5 +1,7 @@
 import unittest
 from array import array
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
@@ -211,6 +213,80 @@ class TestMamba(unittest.TestCase):
 
         view[0, 0, 0, 1, 0] = -1
         self.assertEqual(view[0, 0, 1, 0, 0].item(), -1)
+
+    def test_finished_zero_length_request_is_not_inserted(self):
+        cache = object.__new__(MambaRadixCache)
+        cache.disable = False
+        cache.enable_mamba_extra_buffer = True
+        cache.page_size = 1
+        cache.token_to_kv_pool_allocator = SimpleNamespace(free_segment=Mock())
+        cache.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[10, 11]]),
+            mamba_ckpt_pool=None,
+            get_mamba_ping_pong_keep_idx=Mock(return_value=0),
+            free_mamba_cache=Mock(),
+        )
+        cache.insert = Mock(return_value=SimpleNamespace(mamba_exist=True))
+        cache.dec_lock_ref = Mock()
+        last_node = object()
+        req = SimpleNamespace(
+            origin_input_ids=array("q", [1, 2]),
+            output_ids=array("q"),
+            kv=SimpleNamespace(
+                req_pool_idx=0,
+                cache_protected_len=1,
+                mamba_last_track_seqlen=0,
+                mamba_ping_pong_track_buffer=torch.tensor([2, 3]),
+            ),
+            extra_key=None,
+            cache_salt=None,
+            last_node=last_node,
+        )
+
+        cache.cache_finished_req(req, kv_len_to_handle=2)
+
+        cache.insert.assert_not_called()
+        (freed,) = cache.token_to_kv_pool_allocator.free_segment.call_args.args
+        torch.testing.assert_close(freed, torch.tensor([11]))
+        self.assertEqual(
+            cache.token_to_kv_pool_allocator.free_segment.call_args.kwargs,
+            {"start_pos": 1},
+        )
+        cache.req_to_token_pool.free_mamba_cache.assert_called_once_with(req)
+        cache.dec_lock_ref.assert_called_once_with(last_node)
+
+    def test_donate_ping_pong_slot_resets_only_transferred_replayssm_cursors(self):
+        pool = object.__new__(HybridReqToTokenPool)
+        pool.mamba_pool = SimpleNamespace(
+            replayssm_write_pos=torch.tensor([13, 11, 7, 5, 9], dtype=torch.int32)
+        )
+        pool.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.full(
+            (1, 2), -1, dtype=torch.int64
+        )
+        req = SimpleNamespace(
+            rid="req",
+            kv=SimpleNamespace(
+                req_pool_idx=0,
+                mamba_last_track_idx=0,
+                mamba_next_track_idx=1,
+                mamba_ping_pong_track_buffer=torch.tensor([1, 2]),
+            ),
+        )
+
+        donated = pool.donate_mamba_ping_pong_slot(req, torch.tensor([3]))
+
+        torch.testing.assert_close(donated, torch.tensor([1]))
+        torch.testing.assert_close(
+            pool.mamba_pool.replayssm_write_pos,
+            torch.tensor([13, 0, 7, 0, 9], dtype=torch.int32),
+        )
+        torch.testing.assert_close(
+            req.kv.mamba_ping_pong_track_buffer, torch.tensor([3, 2])
+        )
+        torch.testing.assert_close(
+            pool.req_index_to_mamba_ping_pong_track_buffer_mapping[0],
+            torch.tensor([3, 2]),
+        )
 
     def test_mamba_radix_cache_1(self):
         tree, allocator, req_to_token_pool, make_dummy_req = (
