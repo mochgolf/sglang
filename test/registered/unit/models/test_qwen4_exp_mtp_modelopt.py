@@ -79,6 +79,13 @@ def _mixed_config(exclude_modules, *, with_mtp_experts):
 
 
 class TestQwen4ExpMtpModelOpt(CustomTestCase):
+    def test_ple_token_count_uses_global_host_count(self):
+        batch = SimpleNamespace(
+            global_num_token_non_padded_cpu=3,
+            extend_seq_lens_cpu=None,
+        )
+        self.assertEqual(qwen4_exp._get_processed_token_count(batch, 4), 3)
+
     def test_stable_hc_mix_falls_back_when_fused_path_is_unsupported(self):
         layer = GatedResidual.__new__(GatedResidual)
         torch.nn.Module.__init__(layer)
