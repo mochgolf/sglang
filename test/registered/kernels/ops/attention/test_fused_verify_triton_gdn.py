@@ -16,6 +16,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 try:
     from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
+        fused_recurrent_gated_delta_rule_packed_decode,
         fused_recurrent_gated_delta_rule_update,
     )
     from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
@@ -134,6 +135,36 @@ def run_fused_mtp(
         cache_steps=cache_steps,
         retrieve_parent_token=retrieve_parent_token,
     )
+
+
+@pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
+def test_packed_decode_keeps_beta_in_fp32():
+    device = "cuda"
+    dtype = torch.bfloat16
+
+    mixed_qkv = torch.ones((1, 3), device=device, dtype=dtype)
+    a = torch.zeros((1, 1), device=device, dtype=dtype)
+    b = torch.full((1, 1), 0.5, device=device, dtype=dtype)
+    params = torch.zeros((1,), device=device, dtype=dtype)
+    indices = torch.zeros((1,), device=device, dtype=torch.int32)
+
+    state = torch.zeros((1, 1, 1, 1), device=device, dtype=torch.float32)
+    out = torch.empty((1, 1, 1, 1), device=device, dtype=dtype)
+
+    fused_recurrent_gated_delta_rule_packed_decode(
+        mixed_qkv=mixed_qkv,
+        a=a,
+        b=b,
+        A_log=params,
+        dt_bias=params,
+        scale=1.0,
+        initial_state=state,
+        out=out,
+        ssm_state_indices=indices,
+    )
+
+    expected_beta = torch.sigmoid(b.float()).squeeze()
+    torch.testing.assert_close(state[0, 0, 0, 0], expected_beta, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.skipif(not KERNELS_AVAILABLE, reason="Kernel not available")
