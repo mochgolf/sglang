@@ -354,7 +354,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             # those tail rows to request row 0, mirroring the CUDA-graph
             # speculative layout padding, so gathers stay in bounds.
             repeats = extend_seq_lens[:batch_size].to(dtype=torch.long)
-            real_rows = getattr(forward_batch, "num_token_non_padded_cpu", None)
+            real_rows = getattr(forward_batch, "global_num_token_non_padded_cpu", None)
             if real_rows is None:
                 extend_seq_lens_cpu = getattr(
                     forward_batch, "extend_seq_lens_cpu", None

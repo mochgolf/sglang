@@ -38,8 +38,6 @@ from functools import total_ordering
 from itertools import count
 from typing import (
     TYPE_CHECKING,
-    Any,
-    Callable,
     Dict,
     List,
     Optional,
@@ -278,7 +276,7 @@ def validate_forward_capture_metadata(metadata: dict) -> None:
 
 
 def build_forward_capture_metadata(
-    forward_batch: "ForwardBatch",
+    forward_batch: ForwardBatch,
     *,
     forward_index: int,
     tp_rank: int,
@@ -290,7 +288,9 @@ def build_forward_capture_metadata(
     # Do not touch device tensors here. Positions and sequence lengths are
     # already emitted as dumper core records; consumers join those records by
     # ``forward_index_key`` after capture.
-    num_token_non_padded = getattr(forward_batch, "num_token_non_padded_cpu", None)
+    num_token_non_padded = getattr(
+        forward_batch, "global_num_token_non_padded_cpu", None
+    )
     metadata = {
         **context,
         "forward_iter": getattr(forward_batch, "forward_iter", None),
@@ -2221,7 +2221,7 @@ def run_forward_capture_selfcheck() -> None:
         rids=["r0", "r1", "r2"],
         positions=torch.tensor([3, 4, 0], dtype=torch.int64),
         seq_lens=torch.tensor([4, 5, 1], dtype=torch.int64),
-        num_token_non_padded_cpu=2,
+        global_num_token_non_padded_cpu=2,
         num_padding=1,
     )
     first_index = next_process_forward_index()
@@ -2259,6 +2259,7 @@ def run_forward_capture_selfcheck() -> None:
     assert metadata["metadata_value_mode"] == "core_artifact_join"
     assert metadata["positions"]["source"] == "dumper_core"
     assert metadata["seq_lens"]["record_name"] == "seq_lens"
+    assert metadata["num_token_non_padded"] == 2
     assert json.loads(json.dumps(metadata))["forward_index_key"] == [1, first_index]
 
     # Minimal root/nested dumper integration: every record from the same

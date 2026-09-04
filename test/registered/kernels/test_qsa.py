@@ -1273,6 +1273,21 @@ def test_qsa_speculative_row_bound_uses_tokens_per_request():
     )
 
 
+def test_qsa_speculative_row_mapping_prefers_global_host_count():
+    forward_batch = SimpleNamespace(
+        req_pool_indices=torch.tensor([3, 7], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([2, 1], dtype=torch.int32),
+        global_num_token_non_padded_cpu=3,
+        extend_seq_lens_cpu=[99],
+    )
+
+    mapping = QwenSparseAttnBackend._speculative_row_to_request(
+        forward_batch, num_rows=4
+    )
+
+    assert mapping.tolist() == [0, 0, 1, 0]
+
+
 def test_qsa_decode_requires_one_query_row_per_request():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     backend = QwenSparseAttnBackend(runner)
