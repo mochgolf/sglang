@@ -853,7 +853,14 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.register_parameter("weight", cpu_weight)
         # The scale is tiny; keep it with the model instead of offloading it
         # with the table.
-        self.register_buffer("weight_scale", embedding.weight_scale, persistent=True)
+        weight_scale = getattr(embedding, "weight_scale", None)
+        if weight_scale is None:
+            if source_weight.dtype != torch.bfloat16:
+                raise ValueError("quantized PLE embeddings require weight_scale")
+            weight_scale = torch.ones(
+                1, dtype=torch.bfloat16, device=source_weight.device
+            )
+        self.register_buffer("weight_scale", weight_scale, persistent=True)
         self.ple_row_scale_mode = bool(
             getattr(embedding, "ple_row_scale_mode", False)
         )
