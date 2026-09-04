@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -104,6 +105,75 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         mamba_pool.replayssm_spec_fold = False
         mamba_pool.replayssm_cache_base = None
         return target_worker
+
+    def _make_replayssm_target_worker(self, *, fold):
+        target_worker = self._make_mock_target_worker()
+        req_pool = target_worker.model_runner.req_to_token_pool
+        req_pool.mamba_pool.replayssm_spec_fold = fold
+        req_pool.mamba_pool.replayssm_cache_base = None if fold else torch.empty(1)
+        req_pool.mamba_pool.replayssm_is_kda = False
+        req_pool.get_mamba_indices.return_value = torch.tensor([7], dtype=torch.int32)
+        req_pool.translate_mamba_indices.side_effect = lambda indices: indices + 100
+        target_worker.model_runner.attn_backend._update_ple_state_after_mtp_verify = (
+            MagicMock()
+        )
+        return target_worker
+
+    def _run_replayssm_commit(self, *, fold):
+        from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
+
+        target_worker = self._make_replayssm_target_worker(fold=fold)
+        batch = MagicMock()
+        batch.forward_mode.is_idle.return_value = False
+        batch.req_pool_indices = torch.tensor([1], dtype=torch.int32)
+        batch.mamba_track_indices = (
+            torch.tensor([9], dtype=torch.int32) if fold else None
+        )
+        batch.seq_lens = torch.tensor([253], dtype=torch.int32)
+        accept_lens = torch.tensor([4], dtype=torch.int32)
+        accept_index = torch.tensor([[0, 1, 2, 3, -1]], dtype=torch.int32)
+        commit_patch = patch(
+            "sglang.kernels.ops.attention.fla."
+            + (
+                "gdn_replayssm_spec_fold.commit_gdn_replayssm_fold_after_verify"
+                if fold
+                else "gdn_replayssm_spec_decode.commit_gdn_replayssm_spec"
+            )
+        )
+        conv_patch = (
+            contextlib.nullcontext()
+            if fold
+            else patch(
+                "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
+                "fused_conv_window_scatter_with_mask"
+            )
+        )
+
+        with (
+            patch(
+                "sglang.srt.speculative.spec_utils.mambaish_config",
+                return_value={"some": "config"},
+            ),
+            patch(
+                "sglang.srt.speculative.spec_utils.mamba_track_grid",
+                return_value=256,
+            ),
+            commit_patch,
+            conv_patch,
+        ):
+            commit_mamba_states_after_verify(
+                target_worker,
+                batch,
+                accept_lens,
+                accept_index,
+                draft_token_num=5,
+            )
+
+        ple_update = (
+            target_worker.model_runner.attn_backend._update_ple_state_after_mtp_verify
+        )
+        ple_update.assert_called_once()
+        return ple_update.call_args.args
 
     def test_mamba_verify_update_called_with_correct_indices(self):
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
@@ -226,9 +296,55 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         self.assertTrue(
             torch.equal(
                 call_kwargs["mamba_steps_to_track"],
-                torch.tensor([2, -1], dtype=torch.int32),
+                torch.tensor([3, -1], dtype=torch.int32),
             )
         )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_track_step_uses_boundary_and_clamps_to_last_accept(self):
+        from sglang.srt.speculative.spec_utils import _verify_commit_step_indices
+
+        batch = MagicMock()
+        batch.mamba_track_indices = torch.tensor([9, 10], device="cuda")
+        batch.seq_lens = torch.tensor([253, 253], dtype=torch.int32, device="cuda")
+        accept_lens = torch.tensor([4, 3], dtype=torch.int32, device="cuda")
+        accept_index = torch.tensor(
+            [[0, 1, 2, 3, -1], [5, 6, 7, -1, -1]],
+            dtype=torch.int32,
+            device="cuda",
+        )
+
+        with patch(
+            "sglang.srt.speculative.spec_utils.mamba_track_grid", return_value=256
+        ):
+            _, track_steps = _verify_commit_step_indices(
+                batch=batch,
+                accept_index=accept_index,
+                accept_lens=accept_lens,
+                draft_token_num=5,
+            )
+
+        self.assertTrue(
+            torch.equal(
+                track_steps.cpu(),
+                torch.tensor([3, 2], dtype=torch.int64),
+            )
+        )
+
+    def test_gdn_replayssm_commits_ple_state(self):
+        for fold in (True, False):
+            with self.subTest(fold=fold):
+                state, last_step, track, track_step = self._run_replayssm_commit(
+                    fold=fold
+                )
+                self.assertEqual(state.tolist(), [107])
+                self.assertEqual(last_step.tolist(), [3])
+                if fold:
+                    self.assertEqual(track.tolist(), [109])
+                    self.assertEqual(track_step.tolist(), [3])
+                else:
+                    self.assertIsNone(track)
+                    self.assertIsNone(track_step)
 
 
 class TestConvWindowDedupLayout(CustomTestCase):

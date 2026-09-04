@@ -753,8 +753,8 @@ def _fused_commit_track_indices_kernel(
         post = pre + al
         cross = (pre // interval) != (post // interval)
         tp = (post // interval) * interval
-        ti = tp - pre - 1
-        ti = tl.where(ti < 0, 0, ti)
+        ti = tl.minimum(tp - pre, al - 1)
+        ti = tl.maximum(ti, 0)
         cand = tl.load(accept_index_ptr + base + ti).to(tl.int64) - base
         tl.store(track_steps_out_ptr + b, tl.where(cross, cand, -1))
 

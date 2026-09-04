@@ -812,7 +812,7 @@ def _verify_commit_step_indices(
         )
 
         track_interval = (
-            get_exec().mamba.mamba_track_interval
+            mamba_track_grid(batch.tree_cache.page_size)
             if batch.mamba_track_indices is not None
             else 0
         )
@@ -844,9 +844,10 @@ def _verify_commit_step_indices(
         != seq_lens_post_verify // mamba_track_interval
     )
     tracking_point = seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-    to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0).to(
-        torch.int64
-    )
+    to_track_ith = torch.clamp(
+        torch.minimum(tracking_point - seq_lens_pre_verify, accept_lens - 1),
+        min=0,
+    ).to(torch.int64)
     candidate_track_steps = accept_index[req_idx, to_track_ith] - accept_indices_offset
     mamba_steps_to_track = torch.where(
         to_track_mask,
@@ -920,6 +921,17 @@ def commit_mamba_states_after_verify(
             mamba_steps_to_track=mamba_steps_to_track,
             null_block_id=-1,
         )
+        attn_backend = model_runner.attn_backend
+        if hasattr(attn_backend, "_update_ple_state_after_mtp_verify"):
+            ple_track_indices = batch.mamba_track_indices
+            if ple_track_indices is not None:
+                ple_track_indices = req_pool.translate_mamba_indices(ple_track_indices)
+            attn_backend._update_ple_state_after_mtp_verify(
+                req_pool.translate_mamba_indices(state_batch_indices),
+                last_correct_step_indices,
+                ple_track_indices,
+                mamba_steps_to_track,
+            )
         return
 
     if (
@@ -970,6 +982,14 @@ def commit_mamba_states_after_verify(
         # snapshot; not wired for Part B (server_args forbids extra_buffer with
         # --enable-linear-replayssm-spec), so the per-track scatters are intentionally
         # skipped here.
+        attn_backend = model_runner.attn_backend
+        if hasattr(attn_backend, "_update_ple_state_after_mtp_verify"):
+            attn_backend._update_ple_state_after_mtp_verify(
+                req_pool.translate_mamba_indices(state_batch_indices),
+                last_correct_step_indices,
+                None,
+                None,
+            )
         return
 
     # KDA ReplaySSM (fold-every-commit): KDA keeps its own recurrent verify kernel
