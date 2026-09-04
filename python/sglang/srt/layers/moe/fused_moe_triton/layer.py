@@ -1003,6 +1003,15 @@ class FusedMoE(torch.nn.Module):
                 param.data[:, :dim1, :dim2].copy_(loaded_weight)
             return
 
+        # [n9] Lossless g64 re-read (see AutoRoundConfig.get_quant_method):
+        # the layer buffers were sized for group_size=64, so pairwise
+        # duplicate each parent group row of the checkpoint's (K//128, N)
+        # scale/qzero tensors before the regular TP slicing runs.
+        if getattr(self, "_marlin_g64_expand_scales", False) and (
+            weight_name.endswith("_scales") or weight_name.endswith("_qzeros")
+        ):
+            loaded_weight = loaded_weight.repeat_interleave(2, dim=0)
+
         global_expert_location_metadata = get_global_expert_location_metadata()
         if global_expert_location_metadata is None:
             if not getattr(param, "_sglang_require_global_experts", False):

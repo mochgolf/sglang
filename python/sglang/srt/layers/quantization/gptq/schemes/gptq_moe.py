@@ -197,7 +197,19 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
             if self.quant_config.desc_act:
                 w2_scales_size = intermediate_size_per_partition
             else:
-                w2_scales_size = intermediate_size_per_partition * layer.moe_tp_size
+                # [n9] The marlin kernel derives group_size from the scale
+                # table shape (num_groups = size_k_local // rows), so the
+                # w2 table must be RANK-LOCAL like the qweight shard.  The
+                # previous full-K size (intermediate_per_partition *
+                # moe_tp_size) made every rank read rows for rank 0's K
+                # range and yielded an inconsistent group_size under TP>1.
+                # moe_tp_size == 1 (EP / single-rank) geometries are
+                # numerically unaffected (the factor was 1); TP>1 + marlin
+                # had no runnable checkpoint geometry before the g64
+                # re-read, so no existing configuration changes behavior.
+                # Offline proof: scripts/test_g64_matrix.py (full10 FAIL /
+                # local5 PASS, real expert, both ranks).
+                w2_scales_size = intermediate_size_per_partition
             scales_size2 = w2_scales_size // self.quant_config.group_size
             strategy = FusedMoeWeightScaleSupported.GROUP.value
         else:
@@ -236,7 +248,7 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
                 num_experts,
                 scales_size13,
                 2 * intermediate_size_per_partition,
-                dtype=torch.half,
+                dtype=params_dtype,
             ),
             requires_grad=False,
         )
@@ -244,7 +256,7 @@ class GPTQMarlinMoEScheme(GPTQMoESchemeBase):
         set_weight_attrs(w13_scales, extra_weight_attrs)
 
         w2_scales = torch.nn.Parameter(
-            torch.empty(num_experts, scales_size2, hidden_size, dtype=torch.half),
+            torch.empty(num_experts, scales_size2, hidden_size, dtype=params_dtype),
             requires_grad=False,
         )
         layer.register_parameter("w2_scales", w2_scales)

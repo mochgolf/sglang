@@ -861,7 +861,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
             self.register_buffer(
                 "row_scale",
                 torch.full(
-                    (source_weight.shape[0],), float("nan"), dtype=torch.bfloat16
+                    (source_weight.shape[0],),
+                    float("nan"),
+                    dtype=torch.bfloat16,
+                    device="cpu",
                 ).pin_memory(),
                 persistent=False,
             )

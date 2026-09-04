@@ -521,6 +521,19 @@ class AutoRoundConfig(QuantizationConfig):
                 use_marlin = use_marlin and check_moe_marlin_supports_layer(
                     layer, group_size
                 )
+                # [n9] Lossless group_size re-read. Under row-parallel TP a
+                # gptq group_size=128 becomes unrepresentable when the shard
+                # seam splits a quant group (intermediate 640 / 2 = 320).
+                # Re-reading the same checkpoint tensors as group_size=64 only
+                # duplicates each parent scale/zero row pairwise, so dequant is
+                # bit-identical while the seam lands on a group boundary.
+                # If the native gate fails and a g64 reading passes, take
+                # marlin and expand scale/qzero rows at load time.
+                if not use_marlin and group_size == 128:
+                    if check_moe_marlin_supports_layer(layer, 64):
+                        use_marlin = True
+                        group_size = 64
+                        layer._marlin_g64_expand_scales = True
         else:
             use_marlin = False
         if use_marlin:
