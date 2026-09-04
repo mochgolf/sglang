@@ -297,7 +297,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             return max(1, int(sequence_lengths.max()))
         spec_info = getattr(forward_batch, "spec_info", None)
         draft_window = (
-            int(getattr(spec_info, "draft_token_num", 0) or 0)
+            max(0, int(getattr(spec_info, "num_tokens_per_req", 0) or 0))
             if spec_info is not None
             else 0
         )

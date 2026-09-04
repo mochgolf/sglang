@@ -1252,6 +1252,19 @@ def test_qsa_gpu_only_metadata_uses_host_allocator_bound():
     ) == 12
 
 
+def test_qsa_speculative_row_bound_uses_tokens_per_request():
+    forward_batch = SimpleNamespace(
+        seq_lens_cpu=torch.tensor([11, 21], dtype=torch.int32),
+        kv_allocated_lens_cpu=None,
+        spec_info=SimpleNamespace(draft_token_num=1, num_tokens_per_req=4),
+    )
+
+    assert QwenSparseAttnBackend._speculative_max_row_length(
+        forward_batch,
+        torch.tensor([11, 21], dtype=torch.int32),
+    ) == 25
+
+
 def test_qsa_decode_requires_one_query_row_per_request():
     runner, pool, req_pool = _make_qsa_runner_and_pool()
     backend = QwenSparseAttnBackend(runner)
