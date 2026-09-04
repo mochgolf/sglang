@@ -10,6 +10,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.models import qwen4_exp as qwen4_exp_module
 from sglang.srt.models.qwen4_exp import (
+    Qwen4ExpNGramEmbedding,
     Qwen4ExpPinnedHostEmbedding,
     Qwen4ExpPLELayer,
 )
@@ -21,6 +22,33 @@ register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA is required for this test."
 )
+
+
+def test_qwen4_ple_offload_constructs_embedding_on_meta(monkeypatch):
+    devices = []
+
+    class FakeEmbedding(nn.Module):
+        def __init__(self, *_args, params_dtype, **_kwargs):
+            super().__init__()
+            devices.append(torch.empty(0).device.type)
+            self.weight = nn.Parameter(torch.empty(1, dtype=params_dtype))
+
+    monkeypatch.setattr(qwen4_exp_module, "VocabParallelEmbedding", FakeEmbedding)
+    config = SimpleNamespace(
+        ngram_size=2,
+        heads_per_ngram=1,
+        vocab_size=32,
+        ngram_vocab_size_base=31,
+        make_ngram_vocab_size_divisible_by=8,
+        eos_token_id=2,
+        seed=1234,
+        ple_embedding_dtype=None,
+        ple_offload_embedding=True,
+    )
+    with torch.device("cuda"):
+        Qwen4ExpNGramEmbedding(config, embedding_dim=4)
+
+    assert devices == ["meta"]
 
 
 def _make_source_embedding(
