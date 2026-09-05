@@ -90,6 +90,7 @@ class FakePool:
     """Minimal stand-in for the QSA KV pool buffers used by the indexer."""
 
     def __init__(self, num_slots, num_compressed, device, dtype=torch.bfloat16):
+        self.index_state_dtype = dtype
         self.key_state = torch.zeros(num_slots, 1, HEAD_DIM, dtype=dtype, device=device)
         self.qsa_rope_position_buffer = torch.zeros(
             num_slots, 3, dtype=torch.int64, device=device
@@ -120,28 +121,9 @@ class FakePool:
         self.compressed[loc.long()] = compressed_k.to(self.compressed.dtype)
 
 
-def _make_metadata(pool, cache_loc, token_slot_table, write_locs):
-    return SimpleNamespace(
-        token_to_kv_pool=pool,
-        out_cache_loc=cache_loc,
-        is_cuda_graph=False,
-        token_to_batch_idx=torch.zeros(
-            cache_loc.numel(), dtype=torch.int32, device=cache_loc.device
-        ),
-        token_slot_table=token_slot_table,
-        write_locs=write_locs,
-        req_pool_indices=None,
-        req_to_token_pool=None,
-        pending_ring_slots=None,
-        extend_rope_matrix=None,
-        compress_group_ring_locs=None,
-    )
-
-
 def _force_eager(indexer):
-    """Make an indexer instance take the pre-fusion eager paths."""
+    """Make an indexer instance take the pre-fusion eager prep path."""
     indexer._use_fused_prep = lambda tensor: False
-    indexer._use_fused_compress = lambda pool: False
     return indexer
 
 
@@ -188,29 +170,16 @@ def _run_case(
     cache_loc = (
         torch.randperm(max(num_tokens + 8, 4096), device=device)[:num_tokens].long() + 1
     )
-    token_slot_table = torch.zeros(1, 65536, dtype=torch.int32, device=device)
-    token_slot_table[0, logical_positions.long()] = cache_loc.to(torch.int32)
-
-    boundaries = ((logical_positions + 1) % RATIO) == 0
-    num_boundaries = int(boundaries.sum())
-    write_locs = (
-        torch.randperm(2048, device=device)[:num_boundaries].to(torch.int32) + 1
-    )
-
     pool_ref = FakePool(8192, 4096, device, dtype)
     pool_new = FakePool(8192, 4096, device, dtype)
 
-    # Reference: pre-fusion eager path (toggle the real switches off).
+    # Reference: pre-fusion eager prep (toggle the real switch off).
     q_ref, token_k_ref, stored_ref = _force_eager(indexer).project_qk(hidden, positions)
     assert not stored_ref
-    indexer.update_key_state_and_compress(
-        token_k_ref,
-        logical_positions,
-        positions,
-        _make_metadata(pool_ref, cache_loc, token_slot_table, write_locs),
-    )
-    # Restore the fused switches (instance attributes shadow the methods).
-    del indexer._use_fused_prep, indexer._use_fused_compress
+    pool_ref.set_qsa_key_state_buffer(0, cache_loc, token_k_ref)
+    pool_ref.set_qsa_rope_position_buffer(cache_loc, positions)
+    # Restore the fused switch (the instance attribute shadows the method).
+    del indexer._use_fused_prep
 
     # Fused path.
     q_new, token_k_new, stored_new = indexer.project_qk(
@@ -221,25 +190,18 @@ def _run_case(
         q_heads_padded=pad_q_heads,
     )
     assert stored_new
-    indexer.update_key_state_and_compress(
-        token_k_new,
-        logical_positions,
-        positions,
-        _make_metadata(pool_new, cache_loc, token_slot_table, write_locs),
-        state_stored=True,
-    )
 
     expected_heads = pad_q_heads or NUM_Q_HEADS
     assert q_new.shape == (num_tokens, expected_heads, HEAD_DIM)
     assert_bit_comparable(q_new[:, :NUM_Q_HEADS], q_ref)
     if expected_heads > NUM_Q_HEADS:
         assert torch.all(q_new[:, NUM_Q_HEADS:] == 0).item()
-    # Raw state stores are plain copies and must match exactly.
+    # Raw projection and state stores are plain copies and must match exactly.
+    torch.testing.assert_close(token_k_new, token_k_ref, rtol=0, atol=0)
     torch.testing.assert_close(pool_new.key_state, pool_ref.key_state, rtol=0, atol=0)
     assert torch.equal(
         pool_new.qsa_rope_position_buffer, pool_ref.qsa_rope_position_buffer
     )
-    assert_bit_comparable(pool_new.compressed, pool_ref.compressed)
 
 
 @pytest.mark.parametrize("pad_q_heads", [None, 8])
@@ -279,7 +241,9 @@ def _eager_compress_reference(indexer, pool, group_locs, write_locs):
     """The pre-fusion compression chain, via the indexer's own helpers."""
     key_groups = pool.get_qsa_key_state_buffer(0)[group_locs.long()]
     pooled = average_pool_qsa_keys(key_groups)
-    rope_positions = indexer._get_group_rope_positions(pool, group_locs[:, 0])
+    rope_positions = indexer._rope_from_matrix(
+        pool.qsa_rope_position_buffer[group_locs[:, 0]]
+    )
     normalized = indexer.normalize_compressed_keys(pooled, rope_positions)
     pool.set_qsa_compressed_k_buffer(0, write_locs, normalized)
 

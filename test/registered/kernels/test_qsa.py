@@ -387,6 +387,7 @@ def test_qsa_glue_fetches_indexer_metadata_without_model_unwrap():
         get_indexer_metadata=lambda layer_id, forward_batch: f"meta-{layer_id}",
         token_to_kv_pool=None,
         req_to_token_pool=None,
+        kv_index_translator=None,
         needs_cpu_seq_lens=True,
     )
     hybrid = HybridLinearAttnBackend(
@@ -417,6 +418,7 @@ def test_qsa_cuda_graph_padding_reaches_hybrid_children():
             self.num_padding = None
             self.token_to_kv_pool = None
             self.req_to_token_pool = None
+            self.kv_index_translator = None
             self.needs_cpu_seq_lens = True
 
         def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
