@@ -62,6 +62,11 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5LinearDecoderLayer,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.qwen4_exp_refusal import (
+    capture_hc_state as _capture_refusal_hc_state,
+    capture_writer_output as _capture_refusal_writer_output,
+    refusal_control as _refusal_control,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
 
@@ -1376,6 +1381,11 @@ class Qwen4ExpLayerExtensionMixin:
                     ple_query, forward_batch, ple_batch
                 )
 
+        # This is the raw four-branch tensor entering the attention HC mix.
+        # It is captured after expansion and PLE, but before ``.mix``;
+        # registering a module forward hook on GDN misses this site because
+        # Qwen4 calls ``linear_attn.mix`` directly.
+        _capture_refusal_hc_state(self.layer_id, "attn", hidden_states, forward_batch)
         hidden_states, residual = self.attn_hyper_connection.mix(
             hidden_states, stable=_stable_prefill_hc(forward_batch)
         )
@@ -1390,6 +1400,9 @@ class Qwen4ExpLayerExtensionMixin:
         if not forward_batch.forward_mode.is_idle():
             hidden_states = attn_tp_all_reduce(hidden_states)
         hidden_states = self.attn_hyper_connection.combine(hidden_states, residual)
+        # The second raw four-branch insertion point is after the attention
+        # combine and immediately before the MLP-side ``.mix``.
+        _capture_refusal_hc_state(self.layer_id, "mlp", hidden_states, forward_batch)
         hidden_states, residual = self.mlp_hyper_connection.mix(
             hidden_states, stable=_stable_prefill_hc(forward_batch)
         )
@@ -1494,6 +1507,9 @@ class Qwen4ExpLinearDecoderLayer(
 
         if not forward_batch.forward_mode.is_idle():
             hidden_states = self.linear_attn(hidden_states, forward_batch)
+            _capture_refusal_writer_output(
+                f"layer.{self.layer_id}.gdn_out_proj", hidden_states, forward_batch
+            )
 
         hidden_states, residual = self._prepare_qwen4_exp_mlp(
             hidden_states, residual, forward_batch
@@ -1619,6 +1635,9 @@ class Qwen4ExpAttentionDecoderLayer(
                 gate = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
                 attn_output = attn_output * torch.sigmoid(gate)
         output, _ = self.o_proj(attn_output)
+        _capture_refusal_writer_output(
+            f"layer.{self.layer_id}.attention_o_proj", output, forward_batch
+        )
         return output
 
     def forward(
@@ -1694,6 +1713,17 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidual(hc_config, use_combine=False)
+
+    def qwen4_exp_refusal_control(
+        self,
+        method: str,
+        body: Optional[dict[str, Any]] = None,
+        *,
+        rank_info: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Handle the opt-in refusal capture/snapshot control plane."""
+
+        return _refusal_control(self, method, body, rank_info=rank_info)
 
     def forward(
         self,
@@ -1821,6 +1851,21 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         if hc_hidden_states is not None and isinstance(output, LogitsProcessorOutput):
             output.hidden_states = hc_hidden_states
         return output
+
+    def qwen4_exp_refusal_control(
+        self,
+        method: str,
+        body: Optional[dict[str, Any]] = None,
+        *,
+        rank_info: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Expose refusal runtime control through the loaded model wrapper."""
+
+        # Keep the outer wrapper as the name source for direct weight loading
+        # (``model.layers.N``).  Layer discovery still descends into its
+        # language-model child, so runtime names match named_parameters() on
+        # the object consumed by WeightUpdater.
+        return _refusal_control(self, method, body, rank_info=rank_info)
 
     def _load_qwen4_exp_ple_buffer(
         self,
@@ -2044,6 +2089,11 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             return True
 
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        # Keep the original checkpoint spelling beside each runtime key.  The
+        # refusal runtime reports this map so a TP snapshot can be checked
+        # against actual checkpoint values without assuming HF names equal
+        # ``named_parameters()`` names.
+        self._qwen4_exp_runtime_checkpoint_sources = {}
         buffers = dict(self.named_buffers())
 
         ple_modules = {
@@ -2065,6 +2115,7 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
         skipped_visual_count = 0
 
         for name, loaded_weight in weights:
+            checkpoint_name = name
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -2080,6 +2131,13 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(".k_proj.k_scale", ".attn.k_scale")
             elif name.endswith(".v_proj.v_scale"):
                 name = name.replace(".v_proj.v_scale", ".attn.v_scale")
+
+            if name in params_dict:
+                self._qwen4_exp_runtime_checkpoint_sources[name] = {
+                    "checkpoint_name": checkpoint_name,
+                    "checkpoint_shape": list(loaded_weight.shape),
+                    "checkpoint_dtype": str(loaded_weight.dtype).replace("torch.", ""),
+                }
 
             if self._load_qwen4_exp_ple_buffer(
                 name, loaded_weight, buffers, loaded_buffers

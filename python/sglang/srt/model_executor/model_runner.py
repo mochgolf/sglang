@@ -571,6 +571,131 @@ class ModelRunner:
             get_model_runner=lambda: self,
         )
 
+    def qwen4_exp_refusal_control(self, method: str, body: Optional[dict] = None):
+        """Run the opt-in Qwen4-Exp refusal control operation on this rank.
+
+        Capture is intentionally eager-only.  Temporarily removing this
+        runner's prefill graph leaves the decode graph untouched and is undone
+        when capture stops (or when starting capture fails).
+        """
+
+        control = getattr(self.model, "qwen4_exp_refusal_control", None)
+        if control is None:
+            raise RuntimeError(
+                "loaded model does not expose qwen4_exp_refusal_control"
+            )
+        body = body or {}
+        rank_info = {
+            "tp_rank": int(getattr(self.ps, "tp_rank", 0)),
+            "tp_size": int(getattr(self.ps, "tp_size", 1)),
+            "pp_rank": int(getattr(self.ps, "pp_rank", 0)),
+            "pp_size": int(getattr(self.ps, "pp_size", 1)),
+        }
+        if hasattr(self.ps, "dp_rank"):
+            rank_info["dp_rank"] = int(self.ps.dp_rank)
+
+        def run_local_control():
+            try:
+                response = control(method, body, rank_info=rank_info)
+                if isinstance(response, dict):
+                    response = dict(response)
+                    response.setdefault("rank", dict(rank_info))
+                return {
+                    "success": True,
+                    "response": response,
+                }
+            except Exception as exc:
+                return {
+                    "success": False,
+                    "error": (
+                        f"tp_rank={rank_info['tp_rank']} pp_rank={rank_info['pp_rank']} "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
+
+        def gather_control_result(local_result):
+            """Collect rank-local control results over the TP CPU group.
+
+            Scheduler input IPC is intentionally rank-zero-only.  The request
+            receiver broadcasts this control object to every TP rank, so the
+            model runners can use the already initialized CPU process group to
+            return a complete, rank-addressed result to the tokenizer side.
+            Every rank raises on an aggregate failure after the collective so a
+            rank-one capture/snapshot error cannot be hidden by rank zero.
+            """
+
+            group = getattr(self, "tp_group", None)
+            if (
+                group is None
+                or int(getattr(group, "world_size", 1)) <= 1
+                or not dist.is_initialized()
+            ):
+                gathered = [local_result]
+            else:
+                gathered = group.all_gather_object(local_result)
+            failures = [item for item in gathered if not item.get("success", False)]
+            if failures:
+                detail = " | ".join(
+                    str(item.get("error", "unknown refusal control failure"))
+                    for item in failures
+                )
+                raise RuntimeError(
+                    f"Qwen4-Exp refusal {method} failed on at least one TP rank: {detail}"
+                )
+            responses = [item["response"] for item in gathered]
+            if int(getattr(self.ps, "tp_rank", 0)) == 0:
+                return responses
+            # Non-entry schedulers have no tokenizer IPC sender.  They still
+            # participate in the collective above and return locally for unit
+            # callers; Scheduler.handle_dumper_control drops this response on
+            # non-rank-zero processes.
+            return [local_result["response"]]
+
+        if method == "capture_start":
+            already_active = bool(getattr(self, "_refusal_capture_active", False))
+            if not already_active:
+                self._refusal_capture_saved_prefill_runner = getattr(
+                    self, "prefill_cuda_graph_runner", None
+                )
+                self._refusal_capture_active = True
+                self.prefill_cuda_graph_runner = None
+            try:
+                local_result = (
+                    {
+                        "success": False,
+                        "error": "refusal capture is already active on this rank",
+                    }
+                    if already_active
+                    else run_local_control()
+                )
+                return gather_control_result(local_result)
+            except BaseException:
+                # If another TP rank rejected the start, discard a locally
+                # created session before restoring this rank's graph runner.
+                if not already_active:
+                    try:
+                        control("capture_clear", {}, rank_info=rank_info)
+                    except Exception:
+                        pass
+                    self.prefill_cuda_graph_runner = (
+                        self._refusal_capture_saved_prefill_runner
+                    )
+                    self._refusal_capture_saved_prefill_runner = None
+                    self._refusal_capture_active = False
+                raise
+
+        try:
+            return gather_control_result(run_local_control())
+        finally:
+            if method in {"capture_stop", "capture_clear"} and getattr(
+                self, "_refusal_capture_active", False
+            ):
+                self.prefill_cuda_graph_runner = (
+                    self._refusal_capture_saved_prefill_runner
+                )
+                self._refusal_capture_saved_prefill_runner = None
+                self._refusal_capture_active = False
+
     def init_spec_aux_hidden_state(self):
         self.spec_aux_config: SpecAuxHiddenStateConfig = (
             resolve_spec_aux_hidden_state_config(

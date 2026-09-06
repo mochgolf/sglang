@@ -899,6 +899,26 @@ if os.environ.get("DUMPER_SERVER_PORT") == "reuse":
         return [x for result in results for x in result.response]
 
 
+@app.api_route("/qwen4_exp_refusal/{method}", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def _qwen4_exp_refusal_control_handler(method: str, request: Request):
+    """Broadcast opt-in Qwen4-Exp capture/update control to model ranks."""
+
+    body_bytes = await request.body()
+    body = await request.json() if body_bytes else {}
+    if not isinstance(body, dict):
+        return ORJSONResponse(
+            status_code=400,
+            content={"error": "Request body must be a JSON object."},
+        )
+    obj = DumperControlReqInput(method=f"qwen4_exp_refusal_{method}", body=body)
+    results = await _global_state.tokenizer_manager.dumper_control(obj)
+    if any(not result.success for result in results):
+        errors = [result.error for result in results if not result.success]
+        return ORJSONResponse(status_code=400, content={"error": errors})
+    return [item for result in results for item in result.response]
+
+
 # fastapi implicitly converts json in the request to obj (dataclass)
 @app.api_route(
     "/generate",

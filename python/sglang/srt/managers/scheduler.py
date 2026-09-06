@@ -5540,17 +5540,34 @@ class Scheduler(
         self.ipc_channels.send_to_detokenizer.send_output(recv_req, recv_req)
 
     def handle_dumper_control(self, recv_req: DumperControlReqInput):
-        from sglang.srt.debug_utils.dumper import dumper
-
         try:
             response: list = []
-            if (
-                not torch.distributed.is_initialized()
-                or torch.distributed.get_rank() == 0
-            ):
-                response = dumper._http_manager.handle_request(
-                    method=recv_req.method, body=recv_req.body
+            if recv_req.method.startswith("qwen4_exp_refusal_"):
+                method = recv_req.method.removeprefix("qwen4_exp_refusal_")
+                if not method:
+                    raise ValueError("missing Qwen4-Exp refusal control method")
+                control_result = self.tp_worker.model_runner.qwen4_exp_refusal_control(
+                    method, recv_req.body
                 )
+                # The model runner returns all TP responses on the tokenizer
+                # entry rank after a CPU-group gather.  Keep a local list for
+                # the existing DumperControlReqOutput contract; non-entry
+                # schedulers have a no-op sender and their result is dropped.
+                response = (
+                    control_result
+                    if isinstance(control_result, list)
+                    else [control_result]
+                )
+            else:
+                from sglang.srt.debug_utils.dumper import dumper
+
+                if (
+                    not torch.distributed.is_initialized()
+                    or torch.distributed.get_rank() == 0
+                ):
+                    response = dumper._http_manager.handle_request(
+                        method=recv_req.method, body=recv_req.body
+                    )
             self.ipc_channels.send_to_tokenizer.send_output(
                 DumperControlReqOutput(success=True, response=response), recv_req
             )
