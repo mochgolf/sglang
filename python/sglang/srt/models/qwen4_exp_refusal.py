@@ -857,9 +857,382 @@ class RefusalCaptureSession:
         }
 
 
+def _qsa_indexers(model: torch.nn.Module) -> list[tuple[int, Any]]:
+    """Return the loaded compressed-QSA indexers by their runtime layer IDs."""
+
+    result: list[tuple[int, Any]] = []
+    for layer in _model_layers(model):
+        indexer = getattr(layer, "indexer", None)
+        if indexer is None or not hasattr(indexer, "_qsa_r1_graph_capture"):
+            continue
+        result.append((int(layer.layer_id), indexer))
+    return result
+
+
+def _cpu_vector(value: Any, name: str) -> list[int]:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().reshape(-1).tolist()
+    if not isinstance(value, (list, tuple)):
+        raise RuntimeError(f"r1 observer could not read {name} as a vector")
+    result = [int(item) for item in value]
+    return result
+
+
+@dataclass
+class QsaR1Observer:
+    """Drain c1 QSA raw block selections after normal CUDA-graph replays.
+
+    The indexer owns the captured graph tensor reference.  This object only
+    reads that storage after replay while active and writes the agreed raw
+    JSONL schema; it never adds an operation to the graph.
+    """
+
+    output_dir: Path
+    session_id: str
+    rank_info: dict[str, Any]
+    indexers: tuple[tuple[int, Any], ...]
+    expected_steps: Optional[int] = None
+    active: bool = True
+    failure: Optional[str] = None
+    row_count: int = 0
+    first_position: Optional[int] = None
+    last_position: Optional[int] = None
+    request_id: Optional[str] = None
+    _raw_path: Path = field(init=False)
+    _metadata_path: Path = field(init=False)
+    _status_path: Path = field(init=False)
+    _stream: Any = field(init=False, repr=False)
+
+    @classmethod
+    def start(
+        cls, model: torch.nn.Module, body: dict[str, Any], rank_info: dict[str, Any]
+    ) -> "QsaR1Observer":
+        output_dir_raw = body.get("output_dir")
+        if not isinstance(output_dir_raw, str) or not output_dir_raw:
+            raise ValueError("r1_start requires a non-empty output_dir")
+        output_dir = Path(output_dir_raw).expanduser()
+        output_dir.mkdir(parents=True, exist_ok=True)
+        session_id = str(body.get("session_id") or "r1")
+        if not session_id or session_id in {".", ".."} or "/" in session_id:
+            raise ValueError("r1_start session_id must be a simple path component")
+        expected_steps = body.get("expected_steps")
+        if expected_steps is not None and (
+            isinstance(expected_steps, bool)
+            or not isinstance(expected_steps, int)
+            or expected_steps <= 0
+        ):
+            raise ValueError("r1_start expected_steps must be a positive integer")
+        indexers = tuple(_qsa_indexers(model))
+        if not indexers:
+            raise RuntimeError("r1_start found no compressed QSA indexers")
+        expected_layer_count = body.get("expected_qsa_layer_count")
+        if expected_layer_count is not None and (
+            isinstance(expected_layer_count, bool)
+            or not isinstance(expected_layer_count, int)
+            or expected_layer_count <= 0
+        ):
+            raise ValueError(
+                "r1_start expected_qsa_layer_count must be a positive integer"
+            )
+        if expected_layer_count is not None and len(indexers) != expected_layer_count:
+            raise RuntimeError(
+                "r1_start QSA layer count mismatch: "
+                f"loaded={len(indexers)}, expected={expected_layer_count}"
+            )
+
+        buffers: list[dict[str, Any]] = []
+        buffer_ranges: list[tuple[int, int, int]] = []
+        for layer_id, indexer in indexers:
+            capture = getattr(indexer, "_qsa_r1_graph_capture", None)
+            if not isinstance(capture, dict):
+                raise RuntimeError(
+                    f"r1_start has no captured c1 raw block tensor for layer {layer_id}"
+                )
+            required_metadata = {
+                "tensor",
+                "data_ptr",
+                "shape",
+                "dtype",
+                "layer_id",
+                "forward_mode",
+                "cuda_graph",
+                "block_topk",
+                "compress_ratio",
+                "producer",
+            }
+            missing_metadata = sorted(required_metadata - set(capture))
+            if missing_metadata:
+                raise RuntimeError(
+                    f"r1_start missing c1 producer metadata for layer {layer_id}: "
+                    f"{missing_metadata}"
+                )
+            tensor = capture.get("tensor")
+            shape = tuple(int(value) for value in capture.get("shape", ()))
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or not tensor.is_cuda
+                or tensor.dtype != torch.int32
+                or not tensor.is_contiguous()
+                or shape != (1, 512)
+                or tuple(tensor.shape) != shape
+                or int(tensor.data_ptr()) != int(capture.get("data_ptr", -1))
+                or int(capture["layer_id"]) != layer_id
+                or capture["dtype"] != "int32"
+                or capture["forward_mode"] != "decode"
+                or capture["cuda_graph"] is not True
+                or int(capture["block_topk"]) != 512
+                or int(capture["compress_ratio"]) <= 0
+                or capture["producer"] != "QSAIndexer.select_decode_tokens.fast_topk"
+            ):
+                raise RuntimeError(
+                    "r1_start c1 raw block tensor metadata is invalid for "
+                    f"layer {layer_id}: {capture}"
+                )
+            data_ptr = int(capture["data_ptr"])
+            buffer_ranges.append(
+                (data_ptr, data_ptr + 512 * tensor.element_size(), layer_id)
+            )
+            buffers.append(
+                {
+                    "layer_id": layer_id,
+                    "producer": capture.get("producer"),
+                    "data_ptr": data_ptr,
+                    "shape": list(shape),
+                    "dtype": capture.get("dtype"),
+                    "block_topk": int(capture.get("block_topk", -1)),
+                    "compress_ratio": int(capture.get("compress_ratio", -1)),
+                    "forward_mode": capture.get("forward_mode"),
+                    "cuda_graph": capture.get("cuda_graph"),
+                }
+            )
+        if len({start for start, _end, _layer_id in buffer_ranges}) != len(buffer_ranges):
+            raise RuntimeError("r1_start found overlapping c1 raw block buffers")
+        for index, (start, end, layer_id) in enumerate(buffer_ranges):
+            for other_start, other_end, other_layer_id in buffer_ranges[index + 1 :]:
+                if start < other_end and other_start < end:
+                    raise RuntimeError(
+                        "r1_start found overlapping c1 raw block buffers: "
+                        f"layers={layer_id},{other_layer_id}"
+                    )
+
+        observer = cls(
+            output_dir=output_dir,
+            session_id=session_id,
+            rank_info=dict(rank_info),
+            indexers=indexers,
+            expected_steps=expected_steps,
+        )
+        observer._raw_path = output_dir / (
+            f"{session_id}-{_rank_suffix(rank_info)}.jsonl"
+        )
+        observer._metadata_path = output_dir / (
+            f"{session_id}-{_rank_suffix(rank_info)}.json"
+        )
+        observer._status_path = output_dir / (
+            f"{session_id}-{_rank_suffix(rank_info)}.status.json"
+        )
+        if observer._raw_path.exists():
+            raise FileExistsError(f"r1_start refuses existing raw file: {observer._raw_path}")
+        observer._stream = observer._raw_path.open("x", encoding="utf-8")
+        metadata = {
+            "schema_version": "qsa-r1-v1",
+            "session_id": session_id,
+            "rank": observer.rank_info,
+            "expected_steps": expected_steps,
+            "layer_ids": [layer_id for layer_id, _indexer in indexers],
+            "raw_path": str(observer._raw_path),
+            "buffers": buffers,
+            "observer": "post_graph_replay_cpu_drain",
+            "expanded_indices_used": False,
+        }
+        observer._metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return observer
+
+    def _fail(self, message: str) -> None:
+        self.failure = message
+        self.active = False
+        raise RuntimeError(message)
+
+    def drain(self, forward_batch: Any, graph_runner: Any) -> None:
+        if not self.active:
+            return
+        if self.failure is not None:
+            return
+        mode = getattr(getattr(forward_batch, "forward_mode", None), "name", None)
+        if mode != "DECODE":
+            self._fail(f"r1 observer rejected non-DECODE forward mode: {mode!r}")
+        if getattr(forward_batch, "spec_info", None) is not None:
+            self._fail("r1 observer rejected speculative decode")
+        if getattr(forward_batch, "_original_forward_mode", None) is not None:
+            self._fail("r1 observer rejected a substituted forward mode")
+        if int(getattr(forward_batch, "batch_size", -1)) != 1:
+            self._fail(
+                "r1 observer requires raw batch size 1, got "
+                f"{getattr(forward_batch, 'batch_size', None)!r}"
+            )
+        if getattr(forward_batch, "num_padding", None) not in (None, 0):
+            self._fail("r1 observer rejected padded forward batch")
+        if int(getattr(graph_runner, "bs", -1)) != 1:
+            self._fail(
+                "r1 observer requires c1 graph replay, got "
+                f"graph_bs={getattr(graph_runner, 'bs', None)!r}"
+            )
+        rids = list(getattr(forward_batch, "rids", None) or [])
+        if len(rids) != 1 or not isinstance(rids[0], str) or not rids[0]:
+            self._fail(f"r1 observer requires one runtime request id, got {rids!r}")
+        rid = rids[0]
+        try:
+            positions = _cpu_vector(getattr(forward_batch, "positions", None), "positions")
+            seq_lens_value = getattr(forward_batch, "seq_lens_cpu", None)
+            if seq_lens_value is None:
+                seq_lens_value = getattr(forward_batch, "seq_lens", None)
+            seq_lens = _cpu_vector(seq_lens_value, "seq_lens")
+        except (TypeError, ValueError, RuntimeError) as exc:
+            self._fail(str(exc))
+        if len(positions) != 1 or len(seq_lens) != 1:
+            self._fail(
+                f"r1 observer requires one position/sequence length, got {positions!r}/{seq_lens!r}"
+            )
+        position = int(positions[0])
+        sequence_length = int(seq_lens[0])
+        if position < 0 or sequence_length <= 0:
+            self._fail(
+                f"r1 observer received invalid position/sequence length: {position}/{sequence_length}"
+            )
+        if self.request_id is None:
+            self.request_id = rid
+            self.first_position = position
+        elif rid != self.request_id:
+            self._fail(
+                "r1 observer request changed during one session: "
+                f"{self.request_id!r} -> {rid!r}"
+            )
+        if self.last_position is not None and position != self.last_position + 1:
+            self._fail(
+                "r1 observer position is not consecutive: "
+                f"previous={self.last_position}, current={position}"
+            )
+
+        rows: list[dict[str, Any]] = []
+        for layer_id, indexer in self.indexers:
+            capture = getattr(indexer, "_qsa_r1_graph_capture", None)
+            if not isinstance(capture, dict):
+                self._fail(f"r1 observer lost c1 producer metadata for layer {layer_id}")
+            tensor = capture.get("tensor")
+            expected_ptr = int(capture.get("data_ptr", -1))
+            expected_shape = tuple(int(value) for value in capture.get("shape", ()))
+            if (
+                not isinstance(tensor, torch.Tensor)
+                or not tensor.is_cuda
+                or tensor.dtype != torch.int32
+                or tuple(tensor.shape) != expected_shape
+                or expected_shape != (1, 512)
+                or int(tensor.data_ptr()) != expected_ptr
+            ):
+                self._fail(
+                    "r1 observer producer tensor changed for "
+                    f"layer {layer_id}: expected_ptr={expected_ptr}, "
+                    f"actual={tensor!r}"
+                )
+            # This is the sole observer D2H operation and is outside graph
+            # replay.  Do not replace it with a device-side copy or clone.
+            values = [int(value) for value in tensor.detach().cpu().reshape(-1).tolist()]
+            if len(values) != 512:
+                self._fail(
+                    f"r1 observer raw block shape changed for layer {layer_id}: {len(values)}"
+                )
+            ratio = int(capture.get("compress_ratio", 0))
+            if ratio <= 0:
+                self._fail(f"r1 observer has invalid compress_ratio for layer {layer_id}")
+            compressed_length = sequence_length // ratio
+            if compressed_length < 0:
+                self._fail(
+                    f"r1 observer computed invalid compressed_length={compressed_length}"
+                )
+            rows.append(
+                {
+                    "request_id": rid,
+                    "rank": int(self.rank_info.get("tp_rank", 0)),
+                    "layer_id": int(layer_id),
+                    "position": position,
+                    "compressed_length": compressed_length,
+                    "block_indices": values,
+                    "forward_mode": "decode",
+                    "cuda_graph": True,
+                }
+            )
+        for row in rows:
+            self._stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        self._stream.flush()
+        self.row_count += len(rows)
+        self.last_position = position
+        if (
+            self.expected_steps is not None
+            and self.row_count == self.expected_steps * len(self.indexers)
+        ):
+            # The scheduler may execute one ahead target step before the HTTP
+            # response is assembled.  The requested generation budget ends at
+            # this accepted decode position; leave the graph-owned references
+            # intact but disable further D2H drains until r1_stop closes us.
+            self.active = False
+
+    def status(self, **extra: Any) -> dict[str, Any]:
+        return {
+            "success": self.failure is None,
+            "active": self.active,
+            "session_id": self.session_id,
+            "rank": self.rank_info,
+            "layer_count": len(self.indexers),
+            "layer_ids": [layer_id for layer_id, _indexer in self.indexers],
+            "row_count": self.row_count,
+            "request_id": self.request_id,
+            "first_position": self.first_position,
+            "last_position": self.last_position,
+            "expected_steps": self.expected_steps,
+            "raw_path": str(self._raw_path),
+            "metadata_path": str(self._metadata_path),
+            "failure": self.failure,
+            **extra,
+        }
+
+    def stop(self) -> dict[str, Any]:
+        if self.active:
+            self.active = False
+        if getattr(self, "_stream", None) is not None and not self._stream.closed:
+            self._stream.flush()
+            self._stream.close()
+        expected_rows = (
+            None
+            if self.expected_steps is None
+            else self.expected_steps * len(self.indexers)
+        )
+        if expected_rows is not None and self.row_count != expected_rows:
+            self.failure = (
+                "r1_stop expected one raw row per layer per step: "
+                f"rows={self.row_count}, expected={expected_rows}"
+            )
+        if self.row_count == 0 and self.failure is None:
+            self.failure = "r1_stop rejected empty raw capture"
+        result = self.status()
+        try:
+            self._status_path.write_text(
+                json.dumps(result, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        if self.failure is not None:
+            raise RuntimeError(self.failure)
+        return result
+
+
 @dataclass
 class RefusalRuntimeState:
     capture: Optional[RefusalCaptureSession] = None
+    r1: Optional[QsaR1Observer] = None
 
 
 _RUNTIME_STATES: dict[int, RefusalRuntimeState] = {}
@@ -986,6 +1359,25 @@ def refusal_control(
     if method == "capture_clear":
         state.capture = None
         return {"success": True, "active": False}
+    if method == "r1_start":
+        if state.r1 is not None and state.r1.active:
+            raise RuntimeError("r1 observer is already active")
+        state.r1 = QsaR1Observer.start(model, body, rank_info)
+        # Keep the stopped observer object attached as well: QSA indexers retain
+        # their graph-owned c1 tensors for the process lifetime, while the
+        # model runner uses this object only as the active CPU-drain switch.
+        model._qwen4_exp_r1_observer = state.r1
+        return state.r1.status()
+    if method == "r1_status":
+        return (
+            state.r1.status()
+            if state.r1 is not None
+            else {"success": True, "active": False, "row_count": 0}
+        )
+    if method == "r1_stop":
+        if state.r1 is None:
+            raise RuntimeError("r1_stop rejected: no observer session")
+        return state.r1.stop()
     raise ValueError(f"unknown refusal runtime method: {method!r}")
 
 

@@ -80,6 +80,11 @@ class QSAIndexer(MultiPlatformOp):
             self.index_head_dim, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
         self._rope_axis_map_cache = None
+        # The r1 diagnostic keeps only the one c1 decode tensor produced while
+        # capturing the CUDA graph.  It deliberately stores the producer
+        # tensor itself, rather than inserting a copy or an observer kernel;
+        # replay writes the same graph-owned storage in place.
+        self._qsa_r1_graph_capture = None
 
     @staticmethod
     def _validate_config(config) -> None:
@@ -495,6 +500,9 @@ class QSAIndexer(MultiPlatformOp):
         max_model_len: int,
         query_positions: torch.Tensor,
         sequence_lengths: torch.Tensor,
+        *,
+        indexer_metadata=None,
+        forward_batch=None,
     ) -> torch.Tensor:
         logits = qsa_mqa_decode(
             q,
@@ -520,6 +528,38 @@ class QSAIndexer(MultiPlatformOp):
             block_indices = qsa_fast_topk(
                 logits, row_starts, compressed_lengths, topk=self.block_topk
             )
+        if (
+            getattr(indexer_metadata, "is_cuda_graph", False)
+            and forward_batch is not None
+            and getattr(getattr(forward_batch, "forward_mode", None), "name", None)
+            == "DECODE"
+            and getattr(forward_batch, "spec_info", None) is None
+            and block_indices.is_cuda
+            and block_indices.ndim == 2
+            and block_indices.shape[0] == 1
+            and block_indices.shape[1] == self.block_topk == 512
+            # The graph runner uses the same ``run_once`` body for two eager
+            # warmups and the actual capture.  Only retain the producer from
+            # the latter; a warmup tensor is not graph-owned and may be
+            # allocator-reused before the first replay.
+            and torch.cuda.is_current_stream_capturing()
+        ):
+            # Keep only c1.  Other graph buckets are intentionally ignored so
+            # the diagnostic cannot pin every graph bucket's intermediate
+            # buffer.  ``expand_qsa_block_indices`` below does not mutate this
+            # tensor, so its values remain the exact pre-expansion IDs.
+            self._qsa_r1_graph_capture = {
+                "tensor": block_indices,
+                "data_ptr": int(block_indices.data_ptr()),
+                "shape": tuple(int(value) for value in block_indices.shape),
+                "dtype": str(block_indices.dtype).replace("torch.", ""),
+                "layer_id": self.layer_id,
+                "forward_mode": "decode",
+                "cuda_graph": True,
+                "block_topk": self.block_topk,
+                "compress_ratio": self.compress_ratio,
+                "producer": "QSAIndexer.select_decode_tokens.fast_topk",
+            }
         return expand_qsa_block_indices(
             block_indices,
             query_positions,
@@ -621,6 +661,8 @@ class QSAIndexer(MultiPlatformOp):
                 max_model_len,
                 logical_positions,
                 indexer_metadata.get_seqlens_int32(),
+                indexer_metadata=indexer_metadata,
+                forward_batch=forward_batch,
             )
 
         compressed_keys, row_starts, row_ends, sequence_lengths = (

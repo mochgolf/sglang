@@ -1935,6 +1935,26 @@ class ModelRunner:
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
+                r1_observer = getattr(self.model, "_qwen4_exp_r1_observer", None)
+                if r1_observer is not None and r1_observer.active:
+                    # The observer only reads the c1 raw block tensor retained
+                    # by QSAIndexer after replay.  It is intentionally outside
+                    # the graph and disabled for every normal serving forward.
+                    # A diagnostic failure must stop measurement while leaving
+                    # the serving forward and resident process alive; r1_stop
+                    # reports the failure to the controlling client.
+                    try:
+                        r1_observer.drain(
+                            forward_batch,
+                            graph_runner=self.decode_cuda_graph_runner,
+                        )
+                    except Exception as exc:
+                        r1_observer.active = False
+                        if r1_observer.failure is None:
+                            r1_observer.failure = (
+                                "r1 observer drain failed: "
+                                f"{type(exc).__name__}: {exc}"
+                            )
                 return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
