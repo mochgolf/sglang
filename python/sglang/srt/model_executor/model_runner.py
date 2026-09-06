@@ -591,8 +591,12 @@ class ModelRunner:
             "pp_rank": int(getattr(self.ps, "pp_rank", 0)),
             "pp_size": int(getattr(self.ps, "pp_size", 1)),
         }
-        if hasattr(self.ps, "dp_rank"):
-            rank_info["dp_rank"] = int(self.ps.dp_rank)
+        # ``ParallelState.dp_rank`` is optional for DP-attention workers.  In
+        # the ordinary TP path it is present but deliberately ``None``; keep
+        # that value out of the wire metadata instead of coercing it to int.
+        dp_rank = getattr(self.ps, "dp_rank", None)
+        if dp_rank is not None:
+            rank_info["dp_rank"] = int(dp_rank)
 
         def run_local_control():
             try:
