@@ -25,6 +25,11 @@ def _rank_suffix(rank_info: dict[str, Any]) -> str:
 
 _CAPTURE_FORWARD_MODES = frozenset({"EXTEND", "SPLIT_PREFILL", "DLLM_EXTEND"})
 
+# Fixed decode-relative positions for the independent QSA top-k sentinel.
+# ``QsaR1Observer`` keeps the ordinary raw block trace unchanged unless this
+# exact list is requested through ``r1_start.topk_sample_steps``.
+QSA_TOPK_SAMPLE_STEPS = (0, 1, 2, 3, 127, 255, 511, 766)
+
 
 def _prefill_last_prompt_row_records(
     hidden_states: torch.Tensor,
@@ -898,9 +903,12 @@ class QsaR1Observer:
     first_position: Optional[int] = None
     last_position: Optional[int] = None
     request_id: Optional[str] = None
+    topk_sample_steps: tuple[int, ...] = ()
+    topk_samples: list[dict[str, Any]] = field(default_factory=list, repr=False)
     _raw_path: Path = field(init=False)
     _metadata_path: Path = field(init=False)
     _status_path: Path = field(init=False)
+    _topk_sample_path: Optional[Path] = field(init=False, default=None)
     _stream: Any = field(init=False, repr=False)
 
     @classmethod
@@ -922,6 +930,30 @@ class QsaR1Observer:
             or expected_steps <= 0
         ):
             raise ValueError("r1_start expected_steps must be a positive integer")
+        requested_sample_steps = body.get("topk_sample_steps")
+        if requested_sample_steps is None:
+            topk_sample_steps: tuple[int, ...] = ()
+        else:
+            if (
+                not isinstance(requested_sample_steps, list)
+                or any(
+                    isinstance(step, bool) or not isinstance(step, int)
+                    for step in requested_sample_steps
+                )
+            ):
+                raise ValueError(
+                    "r1_start topk_sample_steps must be a list of integers"
+                )
+            topk_sample_steps = tuple(requested_sample_steps)
+            if topk_sample_steps != QSA_TOPK_SAMPLE_STEPS:
+                raise ValueError(
+                    "r1_start topk_sample_steps must equal the fixed QSA sentinel "
+                    f"{list(QSA_TOPK_SAMPLE_STEPS)}"
+                )
+            if expected_steps != 767:
+                raise ValueError(
+                    "r1_start topk_sample_steps requires expected_steps=767"
+                )
         indexers = tuple(_qsa_indexers(model))
         if not indexers:
             raise RuntimeError("r1_start found no compressed QSA indexers")
@@ -960,6 +992,16 @@ class QsaR1Observer:
                 "compress_ratio",
                 "producer",
             }
+            if topk_sample_steps:
+                required_metadata.update(
+                    {
+                        "logits",
+                        "logits_data_ptr",
+                        "logits_shape",
+                        "logits_dtype",
+                        "logits_producer",
+                    }
+                )
             missing_metadata = sorted(required_metadata - set(capture))
             if missing_metadata:
                 raise RuntimeError(
@@ -992,6 +1034,38 @@ class QsaR1Observer:
             buffer_ranges.append(
                 (data_ptr, data_ptr + 512 * tensor.element_size(), layer_id)
             )
+            if topk_sample_steps:
+                logits = capture.get("logits")
+                logits_shape = tuple(
+                    int(value) for value in capture.get("logits_shape", ())
+                )
+                if (
+                    not isinstance(logits, torch.Tensor)
+                    or not logits.is_cuda
+                    or logits.dtype != torch.float32
+                    or not logits.is_contiguous()
+                    or logits.ndim != 2
+                    or logits_shape != tuple(logits.shape)
+                    or logits_shape[0] != 1
+                    or logits_shape[1] <= 0
+                    or int(logits.data_ptr())
+                    != int(capture.get("logits_data_ptr", -1))
+                    or capture["logits_dtype"] != "float32"
+                    or capture["logits_producer"]
+                    != "QSAIndexer.select_decode_tokens.qsa_mqa_decode"
+                ):
+                    raise RuntimeError(
+                        "r1_start qsa logits producer metadata is invalid for "
+                        f"layer {layer_id}: {capture}"
+                    )
+                logits_ptr = int(capture["logits_data_ptr"])
+                buffer_ranges.append(
+                    (
+                        logits_ptr,
+                        logits_ptr + logits.numel() * logits.element_size(),
+                        layer_id,
+                    )
+                )
             buffers.append(
                 {
                     "layer_id": layer_id,
@@ -1003,15 +1077,28 @@ class QsaR1Observer:
                     "compress_ratio": int(capture.get("compress_ratio", -1)),
                     "forward_mode": capture.get("forward_mode"),
                     "cuda_graph": capture.get("cuda_graph"),
+                    **(
+                        {
+                            "logits_producer": capture.get("logits_producer"),
+                            "logits_data_ptr": int(capture.get("logits_data_ptr", -1)),
+                            "logits_shape": list(
+                                int(value)
+                                for value in capture.get("logits_shape", ())
+                            ),
+                            "logits_dtype": capture.get("logits_dtype"),
+                        }
+                        if topk_sample_steps
+                        else {}
+                    ),
                 }
             )
         if len({start for start, _end, _layer_id in buffer_ranges}) != len(buffer_ranges):
-            raise RuntimeError("r1_start found overlapping c1 raw block buffers")
+            raise RuntimeError("r1_start found overlapping c1 producer buffers")
         for index, (start, end, layer_id) in enumerate(buffer_ranges):
             for other_start, other_end, other_layer_id in buffer_ranges[index + 1 :]:
                 if start < other_end and other_start < end:
                     raise RuntimeError(
-                        "r1_start found overlapping c1 raw block buffers: "
+                        "r1_start found overlapping c1 producer buffers: "
                         f"layers={layer_id},{other_layer_id}"
                     )
 
@@ -1021,6 +1108,7 @@ class QsaR1Observer:
             rank_info=dict(rank_info),
             indexers=indexers,
             expected_steps=expected_steps,
+            topk_sample_steps=topk_sample_steps,
         )
         observer._raw_path = output_dir / (
             f"{session_id}-{_rank_suffix(rank_info)}.jsonl"
@@ -1031,8 +1119,17 @@ class QsaR1Observer:
         observer._status_path = output_dir / (
             f"{session_id}-{_rank_suffix(rank_info)}.status.json"
         )
+        if topk_sample_steps:
+            observer._topk_sample_path = output_dir / (
+                f"{session_id}-{_rank_suffix(rank_info)}.topk-samples.pt"
+            )
         if observer._raw_path.exists():
             raise FileExistsError(f"r1_start refuses existing raw file: {observer._raw_path}")
+        if observer._topk_sample_path is not None and observer._topk_sample_path.exists():
+            raise FileExistsError(
+                f"r1_start refuses existing top-k sample file: "
+                f"{observer._topk_sample_path}"
+            )
         observer._stream = observer._raw_path.open("x", encoding="utf-8")
         metadata = {
             "schema_version": "qsa-r1-v1",
@@ -1045,6 +1142,19 @@ class QsaR1Observer:
             "observer": "post_graph_replay_cpu_drain",
             "expanded_indices_used": False,
         }
+        if topk_sample_steps:
+            metadata.update(
+                {
+                    "topk_sample_schema_version": "qsa-topk-v1",
+                    "topk_sample_steps": list(topk_sample_steps),
+                    "topk_sample_path": str(observer._topk_sample_path),
+                    "topk_sample_count_expected": len(topk_sample_steps)
+                    * len(indexers),
+                    "topk_logits_source": "captured_qsa_mqa_decode_output",
+                    "topk_selection_source": "same_graph_fast_topk_output",
+                    "topk_cpu_check": "lab/results/qwen38-hisparse-tests-20260907/check_topk_samples.py",
+                }
+            )
         observer._metadata_path.write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
@@ -1115,6 +1225,7 @@ class QsaR1Observer:
                 "r1 observer position is not consecutive: "
                 f"previous={self.last_position}, current={position}"
             )
+        decode_step = position - int(self.first_position)
 
         rows: list[dict[str, Any]] = []
         for layer_id, indexer in self.indexers:
@@ -1151,6 +1262,49 @@ class QsaR1Observer:
             if compressed_length < 0:
                 self._fail(
                     f"r1 observer computed invalid compressed_length={compressed_length}"
+                )
+            if self.topk_sample_steps and decode_step in self.topk_sample_steps:
+                logits = capture.get("logits")
+                logits_shape = tuple(
+                    int(value) for value in capture.get("logits_shape", ())
+                )
+                logits_ptr = int(capture.get("logits_data_ptr", -1))
+                if (
+                    not isinstance(logits, torch.Tensor)
+                    or not logits.is_cuda
+                    or logits.dtype != torch.float32
+                    or not logits.is_contiguous()
+                    or tuple(logits.shape) != logits_shape
+                    or logits_shape[0] != 1
+                    or int(logits.data_ptr()) != logits_ptr
+                    or compressed_length > logits_shape[1]
+                ):
+                    self._fail(
+                        "r1 observer logits producer changed for "
+                        f"layer {layer_id}: expected_ptr={logits_ptr}, "
+                        f"expected_shape={logits_shape}, actual={logits!r}"
+                    )
+                # This is the optional top-k sentinel D2H operation.  It is
+                # outside graph replay and copies only the valid logits prefix
+                # for this exact replay, alongside the block output above.
+                logits_cpu = logits[0, :compressed_length].detach().cpu().contiguous()
+                self.topk_samples.append(
+                    {
+                        "request_id": rid,
+                        "rank": int(self.rank_info.get("tp_rank", 0)),
+                        "layer_id": int(layer_id),
+                        "step": int(decode_step),
+                        "position": position,
+                        "compressed_length": compressed_length,
+                        "logits": logits_cpu,
+                        "block_indices": torch.tensor(
+                            values, dtype=torch.int32, device="cpu"
+                        ),
+                        "forward_mode": "decode",
+                        "cuda_graph": True,
+                        "logits_producer": capture.get("logits_producer"),
+                        "selection_producer": capture.get("producer"),
+                    }
                 )
             rows.append(
                 {
@@ -1194,6 +1348,19 @@ class QsaR1Observer:
             "expected_steps": self.expected_steps,
             "raw_path": str(self._raw_path),
             "metadata_path": str(self._metadata_path),
+            "topk_sample_enabled": bool(self.topk_sample_steps),
+            "topk_sample_steps": list(self.topk_sample_steps),
+            "topk_sample_count": len(self.topk_samples),
+            "topk_sample_count_expected": (
+                len(self.topk_sample_steps) * len(self.indexers)
+                if self.topk_sample_steps
+                else 0
+            ),
+            "topk_sample_path": (
+                str(self._topk_sample_path)
+                if self._topk_sample_path is not None
+                else None
+            ),
             "failure": self.failure,
             **extra,
         }
@@ -1214,8 +1381,32 @@ class QsaR1Observer:
                 "r1_stop expected one raw row per layer per step: "
                 f"rows={self.row_count}, expected={expected_rows}"
             )
+        expected_samples = len(self.topk_sample_steps) * len(self.indexers)
+        if self.topk_sample_steps and len(self.topk_samples) != expected_samples:
+            self.failure = (
+                "r1_stop expected one top-k sample per layer per fixed step: "
+                f"samples={len(self.topk_samples)}, expected={expected_samples}"
+            )
         if self.row_count == 0 and self.failure is None:
             self.failure = "r1_stop rejected empty raw capture"
+        if self._topk_sample_path is not None and not self._topk_sample_path.exists():
+            try:
+                torch.save(
+                    {
+                        "schema_version": "qsa-topk-v1",
+                        "session_id": self.session_id,
+                        "rank": self.rank_info,
+                        "request_id": self.request_id,
+                        "sample_steps": list(self.topk_sample_steps),
+                        "samples": self.topk_samples,
+                    },
+                    self._topk_sample_path,
+                )
+            except Exception as exc:
+                self.failure = (
+                    "r1_stop could not write top-k samples: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         result = self.status()
         try:
             self._status_path.write_text(

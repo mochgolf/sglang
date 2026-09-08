@@ -553,12 +553,21 @@ class QSAIndexer(MultiPlatformOp):
                 "data_ptr": int(block_indices.data_ptr()),
                 "shape": tuple(int(value) for value in block_indices.shape),
                 "dtype": str(block_indices.dtype).replace("torch.", ""),
+                # Keep the producer logits alongside the existing top-k
+                # output.  Both tensors are outputs of this graph invocation;
+                # the observer may copy the valid prefix after replay without
+                # inserting a graph node or recomputing a second selection.
+                "logits": logits,
+                "logits_data_ptr": int(logits.data_ptr()),
+                "logits_shape": tuple(int(value) for value in logits.shape),
+                "logits_dtype": str(logits.dtype).replace("torch.", ""),
                 "layer_id": self.layer_id,
                 "forward_mode": "decode",
                 "cuda_graph": True,
                 "block_topk": self.block_topk,
                 "compress_ratio": self.compress_ratio,
                 "producer": "QSAIndexer.select_decode_tokens.fast_topk",
+                "logits_producer": "QSAIndexer.select_decode_tokens.qsa_mqa_decode",
             }
         return expand_qsa_block_indices(
             block_indices,
