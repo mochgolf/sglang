@@ -120,11 +120,16 @@ class TestQSAHiSparseSlots(unittest.TestCase):
         slots.drain(a, Event(on_wait=lambda: waited("consumer")),
                     [Event(on_wait=lambda: waited("copy"))])
         self.assertEqual(waits, ["consumer", "copy"])
+        with self.assertRaises(RuntimeError):
+            slots.commit_release(a)
         logical.free_group_begin()
         logical.free(ar)
         self.assertEqual(logical.available_size(), 0)
         self.assertEqual(slots.snapshot()["lease_free"], 0)
+        with self.assertRaisesRegex(RuntimeError, "has not flushed"):
+            slots.logical_flushed(a, logical)
         logical.free_group_end()
+        slots.logical_flushed(a, logical)
         slots.commit_release(a)
         reqs.free_rows([a.req_pool_idx])
         self.assertEqual(logical.available_size(), 128)
@@ -136,6 +141,7 @@ class TestQSAHiSparseSlots(unittest.TestCase):
         self.assertEqual(c.generation, a.generation + 1)
         for callback in (lambda: slots.finish_handoff(a, Event()),
                          lambda: slots.drain(a, Event(), []),
+                         lambda: slots.logical_flushed(a, logical),
                          lambda: slots.commit_release(a)):
             with self.assertRaisesRegex(RuntimeError, "stale"):
                 callback()
@@ -152,6 +158,7 @@ class TestQSAHiSparseSlots(unittest.TestCase):
         for lease, rows in ((c, cr), (b, br)):
             slots.drain(lease, Event(), [Event()])
             logical.free(rows)
+            slots.logical_flushed(lease, logical)
             slots.commit_release(lease)
             reqs.free_rows([lease.req_pool_idx])
         with self.assertRaisesRegex(RuntimeError, "stale"):

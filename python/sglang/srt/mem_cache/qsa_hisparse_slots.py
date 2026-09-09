@@ -117,9 +117,14 @@ class QSAHiSparseSlots:
             self.prefill_owner = None
         self.phases[lease.req_pool_idx] = "drained"
 
-    def commit_release(self, lease):
-        # Called after logical free-group flush, never at cancellation submission.
+    def logical_flushed(self, lease, allocator):
         self.require(lease, "drained")
+        if allocator.free_group is not None:
+            raise RuntimeError("QSA logical free group has not flushed")
+        self.phases[lease.req_pool_idx] = "logical_flushed"
+
+    def commit_release(self, lease):
+        self.require(lease, "logical_flushed")
         del self.active[lease.req_pool_idx]
         del self.phases[lease.req_pool_idx]
         self.free_slots.append(lease.slot)
