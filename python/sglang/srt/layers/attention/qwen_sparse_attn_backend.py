@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from copy import copy
 from functools import lru_cache
 from typing import Dict, Optional, Tuple
@@ -250,6 +251,14 @@ class QwenSparseAttnBackend(AttentionBackend):
         self._graph_row_req_pool_indices = None
         self._trtllm_sparse_tables = {}
         self._mtp_shared_sparse_indices = None
+        self.hisparse_v3 = None
+        if runner is not None and os.environ.get("SGLANG_QSA_HISPARSE_V3"):
+            from sglang.srt.mem_cache.qsa_hisparse_v3 import QSAHiSparseV3
+
+            self.hisparse_v3 = QSAHiSparseV3(
+                runner, os.environ["SGLANG_QSA_HISPARSE_V3"]
+            )
+            self.token_to_kv_pool.qsa_hisparse_v3 = self.hisparse_v3
         self._trtllm_workspace = None
         self._graph_extend_lens = None
         self._graph_extend_lens_pin = None
@@ -268,6 +277,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _store_kv(self, layer, loc, k: torch.Tensor, v: torch.Tensor) -> None:
+        if self.hisparse_v3 is not None and self.hisparse_v3.offloaded:
+            loc = self.hisparse_v3.ring_loc
         cache_dtype = getattr(self.token_to_kv_pool, "dtype", k.dtype)
         if not is_fp8_kv_dtype(cache_dtype):
             self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
@@ -849,6 +860,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = None
             return
+        if self.hisparse_v3 is not None:
+            self.hisparse_v3.begin_batch(forward_batch)
         self.forward_metadata = self._metadata_from_forward_batch(forward_batch)
 
     def init_forward_metadata_out_graph(
@@ -1690,6 +1703,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             raise ValueError("QSA sparse attention requires topk_indices")
         if save_kv_cache:
             self._store_kv(layer, forward_batch.out_cache_loc, k, v)
+            if self.hisparse_v3 is not None:
+                self.hisparse_v3.after_store(layer)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
@@ -1722,7 +1737,18 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
-        trtllm_decode = _resolve_trtllm_sparse_decode()
+        req_table = self.req_to_token_pool.req_to_token
+        row_req_indices = (
+            metadata.row_req_pool_indices
+            if metadata.row_req_pool_indices is not None
+            else forward_batch.req_pool_indices
+        )
+        if self.hisparse_v3 is not None and self.hisparse_v3.offloaded:
+            k_buffer, v_buffer, req_table, row_req_indices = self.hisparse_v3.selected(
+                layer, topk_indices
+            )
+        # Both V3 arms use the same FA2 decode implementation.
+        trtllm_decode = None if self.hisparse_v3 is not None else _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:
             return self._forward_trtllm_sparse(
                 q,
@@ -1773,12 +1799,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         qwen_sparse_kv_extraction_compact_triton(
             k_buffer,
             v_buffer,
-            self.req_to_token_pool.req_to_token,
-            (
-                metadata.row_req_pool_indices
-                if metadata.row_req_pool_indices is not None
-                else forward_batch.req_pool_indices
-            ),
+            req_table,
+            row_req_indices,
             topk_indices,
             sequence_lens,
             cu_seqlens_k,
