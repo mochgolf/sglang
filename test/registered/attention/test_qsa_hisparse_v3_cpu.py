@@ -19,6 +19,105 @@ from sglang.srt.mem_cache.qsa_hisparse_v3 import (
 
 
 class TestQSAHiSparseV3(unittest.TestCase):
+    def test_startup_slab_reuse_and_appended_writeback(self):
+        # Exercise the real constructor/handoff/release with scaled CPU backing.
+        class Full(SimpleNamespace):
+            pass
+
+        class Allocator(SimpleNamespace):
+            pass
+
+        slab = torch.empty((1, 514, 2048), dtype=torch.uint8)
+        full = Full(k_buffer=[torch.zeros((2056, 1, 256), dtype=torch.uint8)],
+                    v_buffer=[torch.zeros((2056, 1, 256), dtype=torch.uint8)],
+                    _init_data_ptrs_and_strides=Mock())
+        mamba = SimpleNamespace(get_contiguous_buf_infos=lambda: ([], [], None))
+        pool = SimpleNamespace(full_kv_pool=full, device="cpu", size=262144,
+                               full_attention_layer_id_mapping=[3],
+                               qsa_compressed_flat=torch.zeros(1),
+                               _transfer_full_attention_id=lambda _: 0)
+        allocator = Allocator(available_size=lambda: 0, free_group=None)
+        runner = SimpleNamespace(token_to_kv_pool=pool, server_args=None,
+                                 token_to_kv_pool_allocator=allocator,
+                                 ps=SimpleNamespace(tp_rank=0),
+                                 req_to_token_pool=SimpleNamespace(
+                                     req_to_token=torch.arange(262144)[None], mamba_pool=mamba))
+        empty = torch.empty
+        allocations = []
+
+        def pinned_empty(shape, **kwargs):
+            if kwargs.get("pin_memory"):
+                allocations.append((shape, kwargs))
+                return slab
+            return empty(shape, **kwargs)
+
+        with patch.dict("os.environ", {}, clear=True), \
+                patch("sglang.srt.mem_cache.qsa_hisparse_v3.validate_configuration"), \
+                patch("sglang.srt.model_executor.cuda_graph_config.cuda_graph_fully_disabled", return_value=True), \
+                patch("sglang.srt.mem_cache.memory_pool.MHATokenToKVPool", Full), \
+                patch("sglang.srt.mem_cache.allocator.paged.PagedTokenToKVPoolAllocator", Allocator), \
+                patch.object(torch, "empty", side_effect=pinned_empty), \
+                patch.object(torch.cuda, "Stream"), \
+                patch.object(QSAHiSparseV3, "record") as record:
+            resident = QSAHiSparseV3(runner, "resident")
+            self.assertIsNone(resident.host_slab)
+            self.assertEqual(allocations, [])
+            adapter = QSAHiSparseV3(runner, "offload")
+            self.assertEqual(allocations, [((12, 65536, 2048),
+                                           {"dtype": torch.uint8, "pin_memory": True})])
+            self.assertEqual(record.call_args.kwargs["allocation_phase"], "startup")
+            with patch.object(torch, "empty", side_effect=RuntimeError("pin failure")), \
+                    self.assertRaisesRegex(RuntimeError, "pin failure"):
+                QSAHiSparseV3(runner, "offload")
+
+        adapter.capacity = 2056
+        adapter.record = Mock()
+        events = []
+
+        def make_event(**kwargs):
+            event = Mock()
+            event.elapsed_time.return_value = 0.0
+            events.append(event)
+            return event
+
+        def drain():
+            # Active backing cannot be surrendered before consumer/copy drains.
+            self.assertIs(adapter.host, slab)
+            events[-1].synchronize.assert_called_once_with()
+
+        adapter.copy_stream.synchronize.side_effect = drain
+        with patch.object(torch.cuda, "Event", side_effect=make_event), \
+                patch.object(torch.cuda, "memory_allocated", return_value=0), \
+                patch.object(torch.cuda, "current_stream"), \
+                patch.object(torch.cuda, "stream", side_effect=lambda _: nullcontext()), \
+                patch.object(torch, "empty", side_effect=pinned_empty):
+            for generation in (1, 2):
+                adapter.owner, adapter.owner_rid, adapter.generation = 0, str(generation), generation
+                full.k_buffer = [torch.full((2056, 1, 256), generation, dtype=torch.uint8)]
+                full.v_buffer = [torch.full((2056, 1, 256), generation + 17, dtype=torch.uint8)]
+                adapter.handoff(2048)
+                self.assertIs(adapter.host, slab)
+                self.assertTrue(torch.all(slab[0, :512, :1024] == generation))
+                self.assertTrue(torch.all(slab[0, :512, 1024:] == generation + 17))
+                with self.assertRaisesRegex(RuntimeError, "unclaimed host slab"):
+                    adapter.handoff(2048)
+                adapter.seq_len = 2052
+                full.k_buffer[0][1:5].fill_(generation + 31)
+                full.v_buffer[0][1:5].fill_(generation + 53)
+                adapter.after_store(SimpleNamespace(layer_id=3))
+                # This fails if handoff leases only host_slab[:, :prompt_blocks].
+                self.assertTrue(torch.all(slab[0, 512, :1024] == generation + 31))
+                self.assertTrue(torch.all(slab[0, 512, 1024:] == generation + 53))
+                lease = adapter.release(0, str(generation))
+                self.assertIsNone(adapter.host)
+                self.assertIs(adapter.host_slab, slab)
+                adapter.after_release(lease)
+                self.assertIsNone(adapter.owner)
+            self.assertEqual(len(allocations), 1)
+            adapter.owner, adapter.failed = 0, True
+            with self.assertRaisesRegex(RuntimeError, "unclaimed host slab"):
+                adapter.handoff(2048)
+
     def test_light_observation_keeps_writeback_dependencies(self):
         for strict in (False, True):
             adapter = QSAHiSparseV3.__new__(QSAHiSparseV3)

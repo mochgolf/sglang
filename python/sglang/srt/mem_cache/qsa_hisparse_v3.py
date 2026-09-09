@@ -132,6 +132,7 @@ class QSAHiSparseV3:
         self.offloaded = False
         self.states = []
         self.host = None
+        self.host_slab = None
         self.decode_steps = 0
         self.seq_len = 0
         self.is_decode = False
@@ -145,7 +146,16 @@ class QSAHiSparseV3:
         if directory:
             Path(directory).mkdir(parents=True, exist_ok=True)
             self.path = Path(directory) / f"rank-{self.rank}.jsonl"
-        self.record("init")
+        # ponytail: one persistent slab for the guarded B1 adapter; P2 needs per-request leases.
+        host_alloc_start = time.monotonic()
+        if self.mode == "offload":
+            self.host_slab = torch.empty(
+                (12, (self.capacity + 3) // 4, self.ITEM),
+                dtype=torch.uint8, pin_memory=True,
+            )
+        self.record("init", allocation_phase="startup",
+                    host_alloc_wall_ms=(time.monotonic() - host_alloc_start) * 1000
+                    if self.mode == "offload" else 0.0)
 
     def record(self, event, **extra):
         if self.path is None or (not self.strict and event in (
@@ -153,6 +163,8 @@ class QSAHiSparseV3:
         )):
             return
         raw = sum(t.numel() * t.element_size() for t in self.full.k_buffer + self.full.v_buffer)
+        host_reserved = 0 if self.host_slab is None else self.host_slab.nbytes
+        host_active = 0 if self.host is None else self.host.nbytes
         row = {
             "event": event, "time_ns": time.time_ns(), "rank": self.rank,
             "mode": self.mode, "observe": self.observe, "generation": self.generation,
@@ -161,7 +173,10 @@ class QSAHiSparseV3:
             "decode_steps": self.decode_steps, "raw_bytes": raw,
             "index_bytes": self.pool.qsa_compressed_flat.numel() * 2,
             "index_storage_unchanged": self.index_ptr == self.pool.qsa_compressed_flat.data_ptr(),
-            "host_bytes": 0 if self.host is None else self.host.numel(),
+            "host_bytes": host_active,
+            "host_reserved_bytes": host_reserved,
+            "host_free_bytes": host_reserved - host_active,
+            "host_slab_ptr": None if self.host_slab is None else self.host_slab.data_ptr(),
             "hot_bytes": sum(s["hot"].numel() for s in self.states),
             "workspace_bytes": sum(
                 t.nbytes for name in ("indices", "gathered", "unpacked", "compact", "compact_table", "zero_req", "real", "ring_loc", "compressed_len")
@@ -248,14 +263,17 @@ class QSAHiSparseV3:
 
     @profile_method("qsa.handoff", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def handoff(self, prompt_len):
+        if (self.mode != "offload" or self.owner is None or self.failed or self.releasing
+                or self.host is not None or self.host_slab is None):
+            raise RuntimeError("QSA V3 handoff requires an unclaimed host slab and active lease")
         start_wall = time.monotonic()
         allocated_before = torch.cuda.memory_allocated(self.device)
         logical_available = self.runner.token_to_kv_pool_allocator.available_size()
         self.record("handoff_begin", prompt_len=prompt_len)
         blocks, tail = divmod(prompt_len, 4)
         with operations_nvtx_range("qsa.handoff.allocate_validate"):
-            self.host = torch.empty((12, (self.capacity + 3) // 4, self.ITEM),
-                                    dtype=torch.uint8, pin_memory=True)
+            # Keep append capacity for C4 blocks completed during decode.
+            self.host = self.host_slab
             slots = self.req_table[self.owner, :prompt_len].long()
             slots_cpu = slots.cpu()
             complete = slots_cpu[:blocks * 4].reshape(-1, 4)
