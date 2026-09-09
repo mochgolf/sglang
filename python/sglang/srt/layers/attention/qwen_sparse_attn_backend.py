@@ -1738,6 +1738,7 @@ class QwenSparseAttnBackend(AttentionBackend):
 
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = topk_indices.to(torch.int32).contiguous()
+        raw_topk_indices = topk_indices
         req_table = self.req_to_token_pool.req_to_token
         row_req_indices = (
             metadata.row_req_pool_indices
@@ -1745,8 +1746,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             else forward_batch.req_pool_indices
         )
         if self.hisparse_v3 is not None and self.hisparse_v3.offloaded:
-            k_buffer, v_buffer, req_table, row_req_indices = self.hisparse_v3.selected(
-                layer, topk_indices
+            k_buffer, v_buffer, req_table, row_req_indices, topk_indices = (
+                self.hisparse_v3.selected(layer, raw_topk_indices)
             )
         # Both V3 arms use the same FA2 decode implementation.
         trtllm_decode = None if self.hisparse_v3 is not None else _resolve_trtllm_sparse_decode()
@@ -1828,7 +1829,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
         if self.hisparse_v3 is not None:
             self.hisparse_v3.capture_decode(
-                layer, q, packed_k, packed_v, topk_indices, output, k_scale, v_scale,
+                layer, q, packed_k, packed_v, raw_topk_indices, output, k_scale, v_scale,
                 valid_counts, cu_seqlens_q, cu_seqlens_k,
             )
         return output.reshape(q.shape[0], -1)

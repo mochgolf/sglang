@@ -179,7 +179,7 @@ class QSAHiSparseV3:
             "host_slab_ptr": None if self.host_slab is None else self.host_slab.data_ptr(),
             "hot_bytes": sum(s["hot"].numel() for s in self.states),
             "workspace_bytes": sum(
-                t.nbytes for name in ("indices", "gathered", "unpacked", "compact", "compact_table", "zero_req", "real", "ring_loc", "compressed_len")
+                t.nbytes for name in ("indices", "gathered", "unpacked", "compact", "compact_table", "compact_topk", "zero_req", "real", "ring_loc", "compressed_len")
                 if (t := getattr(self, name, None)) is not None
             ),
             "mamba_bytes": sum(self.mamba_sizes),
@@ -331,7 +331,11 @@ class QSAHiSparseV3:
         self.gathered = torch.empty((512, 2048), dtype=torch.uint8, device=self.device)
         self.unpacked = torch.empty((2, 2048, 1, 256), dtype=torch.uint8, device=self.device)
         self.compact = torch.zeros((2, 2052, 1, 256), dtype=torch.uint8, device=self.device)
-        self.compact_table = torch.zeros((1, self.capacity), dtype=torch.int32, device=self.device)
+        # Local position i addresses compact slot i+1, leaving slot zero reserved.
+        self.compact_table = torch.arange(1, 2052, dtype=torch.int32, device=self.device)[None]
+        self.compact_topk = torch.arange(2051, dtype=torch.int32, device=self.device).repeat(4, 1)
+        for tail_phase in range(4):
+            self.compact_topk[tail_phase, 2048 + tail_phase:] = -1
         self.zero_req = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.real = torch.ones(1, dtype=torch.int32, device=self.device)
         self.ring_loc = torch.zeros(1, dtype=torch.int64, device=self.device)
@@ -426,8 +430,7 @@ class QSAHiSparseV3:
             if tail:
                 self.compact[0, 2049:2049 + tail].copy_(self.full.k_buffer[li][1:1 + tail].view(torch.uint8))
                 self.compact[1, 2049:2049 + tail].copy_(self.full.v_buffer[li][1:1 + tail].view(torch.uint8))
-            valid = raw_indices[0, :2048 + tail].long()
-            self.compact_table[0, valid] = torch.arange(1, 2049 + tail, dtype=torch.int32, device=self.device)
+        local_indices = self.compact_topk[tail:tail + 1]
         check = self.strict and (self.decode_steps in (1, 2, 3, 384, 767) or self.seq_len % 4 == 0)
         if check:
             ids = blocks[0].cpu().long()
@@ -450,14 +453,22 @@ class QSAHiSparseV3:
             for plane, source in ((0, self.full.k_buffer[li]), (1, self.full.v_buffer[li])):
                 if not torch.equal(self.compact[plane, 2049:2049 + tail].cpu(), source[1:1 + tail].view(torch.uint8).cpu()):
                     raise AssertionError("pending tail bytes differ")
-            if not torch.equal(self.compact_table[0, valid].cpu(), torch.arange(1, 2049 + tail, dtype=torch.int32)):
+            local_cpu = local_indices[0].cpu()
+            if not torch.equal(local_cpu, torch.cat((
+                torch.arange(2048 + tail, dtype=torch.int32),
+                torch.full((3 - tail,), -1, dtype=torch.int32),
+            ))):
+                raise AssertionError("compact local indices/mask differ")
+            if not torch.equal(self.compact_table[0, local_indices[0, :2048 + tail].long()].cpu(),
+                               torch.arange(1, 2049 + tail, dtype=torch.int32)):
                 raise AssertionError("compact physical mapping differs")
             self.record("selected_check", layer=layer.layer_id, bytes_checked=2048 * 512,
                         tail=tail, tail_bytes_checked=tail * 512, mapping_checked=True,
                         page_boundary=self.seq_len % 64 == 0,
                         latest_writeback_event_ms=(state["copy_begin"].elapsed_time(state["done"]) if state["done"] is not None else None),
                         writeback_bytes=state["writeback_bytes"], miss_count=int(state["miss_count"][0]))
-        return self.compact[0].view(self.pool.dtype), self.compact[1].view(self.pool.dtype), self.compact_table, self.zero_req
+        return (self.compact[0].view(self.pool.dtype), self.compact[1].view(self.pool.dtype),
+                self.compact_table, self.zero_req, local_indices)
 
     def release(self, req_idx, rid):
         if self.owner is None:
@@ -481,7 +492,7 @@ class QSAHiSparseV3:
         self.states.clear()
         self.host = None
         if self.offloaded:
-            for name in ("indices", "gathered", "unpacked", "compact", "compact_table", "zero_req", "real", "ring_loc", "compressed_len"):
+            for name in ("indices", "gathered", "unpacked", "compact", "compact_table", "compact_topk", "zero_req", "real", "ring_loc", "compressed_len"):
                 setattr(self, name, None)
         self.offloaded = False
         self.record("release", rid=rid, pending_events=0, terminal_wall_ms=terminal_ms, copy_drain_wall_ms=drain_ms)
