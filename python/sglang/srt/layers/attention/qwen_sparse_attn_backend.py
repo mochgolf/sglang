@@ -1822,6 +1822,11 @@ class QwenSparseAttnBackend(AttentionBackend):
             softmax_scale=layer.scaling,
             causal=True,
         )
+        if self.hisparse_v3 is not None:
+            self.hisparse_v3.capture_decode(
+                layer, q, packed_k, packed_v, topk_indices, output, k_scale, v_scale,
+                valid_counts, cu_seqlens_q, cu_seqlens_k,
+            )
         return output.reshape(q.shape[0], -1)
 
 

@@ -1,6 +1,8 @@
 """CPU checks for the actual V3 byte-layout helpers and startup guards."""
 
 import unittest
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import torch
@@ -15,6 +17,27 @@ from sglang.srt.mem_cache.qsa_hisparse_v3 import (
 
 
 class TestQSAHiSparseV3(unittest.TestCase):
+    def test_capture_uses_actual_consumer_length(self):
+        adapter = QSAHiSparseV3.__new__(QSAHiSparseV3)
+        adapter.decode_steps, adapter.seq_len = 1, 2049
+        adapter.layer_ids, adapter.capture_layers = [3], {}
+        adapter.owner_rid, adapter.generation, adapter.rank = "capture-check", 1, 0
+        q = torch.ones((1, 12, 256), dtype=torch.bfloat16)
+        packed = torch.zeros((2051, 1, 256), dtype=torch.bfloat16)
+        with tempfile.TemporaryDirectory() as directory:
+            adapter.capture_dir = Path(directory)
+            adapter.capture_decode(
+                SimpleNamespace(layer_id=3), q, packed, packed + 1,
+                torch.arange(2051)[None], q + 2, 0.5, 2.0,
+                torch.tensor([3]), torch.tensor([0, 1]), torch.tensor([0, 3]),
+            )
+            paths = list(adapter.capture_dir.glob("*.pt"))
+            saved = torch.load(paths[0], weights_only=True)["layers"][3]
+            # Observe cu_k, even if a bug makes it disagree with sequence-derived counts.
+            self.assertEqual(saved["k"].shape[0], 3)
+            self.assertTrue(torch.equal(saved["output"], q + 2))
+            self.assertEqual(saved["k_stride"], packed.stride())
+
     def test_layout_and_tail(self):
         # Independent raw source rows; neither expectation uses candidate indices.
         raw = torch.arange(2052 * 256, dtype=torch.int64).reshape(2052, 1, 256)
@@ -55,6 +78,7 @@ class TestQSAHiSparseV3(unittest.TestCase):
                                context_length=262144, max_total_tokens=262144,
                                chunked_prefill_size=2048, skip_server_warmup=True,
                                enable_deterministic_inference=True,
+                               random_seed=147342228,
                                speculative_algorithm=None,
                                disaggregation_mode="null")
         full = SimpleNamespace(use_hnd=False, kv_cache_layout="NHD",
@@ -69,6 +93,7 @@ class TestQSAHiSparseV3(unittest.TestCase):
                           ("max_total_tokens", 8192), ("chunked_prefill_size", 4096),
                           ("skip_server_warmup", False), ("enable_streaming_session", True),
                           ("enable_deterministic_inference", False),
+                          ("random_seed", 42),
                           ("speculative_algorithm", "NEXTN"), ("enable_hisparse", True)):
             changed = SimpleNamespace(**vars(args))
             setattr(changed, name, bad)
@@ -79,6 +104,9 @@ class TestQSAHiSparseV3(unittest.TestCase):
         adapter = QSAHiSparseV3.__new__(QSAHiSparseV3)
         adapter.owner, adapter.owner_rid, adapter.generation = 1, "B", 2
         adapter.releasing = False
+        adapter.pending_release = None
+        allocator = SimpleNamespace(free_group=None)
+        adapter.runner = SimpleNamespace(token_to_kv_pool_allocator=allocator)
         with self.assertRaises(RuntimeError):
             adapter.release(1, "A")
         adapter.releasing = True
@@ -89,6 +117,28 @@ class TestQSAHiSparseV3(unittest.TestCase):
         adapter.after_release((1, "B", 2))
         self.assertIsNone(adapter.owner)
         self.assertFalse(adapter.releasing)
+        # Exercise the real allocator flush: the lease stays held until free runs.
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+        adapter.owner, adapter.owner_rid, adapter.generation = 1, "C", 3
+        adapter.releasing = True
+        allocator = PagedTokenToKVPoolAllocator(
+            size=192, page_size=64, dtype=torch.uint8, device="cpu",
+            kvcache=SimpleNamespace(qsa_hisparse_v3=adapter), need_sort=True,
+        )
+        adapter.runner.token_to_kv_pool_allocator = allocator
+        events = []
+        adapter.record = lambda event: events.append((event, allocator.available_size()))
+        rows = allocator.alloc(128)
+        allocator.free_group_begin()
+        allocator.free(rows[:64])
+        allocator.free_segment(rows[64:], start_pos=64)
+        adapter.after_release((1, "C", 3))
+        self.assertEqual(adapter.owner_rid, "C")
+        self.assertEqual(allocator.available_size(), 64)
+        allocator.free_group_end()
+        self.assertEqual(events[-1], ("logical_release_complete", 192))
+        self.assertIsNone(adapter.owner)
 
 
 if __name__ == "__main__":

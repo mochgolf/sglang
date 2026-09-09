@@ -49,6 +49,7 @@ def validate_configuration(args, pool):
         "chunked_prefill_size": 2048,
         "skip_server_warmup": True,
         "enable_deterministic_inference": True,
+        "random_seed": 147342228,
         "speculative_algorithm": None,
         "disaggregation_mode": "null",
     }
@@ -93,6 +94,10 @@ class QSAHiSparseV3:
 
         if type(self.full) is not MHATokenToKVPool or getattr(runner, "_unified_memory_pool", None) is not None:
             raise ValueError("QSA V3 requires independently owned plain MHA backing")
+        from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
+
+        if type(runner.token_to_kv_pool_allocator) is not PagedTokenToKVPoolAllocator:
+            raise ValueError("QSA V3 requires the ordinary paged logical allocator")
         self.req_table = runner.req_to_token_pool.req_to_token
         self.capacity = min(self.pool.size, self.req_table.shape[1])
         if self.capacity != 262144:
@@ -105,6 +110,12 @@ class QSAHiSparseV3:
         self.seen_rids = set()
         self.failed = False
         self.releasing = False
+        self.pending_release = None
+        capture = os.environ.get("SGLANG_QSA_HISPARSE_V3_CAPTURE")
+        self.capture_dir = Path(capture) if capture else None
+        self.capture_layers = {}
+        if self.capture_dir is not None:
+            self.capture_dir.mkdir(parents=True, exist_ok=True)
         self.generation = 0
         self.offloaded = False
         self.states = []
@@ -431,6 +442,35 @@ class QSAHiSparseV3:
             return
         if not self.releasing or lease != (self.owner, self.owner_rid, self.generation):
             raise RuntimeError("stale QSA V3 release commit")
+        if self.runner.token_to_kv_pool_allocator.free_group is not None:
+            self.pending_release = lease
+            self.record("logical_release_pending")
+            return
         self.record("logical_release_complete")
+        self.pending_release = None
         self.owner = self.owner_rid = None
         self.releasing = False
+
+    def capture_decode(self, layer, q, packed_k, packed_v, raw_indices, output, k_scale, v_scale,
+                       valid_counts, cu_seqlens_q, cu_seqlens_k):
+        """Bounded, opt-in evidence for execution-01's exact output mismatch."""
+        if self.capture_dir is None or self.decode_steps > 127:
+            return
+        row = {"q": q.detach().cpu(), "output": output.detach().cpu(),
+               "indices": raw_indices.detach().cpu(), "k_scale": k_scale, "v_scale": v_scale,
+               "valid_counts": valid_counts.cpu(), "cu_q": cu_seqlens_q.cpu(), "cu_k": cu_seqlens_k.cpu(),
+               "q_stride": q.stride(), "k_shape": packed_k.shape, "k_stride": packed_k.stride(),
+               "v_shape": packed_v.shape, "v_stride": packed_v.stride()}
+        if self.decode_steps in (1, 2, 93, 94):
+            valid = int(row["cu_k"][-1])
+            row["k"] = packed_k[:valid].detach().cpu()
+            row["v"] = packed_v[:valid].detach().cpu()
+        self.capture_layers[layer.layer_id] = row
+        if layer.layer_id == self.layer_ids[-1]:
+            torch.save(
+                {"rid": self.owner_rid, "generation": self.generation,
+                 "rank": self.rank, "step": self.decode_steps, "seq_len": self.seq_len,
+                 "layers": self.capture_layers},
+                self.capture_dir / f"gen-{self.generation}-step-{self.decode_steps:04d}-rank-{self.rank}.pt",
+            )
+            self.capture_layers = {}
