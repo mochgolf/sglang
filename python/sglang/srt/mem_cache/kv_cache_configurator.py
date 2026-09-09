@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -1829,6 +1830,23 @@ class KVCacheConfigurator:
                 qsa_token_topk=qsa_profile.budget,
                 num_request_slots=req_to_token_pool.req_to_token.shape[0],
             )
+            if os.environ.get("SGLANG_QSA_HISPARSE_V3") == "p2-offload":
+                from sglang.srt.mem_cache.qsa_hisparse_slots import QSAHiSparseSlots
+
+                if (max_total_num_tokens != 524288 or max_running_requests != 2
+                        or full_pool_class is not MHATokenToKVPool
+                        or self.pool_page_size != 64 or quant_method is not None
+                        or self.post_capture_kv_active or self.use_mla_backend):
+                    raise ValueError("QSA P2 requires B2 logical capacity and plain static MHA staging")
+                slots = QSAHiSparseSlots(262144, 64, 2)
+                extra_args["full_kv_pool"] = MHATokenToKVPool(
+                    size=slots.raw_pool_size, page_size=64, dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        get_parallel().attn_tp_size, get_parallel().attn_dcp_size),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=len(full_attention_layer_ids), device=self.device,
+                    enable_memory_saver=get_exec().features.enable_memory_saver,
+                )
         token_to_kv_pool = pool_class(
             page_size=self.pool_page_size,
             size=max_total_num_tokens,

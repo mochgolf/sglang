@@ -1162,6 +1162,11 @@ class ModelRunner:
         self.kv_index_translator.bind_and_verify_backends(
             [self.attn_backend, self.decode_attn_backend]
         )
+        qsa = getattr(self.token_to_kv_pool, "qsa_hisparse_v3", None)
+        if getattr(qsa, "is_qsa_p2", False):
+            from sglang.srt.mem_cache.qsa_hisparse_p2 import QSAHiSparseCoordinator
+
+            self.hisparse_coordinator = QSAHiSparseCoordinator(qsa, self.tp_group.cpu_group)
 
         if get_parallel().dcp_enabled and get_parallel().dcp_replicate_q_proj:
             self._prepare_replicated_q_proj()

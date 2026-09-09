@@ -256,9 +256,13 @@ class QwenSparseAttnBackend(AttentionBackend):
         if runner is not None and os.environ.get("SGLANG_QSA_HISPARSE_V3"):
             from sglang.srt.mem_cache.qsa_hisparse_v3 import QSAHiSparseV3
 
-            self.hisparse_v3 = QSAHiSparseV3(
-                runner, os.environ["SGLANG_QSA_HISPARSE_V3"]
-            )
+            mode = os.environ["SGLANG_QSA_HISPARSE_V3"]
+            if mode in ("p2-offload", "p2-resident"):
+                from sglang.srt.mem_cache.qsa_hisparse_p2 import QSAHiSparseP2
+
+                self.hisparse_v3 = QSAHiSparseP2(runner, mode)
+            else:
+                self.hisparse_v3 = QSAHiSparseV3(runner, mode)
             self.token_to_kv_pool.qsa_hisparse_v3 = self.hisparse_v3
         self._trtllm_workspace = None
         self._graph_extend_lens = None
@@ -278,8 +282,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
 
     def _store_kv(self, layer, loc, k: torch.Tensor, v: torch.Tensor) -> None:
-        if self.hisparse_v3 is not None and self.hisparse_v3.offloaded:
-            loc = self.hisparse_v3.ring_loc
+        if self.hisparse_v3 is not None:
+            loc = self.hisparse_v3.write_locations(loc)
         cache_dtype = getattr(self.token_to_kv_pool, "dtype", k.dtype)
         if not is_fp8_kv_dtype(cache_dtype):
             self.token_to_kv_pool.set_kv_buffer(layer, loc, k, v)
@@ -1525,16 +1529,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             scale_kwargs = {"k_scale": k_scale, "v_scale": v_scale}
         req_to_token = self.req_to_token_pool.req_to_token
         req_indices = forward_batch.req_pool_indices.tolist()
+        raw_slots = [
+            self.hisparse_v3.prefill_slots(req_indices[i], sequence_lens[i])
+            if self.hisparse_v3 is not None
+            else req_to_token[req_indices[i], :sequence_lens[i]].long()
+            for i in range(len(sequence_lens))
+        ]
         k_parts = [
-            k_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
+            k_buffer.index_select(0, raw_slots[i])
             for i in range(len(sequence_lens))
         ]
         v_parts = [
-            v_buffer.index_select(
-                0, req_to_token[req_indices[i], : sequence_lens[i]].long()
-            )
+            v_buffer.index_select(0, raw_slots[i])
             for i in range(len(sequence_lens))
         ]
         sequence_lens_tensor = torch.tensor(

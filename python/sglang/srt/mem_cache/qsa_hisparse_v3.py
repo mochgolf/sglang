@@ -41,9 +41,9 @@ def stage_short_prefix(hot, tokens, records):
         tokens[0, :count] = torch.arange(count, dtype=torch.int32, device=hot.device)
 
 
-def validate_configuration(args, pool):
+def validate_configuration(args, pool, *, p2=False):
     required = {
-        "max_running_requests": 1,
+        "max_running_requests": 2 if p2 else 1,
         "tp_size": 2,
         "pp_size": 1,
         "disable_radix_cache": True,
@@ -51,7 +51,7 @@ def validate_configuration(args, pool):
         "cuda_graph_backend_decode": "disabled",
         "cuda_graph_backend_prefill": "disabled",
         "context_length": 262144,
-        "max_total_tokens": 262144,
+        "max_total_tokens": 524288 if p2 else 262144,
         "chunked_prefill_size": 2048,
         "skip_server_warmup": True,
         "enable_deterministic_inference": True,
@@ -70,7 +70,7 @@ def validate_configuration(args, pool):
     )):
         raise ValueError("QSA V3 does not support DP/overlap")
     full = pool.full_kv_pool
-    if (pool.size != 262144 or pool.page_size != 64 or pool.qsa_compress_ratio != 4
+    if (pool.size != (524288 if p2 else 262144) or pool.page_size != 64 or pool.qsa_compress_ratio != 4
             or pool.qsa_token_topk != 2048 or pool.full_layer_nums != 12
             or pool.head_num != 1 or pool.head_dim != 256
             or pool.dtype != torch.float8_e4m3fn
@@ -81,6 +81,12 @@ def validate_configuration(args, pool):
 
 class QSAHiSparseV3:
     HOT, PAGE, ITEM, TOPK = 2048, 64, 2048, 512
+
+    def write_locations(self, logical_locs):
+        return self.ring_loc if self.offloaded else logical_locs
+
+    def prefill_slots(self, req_idx, seq_len):
+        return self.req_table[req_idx, :seq_len].long()
 
     def __init__(self, runner, mode):
         if mode not in ("resident", "offload"):
@@ -427,7 +433,8 @@ class QSAHiSparseV3:
                 self.compact[0, 2049:2049 + tail].copy_(self.full.k_buffer[li][1:1 + tail].view(torch.uint8))
                 self.compact[1, 2049:2049 + tail].copy_(self.full.v_buffer[li][1:1 + tail].view(torch.uint8))
             valid = raw_indices[0, :2048 + tail].long()
-            self.compact_table[0, valid] = torch.arange(1, 2049 + tail, dtype=torch.int32, device=self.device)
+            base = getattr(self, "compact_base", 0)
+            self.compact_table[0, valid] = torch.arange(1 + base, 2049 + tail + base, dtype=torch.int32, device=self.device)
         check = self.strict and (self.decode_steps in (1, 2, 3, 384, 767) or self.seq_len % 4 == 0)
         if check:
             ids = blocks[0].cpu().long()
@@ -450,7 +457,7 @@ class QSAHiSparseV3:
             for plane, source in ((0, self.full.k_buffer[li]), (1, self.full.v_buffer[li])):
                 if not torch.equal(self.compact[plane, 2049:2049 + tail].cpu(), source[1:1 + tail].view(torch.uint8).cpu()):
                     raise AssertionError("pending tail bytes differ")
-            if not torch.equal(self.compact_table[0, valid].cpu(), torch.arange(1, 2049 + tail, dtype=torch.int32)):
+            if not torch.equal(self.compact_table[0, valid].cpu(), torch.arange(1 + base, 2049 + tail + base, dtype=torch.int32)):
                 raise AssertionError("compact physical mapping differs")
             self.record("selected_check", layer=layer.layer_id, bytes_checked=2048 * 512,
                         tail=tail, tail_bytes_checked=tail * 512, mapping_checked=True,

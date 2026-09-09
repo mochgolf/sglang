@@ -336,7 +336,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             # the no-double-free contract can only break across a group's calls
             self._debug_check_no_duplicate_pages()
         adapter = getattr(self.get_kvcache(), "qsa_hisparse_v3", None)
-        if adapter is not None and adapter.pending_release is not None:
+        if getattr(adapter, "is_qsa_p2", False):
+            adapter.after_logical_flush()
+        elif adapter is not None and adapter.pending_release is not None:
             adapter.after_release(adapter.pending_release)
 
     def clear(self):
