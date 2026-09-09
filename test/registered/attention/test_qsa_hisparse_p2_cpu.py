@@ -49,6 +49,10 @@ class TestQSAHiSparseP2(unittest.TestCase):
             "cpu", False, enable_alt_stream=False,
         )
         a.req_pool = ReqToTokenPool(2, a.capacity, "cpu", False)
+        # Native mapping-shaped CPU tensors; this scenario checks observation,
+        # not Mamba allocation or state numerics (those require the live model).
+        a.req_pool.enable_mamba_extra_buffer = False
+        a.req_pool.req_index_to_mamba_index_mapping = torch.tensor([0, 7, 9])
         a.req_table = a.req_pool.req_to_token
         a.pool = QSATokenToKVPool(
             size=2 * a.capacity, dtype=torch.float8_e4m3fn, page_size=64,
@@ -179,8 +183,36 @@ class TestQSAHiSparseP2(unittest.TestCase):
             self.assertEqual(coord.collect_ready_reqs(), [req_a, req_b])
             self.assertFalse(coord.wait_initial_pair)
 
+            state_b = a.requests[req_b.kv.req_pool_idx]
+            a.req_pool.req_index_to_mamba_index_mapping[req_b.kv.req_pool_idx] = 9
+            native = a.native_lease_snapshot(state_b, include_pages=True)
+            self.assertEqual(native["logical_row_ptr"], a.req_table[req_b.kv.req_pool_idx].data_ptr())
+            self.assertEqual(native["logical_page_ids"], (br[:2050:64] // 64).tolist())
+            self.assertEqual(native["mamba_pool_idx"], 9)
+            self.assertFalse(native["mamba_extra_buffer_enabled"])
+            self.assertEqual(native["mamba_track_slots"], [])
+            # Same backing pointer does not imply an unchanged native mapping.
+            a.req_table[req_b.kv.req_pool_idx, 0] = ar[0]
+            a.req_pool.req_index_to_mamba_index_mapping[req_b.kv.req_pool_idx] = 7
+            changed = a.native_lease_snapshot(state_b, include_pages=True)
+            self.assertEqual(changed["logical_row_ptr"], native["logical_row_ptr"])
+            self.assertNotEqual(changed["logical_page_ids"], native["logical_page_ids"])
+            self.assertNotEqual(changed["mamba_pool_idx"], native["mamba_pool_idx"])
+            a.req_table[req_b.kv.req_pool_idx, 0] = br[0] + 1
+            with self.assertRaisesRegex(RuntimeError, "not aligned"):
+                a.native_lease_snapshot(state_b, include_pages=True)
+            a.req_table[req_b.kv.req_pool_idx, 0] = br[0]
+            a.req_pool.req_index_to_mamba_index_mapping[req_b.kv.req_pool_idx] = 9
+            a.req_pool.enable_mamba_extra_buffer = True
+            a.req_pool.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.tensor([[0], [11], [13]])
+            a.req_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[req_b.kv.req_pool_idx] = 13
+            self.assertEqual(a.native_lease_snapshot(state_b)["mamba_track_slots"], [13])
+            a.req_pool.enable_mamba_extra_buffer = False
+
             a_steps = a.requests[req_a.kv.req_pool_idx].decode_steps
             a.req_pool.req_generation[req_b.kv.req_pool_idx] += 1
+            with self.assertRaisesRegex(RuntimeError, "stale native"):
+                a.native_lease_snapshot(state_b)
             with self.assertRaisesRegex(RuntimeError, "generation changed"):
                 a.begin_batch(batch([row(req_a, 2050), row(req_b, 2051)], True))
             self.assertEqual(a.requests[req_a.kv.req_pool_idx].decode_steps, a_steps)

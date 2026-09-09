@@ -137,6 +137,31 @@ class QSAHiSparseP2:
                               self.compact_table, self.zero_req, self.real, self.compressed_lens]
         self.record("init", allocation_phase="startup", host_alloc_wall_ms=host_alloc_wall_ms)
 
+    def native_lease_snapshot(self, state, *, include_pages=False):
+        lease = state.lease
+        self.slots.require(lease)
+        idx = lease.req_pool_idx
+        if int(self.req_pool.req_generation[idx]) != lease.generation:
+            raise RuntimeError("QSA P2 snapshot has a stale native request generation")
+        extra_buffer = self.req_pool.enable_mamba_extra_buffer
+        snapshot = {
+            "logical_row_ptr": self.req_table[idx].data_ptr(),
+            "mamba_pool_idx": int(self.req_pool.req_index_to_mamba_index_mapping[idx]),
+            "mamba_extra_buffer_enabled": extra_buffer,
+            "mamba_track_slots": (
+                self.req_pool.req_index_to_mamba_ping_pong_track_buffer_mapping[idx].tolist()
+                if extra_buffer else []),
+        }
+        if include_pages:
+            # Decode-boundary evidence only: read current native page identities,
+            # not a saved pointer or a second allocator's shadow mapping.
+            starts = self.req_table[idx, :state.seq_len:self.slots.page_size].cpu()
+            if torch.any(starts % self.slots.page_size):
+                raise RuntimeError("QSA P2 logical page start is not aligned")
+            snapshot.update(logical_seq_len=state.seq_len,
+                            logical_page_ids=(starts // self.slots.page_size).tolist())
+        return snapshot
+
     def record(self, event, lease=None, **extra):
         if self.path is None:
             return
@@ -170,6 +195,7 @@ class QSAHiSparseP2:
             "leases": [{"req_pool_idx": s.lease.req_pool_idx, "generation": s.lease.generation,
                         "rid": s.lease.rid, "slot": s.lease.slot,
                         "phase": self.slots.phases[s.lease.req_pool_idx],
+                        **self.native_lease_snapshot(s, include_pages=event in ("handoff_complete", "decode_batch")),
                         "host_ptr": None if s.host is None else s.host.data_ptr(),
                         "hot_ptrs": [x["hot"].data_ptr() for x in s.states],
                         "ring_k_ptrs": [x.data_ptr() for x in s.full.k_buffer],
