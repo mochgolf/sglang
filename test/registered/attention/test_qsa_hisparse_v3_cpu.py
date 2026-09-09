@@ -17,6 +17,33 @@ from sglang.srt.mem_cache.qsa_hisparse_v3 import (
 
 
 class TestQSAHiSparseV3(unittest.TestCase):
+    def test_decode_ring_preserves_writer_padding(self):
+        adapter = QSAHiSparseV3.__new__(QSAHiSparseV3)
+        adapter.failed = adapter.releasing = False
+        adapter.owner, adapter.owner_rid = 0, "ring-check"
+        adapter.mode, adapter.offloaded = "offload", True
+        adapter.decode_steps = 0
+        adapter.ring_loc = torch.zeros(1, dtype=torch.int64)
+        adapter.compressed_len = torch.zeros(1, dtype=torch.int32)
+        adapter.record = lambda *args, **kwargs: None
+        mode = SimpleNamespace(is_idle=lambda: False, is_decode=lambda: True)
+        ring = torch.zeros(5, dtype=torch.int64)
+        for position in range(261120, 261128):
+            batch = SimpleNamespace(forward_mode=mode, batch_size=1,
+                                    req_pool_indices=torch.tensor([0]),
+                                    rids=["ring-check"], seq_lens=torch.tensor([position + 1]))
+            adapter.begin_batch(batch)
+            slot = int(adapter.ring_loc[0])
+            # The real CUDA writer's reserved_skip_index defaults to zero.
+            self.assertIn(slot, (1, 2, 3, 4))
+            ring[slot] = position
+            tail = (position + 1) % 4
+            count = tail or 4
+            self.assertEqual(ring[1:1 + count].tolist(),
+                             list(range(position + 1 - count, position + 1)))
+            self.assertEqual(int(ring[0]), 0)
+        self.assertEqual(adapter.decode_steps, 8)
+
     def test_capture_uses_actual_consumer_length(self):
         adapter = QSAHiSparseV3.__new__(QSAHiSparseV3)
         adapter.decode_steps, adapter.seq_len = 1, 2049

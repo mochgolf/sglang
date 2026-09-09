@@ -225,7 +225,7 @@ class QSAHiSparseV3:
                 self.record("resident_boundary", prompt_len=seq - 1)
             self.decode_steps += 1
             if self.offloaded:
-                self.ring_loc.fill_((seq - 1) % 4)
+                self.ring_loc.fill_(1 + (seq - 1) % 4)
                 self.compressed_len.fill_(seq // 4)
             self.record("decode_step")
         else:
@@ -271,11 +271,12 @@ class QSAHiSparseV3:
                     raise AssertionError("handoff K bytes differ")
                 if not torch.equal(dst[:, 1024:].reshape(-1, 1, 256), vb.cpu()):
                     raise AssertionError("handoff V bytes differ")
-            ring_k = torch.zeros((4, 1, 256), dtype=k.dtype, device=self.device)
+            # The existing store_cache writer skips reserved padding slot 0.
+            ring_k = torch.zeros((5, 1, 256), dtype=k.dtype, device=self.device)
             ring_v = torch.zeros_like(ring_k)
             if tail:
-                ring_k[:tail].copy_(k.view(torch.uint8).index_select(0, slots[-tail:]).view(k.dtype))
-                ring_v[:tail].copy_(v.view(torch.uint8).index_select(0, slots[-tail:]).view(v.dtype))
+                ring_k[1:1 + tail].copy_(k.view(torch.uint8).index_select(0, slots[-tail:]).view(k.dtype))
+                ring_v[1:1 + tail].copy_(v.view(torch.uint8).index_select(0, slots[-tail:]).view(v.dtype))
             state = self.make_state()
             stage_short_prefix(state["hot"], state["tokens"], self.host[li, :blocks])
             state["hot"][self.HOT].copy_(self.host[li, blocks - 1], non_blocking=True)
@@ -332,8 +333,8 @@ class QSAHiSparseV3:
         if state["done"] is not None:
             torch.cuda.current_stream(self.device).wait_event(state["done"])
         hot = state["hot"][self.HOT]
-        hot[:1024].copy_(self.full.k_buffer[li].view(torch.uint8).reshape(-1))
-        hot[1024:].copy_(self.full.v_buffer[li].view(torch.uint8).reshape(-1))
+        hot[:1024].copy_(self.full.k_buffer[li][1:5].view(torch.uint8).reshape(-1))
+        hot[1024:].copy_(self.full.v_buffer[li][1:5].view(torch.uint8).reshape(-1))
         block = self.seq_len // 4 - 1
         if block < self.HOT:
             state["hot"][block].copy_(hot)
@@ -374,8 +375,8 @@ class QSAHiSparseV3:
         self.compact[:, 1:2049].copy_(self.unpacked)
         tail = self.seq_len % 4
         if tail:
-            self.compact[0, 2049:2049 + tail].copy_(self.full.k_buffer[li][:tail].view(torch.uint8))
-            self.compact[1, 2049:2049 + tail].copy_(self.full.v_buffer[li][:tail].view(torch.uint8))
+            self.compact[0, 2049:2049 + tail].copy_(self.full.k_buffer[li][1:1 + tail].view(torch.uint8))
+            self.compact[1, 2049:2049 + tail].copy_(self.full.v_buffer[li][1:1 + tail].view(torch.uint8))
         valid = raw_indices[0, :2048 + tail].long()
         self.compact_table[0, valid] = torch.arange(1, 2049 + tail, dtype=torch.int32, device=self.device)
         check = self.decode_steps in (1, 2, 3, 384, 767) or self.seq_len % 4 == 0
@@ -398,7 +399,7 @@ class QSAHiSparseV3:
             ))):
                 raise AssertionError("pending tail indices/mask differ")
             for plane, source in ((0, self.full.k_buffer[li]), (1, self.full.v_buffer[li])):
-                if not torch.equal(self.compact[plane, 2049:2049 + tail].cpu(), source[:tail].view(torch.uint8).cpu()):
+                if not torch.equal(self.compact[plane, 2049:2049 + tail].cpu(), source[1:1 + tail].view(torch.uint8).cpu()):
                     raise AssertionError("pending tail bytes differ")
             if not torch.equal(self.compact_table[0, valid].cpu(), torch.arange(1, 2049 + tail, dtype=torch.int32)):
                 raise AssertionError("compact physical mapping differs")
