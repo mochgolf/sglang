@@ -88,6 +88,7 @@ class TestQSAHiSparseP2(unittest.TestCase):
                 batch_size=len(rows), req_pool_indices_cpu=indices,
                 req_pool_indices=indices, rids=[r.req.rid for r in rows],
                 seq_lens_cpu=torch.tensor([r.seq for r in rows]),
+                seq_lens=torch.tensor([r.seq for r in rows]),
                 extend_seq_lens_cpu=[extend] if extend is not None else None,
                 forward_mode=SimpleNamespace(is_idle=lambda: False,
                     is_decode=lambda: decode, is_extend=lambda: not decode),
@@ -159,6 +160,13 @@ class TestQSAHiSparseP2(unittest.TestCase):
                     self.assertRaisesRegex(RuntimeError, "identities"):
                 coord.collect_ready_reqs()
             self.assertEqual(coord.collect_ready_reqs(), [req_b])
+
+            a_steps = a.requests[req_a.kv.req_pool_idx].decode_steps
+            a.req_pool.req_generation[req_b.kv.req_pool_idx] += 1
+            with self.assertRaisesRegex(RuntimeError, "generation changed"):
+                a.begin_batch(batch([row(req_a, 2050), row(req_b, 2051)], True))
+            self.assertEqual(a.requests[req_a.kv.req_pool_idx].decode_steps, a_steps)
+            a.req_pool.req_generation[req_b.kv.req_pool_idx] -= 1
 
             for seq_a, seq_b in ((2050, 2051), (2051, 2052), (2052, 2053), (2053, 2054)):
                 rows = [row(req_b, seq_b), row(req_a, seq_a)]

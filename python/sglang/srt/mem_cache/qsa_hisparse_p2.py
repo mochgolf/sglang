@@ -202,10 +202,10 @@ class QSAHiSparseP2:
         seq_lens = batch.seq_lens_cpu.tolist()
         if len(req_indices) != batch.batch_size or len(seq_lens) != batch.batch_size or len(set(req_indices)) != len(req_indices):
             raise RuntimeError("QSA P2 batch metadata aliases or pads requests")
-        if self.strict and batch.req_pool_indices.cpu().tolist() != req_indices:
-            raise RuntimeError("QSA P2 CPU/GPU request rows differ")
-        self.forward_id += 1
-        self.batch_requests = []
+        if self.strict and (batch.req_pool_indices.cpu().tolist() != req_indices
+                            or batch.seq_lens.cpu().tolist() != seq_lens):
+            raise RuntimeError("QSA P2 CPU/GPU row identities or lengths differ")
+        states = []
         for req_idx, rid, seq in zip(req_indices, batch.rids, seq_lens):
             if not 1 <= seq <= self.capacity:
                 raise ValueError("QSA P2 request exceeds context capacity")
@@ -218,12 +218,16 @@ class QSAHiSparseP2:
                 self.record("begin_prefill", lease)
             state = self._request(req_idx, rid)
             self.slots.require(state.lease, "decode" if decode else "prefill")
+            states.append(state)
+        # Validate the entire batch before advancing either request's decode state.
+        self.forward_id += 1
+        self.batch_requests = states
+        for state, seq in zip(states, seq_lens):
             state.seq_len = seq
             if decode:
                 state.decode_steps += 1
                 if state.host is not None:
                     state.compressed_len.fill_(seq // 4)
-            self.batch_requests.append(state)
         self.offloaded = decode and self.mode == "p2-offload"
         if self.mode == "p2-offload":
             if decode:
