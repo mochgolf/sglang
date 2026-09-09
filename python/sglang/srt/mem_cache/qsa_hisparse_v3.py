@@ -13,6 +13,12 @@ from pathlib import Path
 
 import torch
 
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_OPERATIONS_ENABLED,
+    operations_nvtx_range,
+    profile_method,
+)
+
 
 def pack_c4(k, v):
     """Pack complete raw byte rows; also used by the CPU layout check."""
@@ -174,6 +180,7 @@ class QSAHiSparseV3:
         with self.path.open("a") as stream:
             stream.write(json.dumps(row) + "\n")
 
+    @profile_method("qsa.batch_metadata", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def begin_batch(self, batch):
         if self.failed or self.releasing:
             raise RuntimeError("QSA V3 cannot serve a failed/releasing lease")
@@ -239,21 +246,23 @@ class QSAHiSparseV3:
         else:
             self.record("prefill_step")
 
+    @profile_method("qsa.handoff", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def handoff(self, prompt_len):
         start_wall = time.monotonic()
         allocated_before = torch.cuda.memory_allocated(self.device)
         logical_available = self.runner.token_to_kv_pool_allocator.available_size()
         self.record("handoff_begin", prompt_len=prompt_len)
         blocks, tail = divmod(prompt_len, 4)
-        self.host = torch.empty((12, (self.capacity + 3) // 4, self.ITEM),
-                                dtype=torch.uint8, pin_memory=True)
-        slots = self.req_table[self.owner, :prompt_len].long()
-        slots_cpu = slots.cpu()
-        complete = slots_cpu[:blocks * 4].reshape(-1, 4)
-        if not torch.equal(complete, complete[:, :1] + torch.arange(4)):
-            raise RuntimeError("C4 physical source members are not contiguous")
-        if len(torch.unique(slots_cpu)) != prompt_len:
-            raise RuntimeError("prefill physical slots alias")
+        with operations_nvtx_range("qsa.handoff.allocate_validate"):
+            self.host = torch.empty((12, (self.capacity + 3) // 4, self.ITEM),
+                                    dtype=torch.uint8, pin_memory=True)
+            slots = self.req_table[self.owner, :prompt_len].long()
+            slots_cpu = slots.cpu()
+            complete = slots_cpu[:blocks * 4].reshape(-1, 4)
+            if not torch.equal(complete, complete[:, :1] + torch.arange(4)):
+                raise RuntimeError("C4 physical source members are not contiguous")
+            if len(torch.unique(slots_cpu)) != prompt_len:
+                raise RuntimeError("prefill physical slots alias")
         for li, lid in enumerate(self.layer_ids):
             copy_ms = 0.0
             k, v = self.full.k_buffer[li], self.full.v_buffer[li]
@@ -261,18 +270,21 @@ class QSAHiSparseV3:
             for offset in range(0, blocks * 4, 4096):
                 stop = min(offset + 4096, blocks * 4)
                 src = slots[offset:stop]
-                kb = k.view(torch.uint8).index_select(0, src)
-                vb = v.view(torch.uint8).index_select(0, src)
-                packed = pack_c4(kb, vb)
+                with operations_nvtx_range("qsa.handoff.gather_pack"):
+                    kb = k.view(torch.uint8).index_select(0, src)
+                    vb = v.view(torch.uint8).index_select(0, src)
+                    packed = pack_c4(kb, vb)
                 producer, copy_begin, done = torch.cuda.Event(), torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                 producer.record()
                 dst = self.host[li, offset // 4:stop // 4]
-                with torch.cuda.stream(self.copy_stream):
-                    self.copy_stream.wait_event(producer)
-                    copy_begin.record(self.copy_stream)
-                    dst.copy_(packed, non_blocking=True)
-                    done.record(self.copy_stream)
-                done.synchronize()
+                with operations_nvtx_range("qsa.handoff.d2h_submit"):
+                    with torch.cuda.stream(self.copy_stream):
+                        self.copy_stream.wait_event(producer)
+                        copy_begin.record(self.copy_stream)
+                        dst.copy_(packed, non_blocking=True)
+                        done.record(self.copy_stream)
+                with operations_nvtx_range("qsa.handoff.wait_copy"):
+                    done.synchronize()
                 copy_ms += copy_begin.elapsed_time(done)
                 # Independent source slices, not unpacking the candidate pack.
                 if self.strict:
@@ -315,6 +327,7 @@ class QSAHiSparseV3:
                     allocated_drop_bytes=allocated_before - torch.cuda.memory_allocated(self.device),
                     pending_tail=tail, logical_lease_preserved=True)
 
+    @profile_method("qsa.state_allocate", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def make_state(self):
         physical = self.HOT + self.PAGE
         return {
@@ -332,6 +345,7 @@ class QSAHiSparseV3:
             "writeback_bytes": 0,
         }
 
+    @profile_method("qsa.writeback", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def after_store(self, layer):
         if not self.offloaded or self.seq_len % 4:
             return
@@ -363,6 +377,7 @@ class QSAHiSparseV3:
         state["copy_begin"] = copy_begin
         state["writeback_bytes"] += self.ITEM
 
+    @profile_method("qsa.selected", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def selected(self, layer, raw_indices):
         from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_mla
 
@@ -374,23 +389,27 @@ class QSAHiSparseV3:
             raise RuntimeError("stale QSA V3 selected state")
         if state["done"] is not None:
             torch.cuda.current_stream(self.device).wait_event(state["done"])
-        blocks = (raw_indices[:, :2048:4] // 4).to(torch.int32).contiguous()
-        load_cache_to_device_buffer_mla(
-            blocks, state["tokens"], state["host_locs"], state["device_locs"],
-            self.host[li], state["hot"], state["out"], self.zero_req.long(),
-            self.compressed_len, state["lru"], 2048, 512, 2048, 64, 1024,
-            self.real, state["miss_src"], state["miss_dst"], state["miss_count"],
-        )
-        torch.index_select(state["hot"], 0, state["out"].reshape(-1).long(), out=self.gathered)
-        torch.index_select(self.gathered.view(-1, 256), 0, self.indices,
-                           out=self.unpacked.view(-1, 256))
-        self.compact[:, 1:2049].copy_(self.unpacked)
-        tail = self.seq_len % 4
-        if tail:
-            self.compact[0, 2049:2049 + tail].copy_(self.full.k_buffer[li][1:1 + tail].view(torch.uint8))
-            self.compact[1, 2049:2049 + tail].copy_(self.full.v_buffer[li][1:1 + tail].view(torch.uint8))
-        valid = raw_indices[0, :2048 + tail].long()
-        self.compact_table[0, valid] = torch.arange(1, 2049 + tail, dtype=torch.int32, device=self.device)
+        with operations_nvtx_range("qsa.resolve_refetch"):
+            blocks = (raw_indices[:, :2048:4] // 4).to(torch.int32).contiguous()
+            load_cache_to_device_buffer_mla(
+                blocks, state["tokens"], state["host_locs"], state["device_locs"],
+                self.host[li], state["hot"], state["out"], self.zero_req.long(),
+                self.compressed_len, state["lru"], 2048, 512, 2048, 64, 1024,
+                self.real, state["miss_src"], state["miss_dst"], state["miss_count"],
+            )
+        with operations_nvtx_range("qsa.hot_gather"):
+            torch.index_select(state["hot"], 0, state["out"].reshape(-1).long(), out=self.gathered)
+        with operations_nvtx_range("qsa.indexed_unpack"):
+            torch.index_select(self.gathered.view(-1, 256), 0, self.indices,
+                               out=self.unpacked.view(-1, 256))
+        with operations_nvtx_range("qsa.compact_mapping"):
+            self.compact[:, 1:2049].copy_(self.unpacked)
+            tail = self.seq_len % 4
+            if tail:
+                self.compact[0, 2049:2049 + tail].copy_(self.full.k_buffer[li][1:1 + tail].view(torch.uint8))
+                self.compact[1, 2049:2049 + tail].copy_(self.full.v_buffer[li][1:1 + tail].view(torch.uint8))
+            valid = raw_indices[0, :2048 + tail].long()
+            self.compact_table[0, valid] = torch.arange(1, 2049 + tail, dtype=torch.int32, device=self.device)
         check = self.strict and (self.decode_steps in (1, 2, 3, 384, 767) or self.seq_len % 4 == 0)
         if check:
             ids = blocks[0].cpu().long()

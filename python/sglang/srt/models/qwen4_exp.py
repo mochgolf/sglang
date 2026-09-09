@@ -19,6 +19,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
+from sglang.srt.utils.nvtx_utils import NVTX_OPERATIONS_ENABLED, profile_method
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.communicator import get_attn_tp_context
@@ -1546,6 +1547,7 @@ class Qwen4ExpAttentionDecoderLayer(
             )
         self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
 
+    @profile_method("qsa.indexer", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def _compute_qsa_topk_indices(
         self,
         hidden_states: torch.Tensor,

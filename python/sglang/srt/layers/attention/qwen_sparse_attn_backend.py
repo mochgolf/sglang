@@ -40,6 +40,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton_ck,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.utils.nvtx_utils import operations_nvtx_range
 
 logger = logging.getLogger(__name__)
 
@@ -1761,67 +1762,70 @@ class QwenSparseAttnBackend(AttentionBackend):
                 trtllm_decode,
             )
 
-        flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
-        batch, topk = topk_indices.shape
-        sequence_lens = metadata.sequence_lengths
-        if metadata.is_cuda_graph:
-            valid_counts = metadata.fa2_valid_counts
-            cu_seqlens_k = metadata.fa2_cu_seqlens_k
-            cu_seqlens_q = metadata.fa2_cu_seqlens_q
-            if valid_counts is None or cu_seqlens_k is None or cu_seqlens_q is None:
-                raise RuntimeError("QSA CUDA graph FA2 metadata is incomplete")
-        else:
-            valid_counts = torch.empty(batch, dtype=torch.int32, device=q.device)
-            cu_seqlens_k = torch.empty(batch + 1, dtype=torch.int32, device=q.device)
-            cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=q.device)
-        qwen_sparse_fa2_cu_seqlens_triton(
-            sequence_lens,
-            topk_indices,
-            valid_counts,
-            cu_seqlens_k,
-            batch,
-            topk,
-        )
-        scratch_capacity = (
-            self._cuda_graph_max_tokens * topk
-            if metadata.is_cuda_graph
-            else batch * topk
-        )
-        scratch_dtype = q.dtype if is_fp8_kv_dtype(k_buffer.dtype) else k_buffer.dtype
-        packed_k, packed_v = self._get_fa2_scratch(
-            scratch_capacity,
-            k_buffer.shape[1],
-            k_buffer.shape[2],
-            scratch_dtype,
-            k_buffer.device,
-        )
-        k_scale, v_scale = self._kv_descales(layer, k_buffer.dtype)
-        qwen_sparse_kv_extraction_compact_triton(
-            k_buffer,
-            v_buffer,
-            req_table,
-            row_req_indices,
-            topk_indices,
-            sequence_lens,
-            cu_seqlens_k,
-            packed_k,
-            packed_v,
-            batch,
-            topk,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-        output = flash_attn_varlen_func(
-            q=q,
-            k=packed_k,
-            v=packed_v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=1,
-            max_seqlen_k=topk,
-            softmax_scale=layer.scaling,
-            causal=True,
-        )
+        with operations_nvtx_range("qsa.fa2_metadata_scratch"):
+            flash_attn_varlen_func = _resolve_flash_attn_varlen_func()
+            batch, topk = topk_indices.shape
+            sequence_lens = metadata.sequence_lengths
+            if metadata.is_cuda_graph:
+                valid_counts = metadata.fa2_valid_counts
+                cu_seqlens_k = metadata.fa2_cu_seqlens_k
+                cu_seqlens_q = metadata.fa2_cu_seqlens_q
+                if valid_counts is None or cu_seqlens_k is None or cu_seqlens_q is None:
+                    raise RuntimeError("QSA CUDA graph FA2 metadata is incomplete")
+            else:
+                valid_counts = torch.empty(batch, dtype=torch.int32, device=q.device)
+                cu_seqlens_k = torch.empty(batch + 1, dtype=torch.int32, device=q.device)
+                cu_seqlens_q = torch.arange(batch + 1, dtype=torch.int32, device=q.device)
+            qwen_sparse_fa2_cu_seqlens_triton(
+                sequence_lens,
+                topk_indices,
+                valid_counts,
+                cu_seqlens_k,
+                batch,
+                topk,
+            )
+            scratch_capacity = (
+                self._cuda_graph_max_tokens * topk
+                if metadata.is_cuda_graph
+                else batch * topk
+            )
+            scratch_dtype = q.dtype if is_fp8_kv_dtype(k_buffer.dtype) else k_buffer.dtype
+            packed_k, packed_v = self._get_fa2_scratch(
+                scratch_capacity,
+                k_buffer.shape[1],
+                k_buffer.shape[2],
+                scratch_dtype,
+                k_buffer.device,
+            )
+            k_scale, v_scale = self._kv_descales(layer, k_buffer.dtype)
+        with operations_nvtx_range("qsa.fa2_extract"):
+            qwen_sparse_kv_extraction_compact_triton(
+                k_buffer,
+                v_buffer,
+                req_table,
+                row_req_indices,
+                topk_indices,
+                sequence_lens,
+                cu_seqlens_k,
+                packed_k,
+                packed_v,
+                batch,
+                topk,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        with operations_nvtx_range("qsa.fa2_attention"):
+            output = flash_attn_varlen_func(
+                q=q,
+                k=packed_k,
+                v=packed_v,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=1,
+                max_seqlen_k=topk,
+                softmax_scale=layer.scaling,
+                causal=True,
+            )
         if self.hisparse_v3 is not None:
             self.hisparse_v3.capture_decode(
                 layer, q, packed_k, packed_v, topk_indices, output, k_scale, v_scale,
