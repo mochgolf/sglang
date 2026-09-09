@@ -156,10 +156,13 @@ class QSAHiSparseP2:
             "logical_available": self.runner.token_to_kv_pool_allocator.available_size(),
             "raw_bytes": sum(t.nbytes for t in self.full.k_buffer + self.full.v_buffer),
             "raw_backing_size_tokens": self.full.size,
+            "raw_ptrs": self.raw_ptrs, "index_ptr": self.index_ptr,
             "raw_storage_unchanged": self.raw_ptrs == [t.data_ptr() for t in self.full.k_buffer + self.full.v_buffer],
             "index_bytes": self.pool.qsa_compressed_flat.nbytes,
             "index_storage_unchanged": self.index_ptr == self.pool.qsa_compressed_flat.data_ptr(),
             "host_reserved_bytes": reserved, "host_bytes": active, "host_free_bytes": reserved - active,
+            "pending_release_count": sum(self.slots.active.get(x.req_pool_idx) == x
+                                         for x in self.pending_releases),
             "hot_bytes": sum(t["hot"].nbytes for s in self.requests.values() for t in s.states),
             "workspace_bytes": sum(t.nbytes for t in self.workspace),
             "mamba_bytes": sum(mamba_sizes),
@@ -240,10 +243,11 @@ class QSAHiSparseP2:
                 segment = self.slots.staging_slice(state.lease, state.seq_len - extend, state.seq_len)
                 self.raw_write_locs = torch.arange(segment.start, segment.stop, dtype=torch.int64, device=self.device)
         if decode:
-            self.record("decode_batch", rows=[{
+            self.record("decode_batch", batch_size=len(self.batch_requests), rows=[{
                 "req_pool_idx": s.lease.req_pool_idx, "generation": s.lease.generation,
                 "rid": s.lease.rid, "lease_slot": s.lease.slot,
                 "seq_len": s.seq_len, "tail": s.seq_len % 4,
+                "compressed_len": s.seq_len // 4, "closes_c4": s.seq_len % 4 == 0,
                 "ring_location": self.slots.ring_write_location(s.lease, s.seq_len),
             } for s in self.batch_requests])
 
@@ -369,26 +373,35 @@ class QSAHiSparseP2:
     def after_release(self, lease):
         if lease is None:
             return
-        self.slots.require(lease, "drained")
+        self.slots.require(lease, "drained", "logical_flushed")
         allocator = self.runner.token_to_kv_pool_allocator
         if allocator.free_group is not None:
+            self.slots.require(lease, "drained")
             if lease in self.pending_releases:
                 raise RuntimeError("duplicate QSA P2 deferred release")
             self.pending_releases.append(lease)
             self.record("logical_release_pending", lease)
             return
-        self.slots.logical_flushed(lease, allocator)
-        state = self.requests.pop(lease.req_pool_idx)
+        if self.slots.phases[lease.req_pool_idx] == "drained":
+            self.slots.logical_flushed(lease, allocator)
+        state = self.requests[lease.req_pool_idx]
         state.states.clear()
         state.host = None
         self.batch_requests = [s for s in self.batch_requests if s.lease != lease]
         self.slots.commit_release(lease)
+        del self.requests[lease.req_pool_idx]
         self.record("logical_release_complete", lease)
 
     def after_logical_flush(self):
-        pending, self.pending_releases = self.pending_releases, []
-        for lease in pending:
-            self.after_release(lease)
+        while self.pending_releases:
+            lease = self.pending_releases[0]
+            try:
+                self.after_release(lease)
+            finally:
+                # Keep unfinished leases reachable on failure. A ledger failure
+                # after commit must not replay the already released generation.
+                if lease.req_pool_idx not in self.slots.active:
+                    self.pending_releases.pop(0)
 
 
 class QSAHiSparseCoordinator:
@@ -399,6 +412,12 @@ class QSAHiSparseCoordinator:
     def __init__(self, adapter, tp_group):
         self.adapter, self.tp_group = adapter, tp_group
         self.ack_staging_queue = []
+        initial_pair = os.environ.get("SGLANG_QSA_P2_VALIDATE_INITIAL_PAIR", "0")
+        if initial_pair not in ("0", "1"):
+            raise ValueError("QSA P2 initial-pair validation flag must be 0 or 1")
+        # Validation only: hold the first request until both prefills finish so
+        # resident/offload controls have identical first-decode membership.
+        self.wait_initial_pair = initial_pair == "1"
         self.num_real_reqs = torch.ones(1, dtype=torch.int32, device=adapter.device)
 
     def set_decode_producer_stream(self, stream):
@@ -428,7 +447,7 @@ class QSAHiSparseCoordinator:
         torch.distributed.all_reduce(total, group=self.tp_group)
         if int(total) == 0:
             return []
-        signatures = [(x.lease.req_pool_idx, x.lease.generation, x.lease.rid)
+        signatures = [(x.lease.req_pool_idx, x.lease.generation, x.lease.rid, x.lease.slot)
                       for x in self.ack_staging_queue]
         count = 0
         for item in self.ack_staging_queue:
@@ -440,10 +459,17 @@ class QSAHiSparseCoordinator:
         # Admission is rare; compare identities as well as the ready prefix count.
         world = torch.distributed.get_world_size(self.tp_group)
         votes = [None] * world
-        torch.distributed.all_gather_object(votes, (signatures, count), group=self.tp_group)
-        if any(ids != signatures for ids, _ in votes):
+        torch.distributed.all_gather_object(
+            votes, (signatures, count, self.wait_initial_pair), group=self.tp_group)
+        if any(ids != signatures or barrier != self.wait_initial_pair
+               for ids, _, barrier in votes):
             raise RuntimeError("QSA TP ranks disagree on staging lease identities")
-        count = min(n for _, n in votes)
+        count = min(n for _, n, _ in votes)
+        if self.wait_initial_pair:
+            if count < 2:
+                return []
+            self.adapter.record("initial_pair_released", ordered_leases=signatures)
+            self.wait_initial_pair = False
         ready, self.ack_staging_queue = self.ack_staging_queue[:count], self.ack_staging_queue[count:]
         for item in ready:
             self.adapter.slots.admit_decode(item.lease)

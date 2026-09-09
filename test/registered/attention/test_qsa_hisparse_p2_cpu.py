@@ -5,6 +5,7 @@ this is neither a DMA/kernel check nor live TP2/service acceptance.
 """
 
 from contextlib import nullcontext
+import os
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
@@ -118,9 +119,12 @@ class TestQSAHiSparseP2(unittest.TestCase):
                 patch.object(torch.distributed, "all_gather_object", side_effect=votes), \
                 patch("sglang.kernels.ops.kvcache.hisparse.load_cache_to_device_buffer_mla", side_effect=resolver):
             coord = QSAHiSparseCoordinator(a, None)
+            self.assertFalse(coord.wait_initial_pair)
+            with patch.dict(os.environ, {"SGLANG_QSA_P2_VALIDATE_INITIAL_PAIR": "1"}):
+                coord = QSAHiSparseCoordinator(a, None)
             coord.set_decode_producer_stream(a.producer_stream)
             def peer_nonempty(out, vote, **kwargs):
-                out[:] = [vote, ([(1, 1, "peer-only")], 1)]
+                out[:] = [vote, ([(1, 1, "peer-only", 0)], 1, vote[2])]
             with patch.object(torch.distributed, "all_reduce", side_effect=lambda total, **kw: total.fill_(1)), \
                     patch.object(torch.distributed, "all_gather_object", side_effect=peer_nonempty), \
                     self.assertRaisesRegex(RuntimeError, "identities"):
@@ -137,10 +141,12 @@ class TestQSAHiSparseP2(unittest.TestCase):
                 coord.admit_request_into_staging(req)
                 # A remote rank that is not ready cannot admit local-ready A.
                 def slow(out, vote, **kwargs):
-                    out[:] = [vote, (vote[0], 0)]
+                    out[:] = [vote, (vote[0], 0, vote[2])]
                 with patch.object(torch.distributed, "all_gather_object", side_effect=slow):
                     self.assertEqual(coord.collect_ready_reqs(), [])
-                self.assertEqual(coord.collect_ready_reqs(), [req])
+                self.assertEqual(coord.collect_ready_reqs(), [])
+                self.assertEqual(a.slots.phases[req.kv.req_pool_idx], "host_ready")
+                self.assertIsNone(a.slots.prefill_owner)
                 saved_a = a.requests[req.kv.req_pool_idx].host.clone()
 
             req_b, br = claim("B")
@@ -155,11 +161,23 @@ class TestQSAHiSparseP2(unittest.TestCase):
             self.assertTrue(torch.equal(a.requests[req_a.kv.req_pool_idx].host, saved_a))
             coord.admit_request_into_staging(req_b)
             def mismatch(out, vote, **kwargs):
-                out[:] = [vote, ([(999, 1, "wrong")], 1)]
+                out[:] = [vote, ([(999, 1, "wrong", 0)], 1, vote[2])]
             with patch.object(torch.distributed, "all_gather_object", side_effect=mismatch), \
                     self.assertRaisesRegex(RuntimeError, "identities"):
                 coord.collect_ready_reqs()
-            self.assertEqual(coord.collect_ready_reqs(), [req_b])
+            def barrier_mismatch(out, vote, **kwargs):
+                out[:] = [vote, (vote[0], vote[1], not vote[2])]
+            with patch.object(torch.distributed, "all_gather_object", side_effect=barrier_mismatch), \
+                    self.assertRaisesRegex(RuntimeError, "identities"):
+                coord.collect_ready_reqs()
+            def slot_mismatch(out, vote, **kwargs):
+                ids = [(*identity[:3], 1 - identity[3]) for identity in vote[0]]
+                out[:] = [vote, (ids, vote[1], vote[2])]
+            with patch.object(torch.distributed, "all_gather_object", side_effect=slot_mismatch), \
+                    self.assertRaisesRegex(RuntimeError, "identities"):
+                coord.collect_ready_reqs()
+            self.assertEqual(coord.collect_ready_reqs(), [req_a, req_b])
+            self.assertFalse(coord.wait_initial_pair)
 
             a_steps = a.requests[req_a.kv.req_pool_idx].decode_steps
             a.req_pool.req_generation[req_b.kv.req_pool_idx] += 1
@@ -218,7 +236,32 @@ class TestQSAHiSparseP2(unittest.TestCase):
                 logical.free(rows)
                 a.after_release(lease)
             self.assertEqual(len(a.pending_releases), 2)
-            logical.free_group_end()
+            first, second = a.pending_releases
+            # A pre-commit failure retains both leases, including the current
+            # logical_flushed lease; native pages have already flushed once.
+            with patch.object(a.slots, "commit_release", side_effect=RuntimeError("commit fault")), \
+                    self.assertRaisesRegex(RuntimeError, "commit fault"):
+                logical.free_group_end()
+            self.assertEqual(a.pending_releases, [first, second])
+            self.assertEqual(a.slots.phases[first.req_pool_idx], "logical_flushed")
+            self.assertEqual(a.slots.phases[second.req_pool_idx], "drained")
+            self.assertEqual(a.slots.free_slots, [])
+            self.assertEqual(logical.available_size(), 2 * a.capacity)
+
+            def record_fault(event, *args, **kwargs):
+                if event == "logical_release_complete":
+                    raise RuntimeError("ledger fault")
+
+            # A post-commit ledger failure removes only the completed head.
+            with patch.object(a, "record", side_effect=record_fault), \
+                    self.assertRaisesRegex(RuntimeError, "ledger fault"):
+                a.after_logical_flush()
+            self.assertEqual(a.pending_releases, [second])
+            self.assertNotIn(first.req_pool_idx, a.requests)
+            self.assertEqual(a.slots.active[second.req_pool_idx], second)
+            self.assertEqual(a.slots.phases[second.req_pool_idx], "drained")
+            self.assertEqual(len(a.slots.free_slots), 1)
+            a.after_logical_flush()
             self.assertEqual(a.pending_releases, [])
             self.assertEqual(a.requests, {})
             self.assertEqual(logical.available_size(), 2 * a.capacity)
