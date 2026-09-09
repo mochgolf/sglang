@@ -40,6 +40,7 @@ def validate_configuration(args, pool):
         "max_total_tokens": 262144,
         "chunked_prefill_size": 2048,
         "skip_server_warmup": True,
+        "enable_deterministic_inference": True,
         "speculative_algorithm": None,
         "disaggregation_mode": "null",
     }

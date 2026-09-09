@@ -42,6 +42,7 @@ class TestQSAHiSparseV3(unittest.TestCase):
                                cuda_graph_backend_decode="disabled", cuda_graph_backend_prefill="disabled",
                                context_length=262144, max_total_tokens=262144,
                                chunked_prefill_size=2048, skip_server_warmup=True,
+                               enable_deterministic_inference=True,
                                speculative_algorithm=None,
                                disaggregation_mode="null")
         full = SimpleNamespace(use_hnd=False, kv_cache_layout="NHD",
@@ -55,6 +56,7 @@ class TestQSAHiSparseV3(unittest.TestCase):
                           ("cuda_graph_backend_prefill", "full"), ("context_length", 8192),
                           ("max_total_tokens", 8192), ("chunked_prefill_size", 4096),
                           ("skip_server_warmup", False), ("enable_streaming_session", True),
+                          ("enable_deterministic_inference", False),
                           ("speculative_algorithm", "NEXTN"), ("enable_hisparse", True)):
             changed = SimpleNamespace(**vars(args))
             setattr(changed, name, bad)
