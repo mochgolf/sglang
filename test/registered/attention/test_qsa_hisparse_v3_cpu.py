@@ -2,8 +2,10 @@
 
 import unittest
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -17,6 +19,67 @@ from sglang.srt.mem_cache.qsa_hisparse_v3 import (
 
 
 class TestQSAHiSparseV3(unittest.TestCase):
+    def test_light_observation_keeps_writeback_dependencies(self):
+        for strict in (False, True):
+            adapter = QSAHiSparseV3.__new__(QSAHiSparseV3)
+            adapter.strict, adapter.device = strict, "cpu"
+            adapter.offloaded, adapter.seq_len, adapter.generation = True, 2052, 1
+            adapter.pool = SimpleNamespace(_transfer_full_attention_id=lambda _: 0)
+            k = torch.arange(5 * 256).reshape(5, 1, 256).to(torch.uint8)
+            v = (k + 17).clone()
+            adapter.full = SimpleNamespace(k_buffer=[k], v_buffer=[v])
+            adapter.capacity = 2056
+            state = adapter.make_state()
+            previous = Mock(name="previous_writeback")
+            state["done"] = previous
+            adapter.states = [state]
+            adapter.host = torch.zeros((1, 514, 2048), dtype=torch.uint8)
+            adapter.copy_stream = Mock(name="copy_stream")
+            current = Mock(name="current_stream")
+            producer, copy_begin, done = Mock(), Mock(), Mock()
+            events = [producer, copy_begin, done] if strict else [producer, done]
+            with patch.object(torch.cuda, "Event", side_effect=events), \
+                    patch.object(torch.cuda, "current_stream", return_value=current), \
+                    patch.object(torch.cuda, "stream", return_value=nullcontext()):
+                adapter.after_store(SimpleNamespace(layer_id=3))
+            current.wait_event.assert_called_once_with(previous)
+            producer.record.assert_called_once_with()
+            adapter.copy_stream.wait_event.assert_called_once_with(producer)
+            done.record.assert_called_once_with(adapter.copy_stream)
+            done.synchronize.assert_not_called()
+            self.assertIs(state["done"], done)
+            self.assertEqual(state["writeback_bytes"], 2048)
+            self.assertTrue(torch.equal(adapter.host[0, 512, :1024], k[1:5].flatten()))
+            self.assertTrue(torch.equal(adapter.host[0, 512, 1024:], v[1:5].flatten()))
+            # A light per-step record must not inspect pool/memory or open files.
+            adapter.path = Path("must-not-write.jsonl")
+            if not strict:
+                for event in ("decode_step", "prefill_step", "selected_check"):
+                    adapter.record(event)
+            # Boundary evidence must remain active in either observation mode.
+            with self.assertRaises(AttributeError):
+                adapter.record("handoff_complete")
+
+    def test_observation_rejects_invalid_or_contaminated_mode(self):
+        # Stop at pool validation, before constructing CUDA resources.
+        for env, expected in (({}, "strict"),
+                              ({"SGLANG_QSA_HISPARSE_V3_OBSERVE": "light"}, "light")):
+            adapter = QSAHiSparseV3.__new__(QSAHiSparseV3)
+            with patch.dict("os.environ", env, clear=True), patch(
+                "sglang.srt.mem_cache.qsa_hisparse_v3.validate_configuration",
+                side_effect=RuntimeError("CPU configuration boundary"),
+            ), self.assertRaisesRegex(RuntimeError, "CPU configuration boundary"):
+                adapter.__init__(SimpleNamespace(token_to_kv_pool=None, server_args=None), "offload")
+            self.assertEqual(adapter.observe, expected)
+            self.assertEqual(adapter.strict, expected == "strict")
+        for env in (
+            {"SGLANG_QSA_HISPARSE_V3_OBSERVE": "typo"},
+            {"SGLANG_QSA_HISPARSE_V3_OBSERVE": "light",
+             "SGLANG_QSA_HISPARSE_V3_CAPTURE": "/tmp/capture"},
+        ):
+            with patch.dict("os.environ", env, clear=True), self.assertRaises(ValueError):
+                QSAHiSparseV3(None, "offload")
+
     def test_decode_ring_preserves_writer_padding(self):
         adapter = QSAHiSparseV3.__new__(QSAHiSparseV3)
         adapter.failed = adapter.releasing = False

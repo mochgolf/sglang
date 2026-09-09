@@ -79,6 +79,13 @@ class QSAHiSparseV3:
     def __init__(self, runner, mode):
         if mode not in ("resident", "offload"):
             raise ValueError("SGLANG_QSA_HISPARSE_V3 must be resident or offload")
+        self.observe = os.environ.get("SGLANG_QSA_HISPARSE_V3_OBSERVE", "strict")
+        if self.observe not in ("strict", "light"):
+            raise ValueError("SGLANG_QSA_HISPARSE_V3_OBSERVE must be strict or light")
+        self.strict = self.observe == "strict"
+        capture = os.environ.get("SGLANG_QSA_HISPARSE_V3_CAPTURE")
+        if capture and not self.strict:
+            raise ValueError("QSA V3 light observation cannot enable tensor capture")
         self.pool = runner.token_to_kv_pool
         validate_configuration(runner.server_args, self.pool)
         from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
@@ -111,7 +118,6 @@ class QSAHiSparseV3:
         self.failed = False
         self.releasing = False
         self.pending_release = None
-        capture = os.environ.get("SGLANG_QSA_HISPARSE_V3_CAPTURE")
         self.capture_dir = Path(capture) if capture else None
         self.capture_layers = {}
         if self.capture_dir is not None:
@@ -136,12 +142,14 @@ class QSAHiSparseV3:
         self.record("init")
 
     def record(self, event, **extra):
-        if self.path is None:
+        if self.path is None or (not self.strict and event in (
+            "decode_step", "prefill_step", "selected_check",
+        )):
             return
         raw = sum(t.numel() * t.element_size() for t in self.full.k_buffer + self.full.v_buffer)
         row = {
             "event": event, "time_ns": time.time_ns(), "rank": self.rank,
-            "mode": self.mode, "generation": self.generation,
+            "mode": self.mode, "observe": self.observe, "generation": self.generation,
             "req_pool_idx": self.owner, "seq_len": self.seq_len,
             "rid": self.owner_rid,
             "decode_steps": self.decode_steps, "raw_bytes": raw,
@@ -267,10 +275,11 @@ class QSAHiSparseV3:
                 done.synchronize()
                 copy_ms += copy_begin.elapsed_time(done)
                 # Independent source slices, not unpacking the candidate pack.
-                if not torch.equal(dst[:, :1024].reshape(-1, 1, 256), kb.cpu()):
-                    raise AssertionError("handoff K bytes differ")
-                if not torch.equal(dst[:, 1024:].reshape(-1, 1, 256), vb.cpu()):
-                    raise AssertionError("handoff V bytes differ")
+                if self.strict:
+                    if not torch.equal(dst[:, :1024].reshape(-1, 1, 256), kb.cpu()):
+                        raise AssertionError("handoff K bytes differ")
+                    if not torch.equal(dst[:, 1024:].reshape(-1, 1, 256), vb.cpu()):
+                        raise AssertionError("handoff V bytes differ")
             # The existing store_cache writer skips reserved padding slot 0.
             ring_k = torch.zeros((5, 1, 256), dtype=k.dtype, device=self.device)
             ring_v = torch.zeros_like(ring_k)
@@ -285,7 +294,7 @@ class QSAHiSparseV3:
             self.full.k_buffer[li], self.full.v_buffer[li] = ring_k, ring_v
             del k, v, kb, vb, packed
             self.record("handoff_layer", layer=lid, source_bytes=prompt_len * 512,
-                        d2h_bytes=blocks * self.ITEM, d2h_event_ms=copy_ms, bytes_checked=True)
+                        d2h_bytes=blocks * self.ITEM, d2h_event_ms=copy_ms, bytes_checked=self.strict)
         self.full._init_data_ptrs_and_strides()
         self.raw_released = True
         self.indices = unpack_index(self.device)
@@ -340,11 +349,14 @@ class QSAHiSparseV3:
             state["hot"][block].copy_(hot)
             state["tokens"][0, block] = block
         state["tokens"][0, self.HOT] = block
-        producer, copy_begin, done = torch.cuda.Event(), torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        producer = torch.cuda.Event()
+        copy_begin = torch.cuda.Event(enable_timing=True) if self.strict else None
+        done = torch.cuda.Event(enable_timing=self.strict)
         producer.record()
         with torch.cuda.stream(self.copy_stream):
             self.copy_stream.wait_event(producer)
-            copy_begin.record(self.copy_stream)
+            if copy_begin is not None:
+                copy_begin.record(self.copy_stream)
             self.host[li, block].copy_(hot, non_blocking=True)
             done.record(self.copy_stream)
         state["done"] = done
@@ -379,7 +391,7 @@ class QSAHiSparseV3:
             self.compact[1, 2049:2049 + tail].copy_(self.full.v_buffer[li][1:1 + tail].view(torch.uint8))
         valid = raw_indices[0, :2048 + tail].long()
         self.compact_table[0, valid] = torch.arange(1, 2049 + tail, dtype=torch.int32, device=self.device)
-        check = self.decode_steps in (1, 2, 3, 384, 767) or self.seq_len % 4 == 0
+        check = self.strict and (self.decode_steps in (1, 2, 3, 384, 767) or self.seq_len % 4 == 0)
         if check:
             ids = blocks[0].cpu().long()
             if len(torch.unique(ids)) != 512 or int(ids.min()) < 0 or int(ids.max()) >= self.seq_len // 4:
