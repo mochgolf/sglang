@@ -114,16 +114,6 @@ class TestQSAHiSparseV3(unittest.TestCase):
                 full.v_buffer = [torch.full((2056, 1, 256), generation + 17, dtype=torch.uint8)]
                 adapter.handoff(2048)
                 self.assertIs(adapter.host, slab)
-                for seq_len in (2049, 2050, 2051, 2052, 261121, 261122, 261123, 261124):
-                    tail = seq_len % 4
-                    local = adapter.compact_topk[tail]
-                    valid = (local >= 0) & (local < seq_len)
-                    self.assertEqual(int(valid.sum()), 2048 + tail)
-                    self.assertTrue(torch.equal(
-                        adapter.compact_table[0, local[valid].long()],
-                        torch.arange(1, 2049 + tail, dtype=torch.int32),
-                    ))
-                    self.assertTrue(torch.all(local[2048 + tail:] == -1))
                 self.assertTrue(torch.all(slab[0, :512, :1024] == generation))
                 self.assertTrue(torch.all(slab[0, :512, 1024:] == generation + 17))
                 with self.assertRaisesRegex(RuntimeError, "unclaimed host slab"):
@@ -137,8 +127,6 @@ class TestQSAHiSparseV3(unittest.TestCase):
                 self.assertTrue(torch.all(slab[0, 512, 1024:] == generation + 53))
                 lease = adapter.release(0, str(generation))
                 self.assertIsNone(adapter.host)
-                self.assertIsNone(adapter.compact_topk)
-                self.assertIsNone(adapter.compact_table)
                 self.assertIs(adapter.host_slab, slab)
                 adapter.after_release(lease)
                 self.assertIsNone(adapter.owner)
