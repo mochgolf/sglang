@@ -269,11 +269,11 @@ class QSAHiSparseV3:
         start_wall = time.monotonic()
         allocated_before = torch.cuda.memory_allocated(self.device)
         logical_available = self.runner.token_to_kv_pool_allocator.available_size()
+        # Keep append capacity for C4 blocks completed during decode.
+        self.host = self.host_slab
         self.record("handoff_begin", prompt_len=prompt_len)
         blocks, tail = divmod(prompt_len, 4)
         with operations_nvtx_range("qsa.handoff.allocate_validate"):
-            # Keep append capacity for C4 blocks completed during decode.
-            self.host = self.host_slab
             slots = self.req_table[self.owner, :prompt_len].long()
             slots_cpu = slots.cpu()
             complete = slots_cpu[:blocks * 4].reshape(-1, 4)

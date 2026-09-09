@@ -1,5 +1,6 @@
 """CPU checks for the actual V3 byte-layout helpers and startup guards."""
 
+import json
 import unittest
 import tempfile
 from contextlib import nullcontext
@@ -71,7 +72,23 @@ class TestQSAHiSparseV3(unittest.TestCase):
                 QSAHiSparseV3(runner, "offload")
 
         adapter.capacity = 2056
-        adapter.record = Mock()
+        def check_ledger(event, **extra):
+            if event != "handoff_begin":
+                return
+            with tempfile.TemporaryDirectory() as directory, \
+                    patch.object(torch.cuda, "memory_reserved", return_value=0), \
+                    patch.object(torch.cuda, "max_memory_allocated", return_value=0), \
+                    patch.object(torch.cuda, "max_memory_reserved", return_value=0):
+                adapter.path = Path(directory) / "events.jsonl"
+                QSAHiSparseV3.record(adapter, event, **extra)
+                row = json.loads(adapter.path.read_text())
+                self.assertEqual(row["host_reserved_bytes"], slab.nbytes)
+                self.assertEqual(row["host_bytes"], slab.nbytes)
+                self.assertEqual(row["host_free_bytes"], 0)
+                self.assertEqual(row["host_slab_ptr"], slab.data_ptr())
+
+        runner.req_to_token_pool.mamba_allocator = SimpleNamespace(available_size=lambda: 40)
+        adapter.record = Mock(side_effect=check_ledger)
         events = []
 
         def make_event(**kwargs):
