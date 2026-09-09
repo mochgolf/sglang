@@ -27,6 +27,14 @@ def unpack_index(device):
     return torch.cat((k, k + 4))
 
 
+def stage_short_prefix(hot, tokens, records):
+    """HiSparse's <=HOT fast path assumes a fully resident ordered prefix."""
+    count = records.shape[0]
+    if count <= 2048:
+        hot[:count].copy_(records, non_blocking=True)
+        tokens[0, :count] = torch.arange(count, dtype=torch.int32, device=hot.device)
+
+
 def validate_configuration(args, pool):
     required = {
         "max_running_requests": 1,
@@ -258,6 +266,7 @@ class QSAHiSparseV3:
                 ring_k[:tail].copy_(k.view(torch.uint8).index_select(0, slots[-tail:]).view(k.dtype))
                 ring_v[:tail].copy_(v.view(torch.uint8).index_select(0, slots[-tail:]).view(v.dtype))
             state = self.make_state()
+            stage_short_prefix(state["hot"], state["tokens"], self.host[li, :blocks])
             state["hot"][self.HOT].copy_(self.host[li, blocks - 1], non_blocking=True)
             state["tokens"][0, self.HOT] = blocks - 1
             self.states.append(state)
@@ -315,6 +324,9 @@ class QSAHiSparseV3:
         hot[:1024].copy_(self.full.k_buffer[li].view(torch.uint8).reshape(-1))
         hot[1024:].copy_(self.full.v_buffer[li].view(torch.uint8).reshape(-1))
         block = self.seq_len // 4 - 1
+        if block < self.HOT:
+            state["hot"][block].copy_(hot)
+            state["tokens"][0, block] = block
         state["tokens"][0, self.HOT] = block
         producer, copy_begin, done = torch.cuda.Event(), torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         producer.record()

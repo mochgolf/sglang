@@ -8,6 +8,7 @@ import torch
 from sglang.srt.mem_cache.qsa_hisparse_v3 import (
     QSAHiSparseV3,
     pack_c4,
+    stage_short_prefix,
     unpack_index,
     validate_configuration,
 )
@@ -35,6 +36,17 @@ class TestQSAHiSparseV3(unittest.TestCase):
             self.assertTrue(torch.equal(compact[1, 1:2049 + tail], v[:2048 + tail]))
         with self.assertRaises(ValueError):
             pack_c4(k[:3], v[:3])
+        # The real resolver bypasses H2D at <=2048 C4: its ordered rows must exist.
+        records = torch.arange(2049 * 8).reshape(2049, 8)
+        for count in (512, 2048, 2049):
+            hot = torch.full((2112, 8), -1)
+            tokens = torch.full((1, 2112), -1, dtype=torch.int32)
+            stage_short_prefix(hot, tokens, records[:count])
+            if count <= 2048:
+                self.assertTrue(torch.equal(hot[:count], records[:count]))
+                self.assertTrue(torch.equal(tokens[0, :count], torch.arange(count)))
+            else:
+                self.assertTrue(torch.all(hot == -1))
 
     def test_configuration(self):
         args = SimpleNamespace(max_running_requests=1, tp_size=2, pp_size=1,
