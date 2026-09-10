@@ -1,4 +1,4 @@
-"""Fixed B1/B2 byte movement for QSA HiSparse decode graphs.
+"""Fixed-capacity byte movement for QSA HiSparse decode graphs.
 
 Slots own persistent storage; rows only route a forward. No host transfers or
 lease lifecycle operations belong in these kernels.
@@ -33,7 +33,8 @@ def close_c4(K, V, Hot, Tokens, Slots, Lengths, Real,
 
 @tr.jit
 def finish_compact(Unpacked, K, V, Compact, Table, Raw, Slots, Lengths, Real,
-                   CAPACITY: tl.constexpr, RING_START: tl.constexpr):
+                   CAPACITY: tl.constexpr, RING_START: tl.constexpr,
+                   PLANE_STRIDE: tl.constexpr):
     row, chunk = tl.program_id(0), tl.program_id(1)
     if row < tl.load(Real):
         slot, seq = tl.load(Slots + row), tl.load(Lengths + row)
@@ -50,7 +51,7 @@ def finish_compact(Unpacked, K, V, Compact, Table, Raw, Slots, Lengths, Real,
                 t = tl.load(K + ring, pending, other=0)
             else:
                 t = tl.load(V + ring, pending, other=0)
-            dst = ((plane * 4104 + slot * 2052 + 1 + member) * 256 + dim)
+            dst = ((plane * PLANE_STRIDE + slot * 2052 + 1 + member) * 256 + dim)
             tl.store(Compact + dst, tl.where(selected, u, t), selected | pending)
         member_id = chunk * 4 + tl.arange(0, 4)
         valid = member_id < 2048 + tail

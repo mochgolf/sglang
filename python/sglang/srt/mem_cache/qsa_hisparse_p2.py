@@ -1,4 +1,4 @@
-"""Guarded B2 eager QSA: one prefill arena, two persistent decode leases."""
+"""Guarded eager QSA: one prefill arena and bounded persistent decode leases."""
 
 import json
 import os
@@ -64,7 +64,7 @@ class _RequestCache(QSAHiSparseV3):
         shared = self.adapter.layer_states[len(self.states)]
         slot = self.lease.slot
         state = {name: shared[name][slot:slot + 1] for name in ("tokens", "lru")}
-        state["hot"] = shared["hot"].view(2, 2112, 2048)[slot]
+        state["hot"] = shared["hot"].view(self.adapter.max_requests, 2112, 2048)[slot]
         state["hot"].zero_()
         state["tokens"].fill_(-1)
         state["lru"].copy_(self.adapter.initial_lru)
@@ -95,6 +95,8 @@ class QSAHiSparseP2:
         self.strict = self.observe == "strict"
         validate_configuration(runner.server_args, self.pool, p2=True,
                                graph=self.graph_enabled, strict=self.strict)
+        self.max_requests = int(runner.server_args.max_running_requests)
+        self.graph_batch_sizes = tuple(range(1, self.max_requests + 1))
         from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.model_executor.cuda_graph_config import (
@@ -106,7 +108,8 @@ class QSAHiSparseP2:
         if self.graph_enabled:
             from sglang.srt.runtime_context import get_exec
             cfg = get_exec().graph.cuda_graph_config.decode
-            graph_ok = graph_ok and cfg.bs == [1, 2] and cfg.max_bs == 2
+            graph_ok = (graph_ok and cfg.bs == list(self.graph_batch_sizes)
+                        and cfg.max_bs == self.max_requests)
 
         if (not str(self.pool.device).startswith("cuda")
                 or not graph_ok
@@ -119,7 +122,7 @@ class QSAHiSparseP2:
                 or getattr(runner.server_args, "enable_priority_preemption", False)):
             raise ValueError("QSA P2 forbids mixed prefill/decode and preemption")
         self.capacity = 262144
-        self.slots = QSAHiSparseSlots(self.capacity, 64, 2)
+        self.slots = QSAHiSparseSlots(self.capacity, 64, self.max_requests)
         self.req_pool = runner.req_to_token_pool
         self.req_table = self.req_pool.req_to_token
         if self.req_table.shape[1] < self.capacity:
@@ -159,7 +162,9 @@ class QSAHiSparseP2:
         host_alloc_wall_ms = 0.0
         self.workspace = []
         if mode == "p2-offload":
-            self.host_slabs = torch.empty((2, 12, self.capacity // 4, 2048), dtype=torch.uint8, pin_memory=True)
+            self.host_slabs = torch.empty(
+                (self.max_requests, 12, self.capacity // 4, 2048),
+                dtype=torch.uint8, pin_memory=True)
             host_alloc_wall_ms = (time.monotonic() - start) * 1000
             self._allocate_decode_workspace()
             if self.graph_enabled:
@@ -167,25 +172,25 @@ class QSAHiSparseP2:
         self.record("init", allocation_phase="startup", host_alloc_wall_ms=host_alloc_wall_ms)
 
     def _allocate_decode_workspace(self):
-        """Fixed B2 backing; persistent rows are lease slots, scratch rows are batch order."""
+        """Fixed backing; persistent rows are lease slots, scratch rows are batch order."""
         device, layers, blocks = self.device, len(self.layer_ids), self.capacity // 4
         self.indices = (unpack_index(device)[None] +
-                        torch.arange(2, device=device)[:, None] * 4096).flatten()
-        self.gathered = torch.empty((2 * 512, 2048), dtype=torch.uint8, device=device)
-        self.unpacked = torch.empty((2, 2, 2048, 1, 256), dtype=torch.uint8, device=device)
-        self.compact = torch.zeros((2, 2 * 2052, 1, 256), dtype=torch.uint8, device=device)
-        self.compact_table = torch.zeros((2, self.capacity), dtype=torch.int32, device=device)
+                        torch.arange(self.max_requests, device=device)[:, None] * 4096).flatten()
+        self.gathered = torch.empty((self.max_requests * 512, 2048), dtype=torch.uint8, device=device)
+        self.unpacked = torch.empty((self.max_requests, 2, 2048, 1, 256), dtype=torch.uint8, device=device)
+        self.compact = torch.zeros((2, self.max_requests * 2052, 1, 256), dtype=torch.uint8, device=device)
+        self.compact_table = torch.zeros((self.max_requests, self.capacity), dtype=torch.int32, device=device)
         self.real = torch.zeros(1, dtype=torch.int32, device=device)
-        self.compressed_lens = torch.zeros(2, dtype=torch.int32, device=device)
-        self.batch_lens = torch.zeros(2, dtype=torch.int32, device=device)
-        self.batch_slots = torch.zeros(2, dtype=torch.int32, device=device)
-        self.batch_write_locs = torch.zeros(2, dtype=torch.int64, device=device)
-        self.blocks = torch.empty((2, 512), dtype=torch.int32, device=device)
-        self.out = torch.empty((2, 512), dtype=torch.int32, device=device)
-        self.gather_indices = torch.empty(2 * 512, dtype=torch.int64, device=device)
-        self.miss_src = torch.empty((2, 512), dtype=torch.int64, device=device)
-        self.miss_dst = torch.empty((2, 512), dtype=torch.int32, device=device)
-        self.miss_count = torch.zeros(2, dtype=torch.int32, device=device)
+        self.compressed_lens = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
+        self.batch_lens = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
+        self.batch_slots = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
+        self.batch_write_locs = torch.zeros(self.max_requests, dtype=torch.int64, device=device)
+        self.blocks = torch.empty((self.max_requests, 512), dtype=torch.int32, device=device)
+        self.out = torch.empty((self.max_requests, 512), dtype=torch.int32, device=device)
+        self.gather_indices = torch.empty(self.max_requests * 512, dtype=torch.int64, device=device)
+        self.miss_src = torch.empty((self.max_requests, 512), dtype=torch.int64, device=device)
+        self.miss_dst = torch.empty((self.max_requests, 512), dtype=torch.int32, device=device)
+        self.miss_count = torch.zeros(self.max_requests, dtype=torch.int32, device=device)
         self.initial_lru = torch.arange(2048, dtype=torch.int16, device=device)[None]
         self.workspace = [self.indices, self.gathered, self.unpacked, self.compact,
                           self.compact_table, self.real, self.compressed_lens, self.batch_lens,
@@ -195,19 +200,19 @@ class QSAHiSparseP2:
         self.layer_states = []
         for li in range(layers):
             shared = {
-                "hot": torch.zeros((2 * 2112, 2048), dtype=torch.uint8, device=device),
-                "tokens": torch.full((2, 2112), -1, dtype=torch.int32, device=device),
-                "lru": self.initial_lru.repeat(2, 1),
-                "device_locs": torch.arange(2 * 2112, dtype=torch.int32, device=device).view(2, 2112),
+                "hot": torch.zeros((self.max_requests * 2112, 2048), dtype=torch.uint8, device=device),
+                "tokens": torch.full((self.max_requests, 2112), -1, dtype=torch.int32, device=device),
+                "lru": self.initial_lru.repeat(self.max_requests, 1),
+                "device_locs": torch.arange(self.max_requests * 2112, dtype=torch.int32, device=device).view(self.max_requests, 2112),
                 "host_locs": (torch.arange(blocks, dtype=torch.int64, device=device)[None] +
-                              (torch.arange(2, device=device)[:, None] * layers + li) * blocks),
+                              (torch.arange(self.max_requests, device=device)[:, None] * layers + li) * blocks),
             }
             self.layer_states.append(shared)
             self.workspace.extend(t for name, t in shared.items() if name != "hot")
 
     def _allocate_graph_workspace(self):
-        self.graph_seq_lens = torch.zeros(2, dtype=torch.int32, device=self.device)
-        self.graph_row_ids = torch.arange(2, dtype=torch.int32, device=self.device)[:, None]
+        self.graph_seq_lens = torch.zeros(self.max_requests, dtype=torch.int32, device=self.device)
+        self.graph_row_ids = torch.arange(self.max_requests, dtype=torch.int32, device=self.device)[:, None]
         self.workspace.extend((self.graph_seq_lens, self.graph_row_ids))
         self.graph_producer = torch.cuda.Event()
         self.graph_copy_done = torch.cuda.Event()
@@ -215,23 +220,23 @@ class QSAHiSparseP2:
         if self.strict:
             layers = len(self.layer_ids)
             self.graph_audit = {
-                "raw": torch.zeros((layers, 2, 2051), dtype=torch.int32, device=self.device),
+                "raw": torch.zeros((layers, self.max_requests, 2051), dtype=torch.int32, device=self.device),
                 "compact": torch.zeros((layers, *self.compact.shape), dtype=torch.uint8, device=self.device),
-                "mapping": torch.zeros((layers, 2, 2051), dtype=torch.int32, device=self.device),
-                "miss_count": torch.zeros((layers, 2), dtype=torch.int32, device=self.device),
-                "valid_counts": torch.zeros((layers, 2), dtype=torch.int32, device=self.device),
-                "resolver_out": torch.zeros((layers, 2, 512), dtype=torch.int32, device=self.device),
-                "miss_src": torch.zeros((layers, 2, 512), dtype=torch.int64, device=self.device),
-                "miss_dst": torch.zeros((layers, 2, 512), dtype=torch.int32, device=self.device),
+                "mapping": torch.zeros((layers, self.max_requests, 2051), dtype=torch.int32, device=self.device),
+                "miss_count": torch.zeros((layers, self.max_requests), dtype=torch.int32, device=self.device),
+                "valid_counts": torch.zeros((layers, self.max_requests), dtype=torch.int32, device=self.device),
+                "resolver_out": torch.zeros((layers, self.max_requests, 512), dtype=torch.int32, device=self.device),
+                "miss_src": torch.zeros((layers, self.max_requests, 512), dtype=torch.int64, device=self.device),
+                "miss_dst": torch.zeros((layers, self.max_requests, 512), dtype=torch.int32, device=self.device),
             }
             self.workspace.extend(self.graph_audit.values())
 
     @contextmanager
     def graph_capture(self, count, *, native_key=None, native_backend=None):
-        if (not self.graph_enabled or count not in (1, 2) or self.requests
+        if (not self.graph_enabled or count not in self.graph_batch_sizes or self.requests
                 or self.slots.active or self.pending_releases or self.graph_batch is not None
                 or self.graph_capture_size is not None):
-            raise RuntimeError("QSA graph capture needs exact B1/B2 and no live leases")
+            raise RuntimeError("QSA graph capture needs an exact configured batch and no live leases")
         from sglang.srt.model_executor.runner.flashinfer_autotune import should_run_flashinfer_autotune
         if should_run_flashinfer_autotune(self.runner):
             raise RuntimeError("QSA graph capture does not permit earlier autotune dummy forwards")
@@ -284,7 +289,7 @@ class QSAHiSparseP2:
                 capture_error.add_note(f"QSA capture cleanup failure: {error!r}")
 
     def after_graph_warmup(self):
-        if self.graph_capture_size not in (1, 2) or self.requests or self.slots.active:
+        if self.graph_capture_size not in self.graph_batch_sizes or self.requests or self.slots.active:
             raise RuntimeError("QSA graph warmup changed ownership")
         self.graph_warmups += 1
         if self.path is not None:
@@ -307,7 +312,7 @@ class QSAHiSparseP2:
                 for name, value in tensors.items()}
 
     def prepare_graph_replay(self, batch, count):
-        if (not self.graph_enabled or count != batch.batch_size or count not in (1, 2)
+        if (not self.graph_enabled or count != batch.batch_size or count not in self.graph_batch_sizes
                 or not batch.forward_mode.is_decode() or self.graph_batch is not None
                 or self.graph_capture_size is not None):
             raise RuntimeError("QSA graph replay requires exact unpadded decode rows")
@@ -550,10 +555,10 @@ class QSAHiSparseP2:
         decode = batch.forward_mode.is_decode()
         if not decode and not batch.forward_mode.is_extend():
             raise RuntimeError("QSA P2 supports plain extend/decode only")
-        if (not 1 <= batch.batch_size <= 2 or (not decode and batch.batch_size != 1)
+        if (not 1 <= batch.batch_size <= self.max_requests or (not decode and batch.batch_size != 1)
                 or batch.req_pool_indices_cpu is None or batch.seq_lens_cpu is None
                 or not batch.rids or len(batch.rids) != batch.batch_size):
-            raise RuntimeError("QSA P2 requires real eager B1/B2 rows and CPU metadata")
+            raise RuntimeError("QSA P2 requires real bounded rows and CPU metadata")
         req_indices = batch.req_pool_indices_cpu.tolist()
         seq_lens = batch.seq_lens_cpu.tolist()
         if len(req_indices) != batch.batch_size or len(seq_lens) != batch.batch_size or len(set(req_indices)) != len(req_indices):
@@ -713,7 +718,7 @@ class QSAHiSparseP2:
             from sglang.srt.layers.attention.qsa.hisparse_graph import close_c4
             li = self.pool._transfer_full_attention_id(layer.layer_id)
             count = self.graph_capture_size or len(self.graph_batch or ())
-            if not self.graph_enabled or count not in (1, 2):
+            if not self.graph_enabled or count not in self.graph_batch_sizes:
                 raise RuntimeError("QSA C4 close has no graph context")
             close_c4[(count,)](
                 self.full.k_buffer[li].view(torch.uint8), self.full.v_buffer[li].view(torch.uint8),
@@ -731,7 +736,7 @@ class QSAHiSparseP2:
         from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_mla
 
         count = (self.graph_capture_size or len(self.graph_batch or ())) if graph else len(self.batch_requests)
-        if (not self.offloaded or not 1 <= count <= 2
+        if (not self.offloaded or not 1 <= count <= self.max_requests
                 or raw_indices.shape != (count, 2051)
                 or raw_indices.dtype != torch.int32 or raw_indices.device != self.compact.device):
             raise RuntimeError("QSA P2 selection rows do not match current decode batch")
@@ -771,7 +776,8 @@ class QSAHiSparseP2:
                 self.unpacked, self.full.k_buffer[li].view(torch.uint8),
                 self.full.v_buffer[li].view(torch.uint8), self.compact, self.compact_table,
                 raw_indices, self.batch_slots, self.graph_seq_lens, self.real, self.capacity,
-                self.slots.page_size + self.slots.staging_tokens)
+                self.slots.page_size + self.slots.staging_tokens,
+                self.max_requests * 2052)
             if self.graph_audit is not None:
                 self.graph_audit["raw"][li, :count].copy_(raw_indices)
                 self.graph_audit["compact"][li].copy_(self.compact)
@@ -860,12 +866,15 @@ class QSAHiSparseCoordinator:
     def __init__(self, adapter, tp_group):
         self.adapter, self.tp_group = adapter, tp_group
         self.ack_staging_queue = []
-        initial_pair = os.environ.get("SGLANG_QSA_P2_VALIDATE_INITIAL_PAIR", "0")
-        if initial_pair not in ("0", "1"):
-            raise ValueError("QSA P2 initial-pair validation flag must be 0 or 1")
-        # Validation only: hold the first request until both prefills finish so
-        # resident/offload controls have identical first-decode membership.
-        self.wait_initial_pair = initial_pair == "1"
+        initial_batch = os.environ.get("SGLANG_QSA_P2_VALIDATE_INITIAL_PAIR", "0")
+        if initial_batch not in ("0", "1", "2", "4", "8"):
+            raise ValueError("QSA P2 initial-batch validation must be 0, 1, 2, 4 or 8")
+        # Keep 1 as the accepted B2 spelling. Larger values let bounded tests
+        # park sequential near-context prefills until one real decode batch exists.
+        self.initial_batch_target = 2 if initial_batch == "1" else int(initial_batch)
+        if self.initial_batch_target > adapter.max_requests:
+            raise ValueError("QSA P2 initial-batch target exceeds lease capacity")
+        self.wait_initial_pair = self.initial_batch_target != 0
         self.num_real_reqs = (adapter.real if adapter.mode == "p2-offload" else
                               torch.ones(1, dtype=torch.int32, device=adapter.device))
 
@@ -909,16 +918,18 @@ class QSAHiSparseCoordinator:
         world = torch.distributed.get_world_size(self.tp_group)
         votes = [None] * world
         torch.distributed.all_gather_object(
-            votes, (signatures, count, self.wait_initial_pair), group=self.tp_group)
-        if any(ids != signatures or barrier != self.wait_initial_pair
-               for ids, _, barrier in votes):
+            votes, (signatures, count, self.initial_batch_target), group=self.tp_group)
+        if any(ids != signatures or target != self.initial_batch_target
+               for ids, _, target in votes):
             raise RuntimeError("QSA TP ranks disagree on staging lease identities")
         count = min(n for _, n, _ in votes)
         if self.wait_initial_pair:
-            if count < 2:
+            if count < self.initial_batch_target:
                 return []
-            self.adapter.record("initial_pair_released", ordered_leases=signatures)
+            self.adapter.record("initial_pair_released", ordered_leases=signatures,
+                                target_count=self.initial_batch_target)
             self.wait_initial_pair = False
+            self.initial_batch_target = 0
         ready, self.ack_staging_queue = self.ack_staging_queue[:count], self.ack_staging_queue[count:]
         for item in ready:
             self.adapter.slots.admit_decode(item.lease)

@@ -315,6 +315,22 @@ class TestQSAHiSparseV3(unittest.TestCase):
         graph_pool.size = 524288
         validate_configuration(graph_args, graph_pool, p2=True, graph=True)
         validate_configuration(graph_args, graph_pool, p2=True, graph=True, strict=False)
+        for max_requests in (4, 8):
+            scaled_args = SimpleNamespace(**vars(graph_args))
+            scaled_args.max_running_requests = max_requests
+            scaled_args.max_total_tokens = max_requests * 262144
+            scaled_args.cuda_graph_bs_decode = list(range(1, max_requests + 1))
+            scaled_args.cuda_graph_max_bs_decode = max_requests
+            scaled_pool = SimpleNamespace(**vars(graph_pool))
+            scaled_pool.size = scaled_args.max_total_tokens
+            validate_configuration(scaled_args, scaled_pool, p2=True, graph=True)
+            scaled_args.max_total_tokens -= 64
+            with self.assertRaisesRegex(ValueError, "max_total_tokens"):
+                validate_configuration(scaled_args, scaled_pool, p2=True, graph=True)
+        unsupported = SimpleNamespace(**vars(graph_args))
+        unsupported.max_running_requests = 3
+        with self.assertRaisesRegex(ValueError, "max_running_requests"):
+            validate_configuration(unsupported, graph_pool, p2=True, graph=True)
         native_args = SimpleNamespace(**vars(graph_args))
         native_args.enable_deterministic_inference = False
         validate_configuration(native_args, graph_pool, p2=True, graph=True, strict=False)

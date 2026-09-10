@@ -1833,12 +1833,13 @@ class KVCacheConfigurator:
             if os.environ.get("SGLANG_QSA_HISPARSE_V3") == "p2-offload":
                 from sglang.srt.mem_cache.qsa_hisparse_slots import QSAHiSparseSlots
 
-                if (max_total_num_tokens != 524288 or max_running_requests != 2
+                if (max_running_requests not in (2, 4, 8)
+                        or max_total_num_tokens != max_running_requests * 262144
                         or full_pool_class is not MHATokenToKVPool
                         or self.pool_page_size != 64 or quant_method is not None
                         or self.post_capture_kv_active or self.use_mla_backend):
-                    raise ValueError("QSA P2 requires B2 logical capacity and plain static MHA staging")
-                slots = QSAHiSparseSlots(262144, 64, 2)
+                    raise ValueError("QSA P2 requires bounded logical capacity and plain static MHA staging")
+                slots = QSAHiSparseSlots(262144, 64, max_running_requests)
                 extra_args["full_kv_pool"] = MHATokenToKVPool(
                     size=slots.raw_pool_size, page_size=64, dtype=self.kv_cache_dtype,
                     head_num=self.model_config.get_num_kv_heads(

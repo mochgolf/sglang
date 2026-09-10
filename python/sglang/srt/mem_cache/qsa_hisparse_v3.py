@@ -44,8 +44,11 @@ def stage_short_prefix(hot, tokens, records):
 def validate_configuration(args, pool, *, p2=False, graph=False, strict=True):
     if graph and not p2:
         raise ValueError("only QSA P2 offload supports the bounded graph path")
+    max_requests = getattr(args, "max_running_requests", None) if p2 else 1
+    if p2 and max_requests not in (2, 4, 8):
+        raise ValueError("QSA P2 requires max_running_requests in (2, 4, 8)")
     required = {
-        "max_running_requests": 2 if p2 else 1,
+        "max_running_requests": max_requests,
         "tp_size": 2,
         "pp_size": 1,
         "disable_radix_cache": True,
@@ -53,7 +56,7 @@ def validate_configuration(args, pool, *, p2=False, graph=False, strict=True):
         "cuda_graph_backend_decode": "full" if graph else "disabled",
         "cuda_graph_backend_prefill": "disabled",
         "context_length": 262144,
-        "max_total_tokens": 524288 if p2 else 262144,
+        "max_total_tokens": max_requests * 262144,
         "skip_server_warmup": True,
         "random_seed": 147342228,
         "speculative_algorithm": None,
@@ -64,8 +67,9 @@ def validate_configuration(args, pool, *, p2=False, graph=False, strict=True):
     if not p2 or strict:
         required["enable_deterministic_inference"] = True
     if graph:
-        required.update(disable_cuda_graph_padding=True, cuda_graph_bs_decode=[1, 2],
-                        cuda_graph_max_bs_decode=2, enable_torch_compile=False)
+        required.update(disable_cuda_graph_padding=True,
+                        cuda_graph_bs_decode=list(range(1, max_requests + 1)),
+                        cuda_graph_max_bs_decode=max_requests, enable_torch_compile=False)
     for name, value in required.items():
         if getattr(args, name, None) != value:
             raise ValueError(f"QSA V3 requires {name}={value!r}")
@@ -80,7 +84,7 @@ def validate_configuration(args, pool, *, p2=False, graph=False, strict=True):
     )):
         raise ValueError("QSA V3 does not support DP/overlap")
     full = pool.full_kv_pool
-    if (pool.size != (524288 if p2 else 262144) or pool.page_size != 64 or pool.qsa_compress_ratio != 4
+    if (pool.size != max_requests * 262144 or pool.page_size != 64 or pool.qsa_compress_ratio != 4
             or pool.qsa_token_topk != 2048 or pool.full_layer_nums != 12
             or pool.head_num != 1 or pool.head_dim != 256
             or pool.dtype != torch.float8_e4m3fn

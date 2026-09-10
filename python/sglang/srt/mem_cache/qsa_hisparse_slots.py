@@ -18,8 +18,8 @@ class QSAHiSparseLease:
 class QSAHiSparseSlots:
     def __init__(self, staging_tokens: int, page_size: int, max_requests: int):
         if (page_size < 4 or page_size % 4 or staging_tokens <= 0
-                or staging_tokens % page_size or max_requests not in (1, 2)):
-            raise ValueError("QSA P2 needs page-aligned C4 staging and B1/B2 leases")
+                or staging_tokens % page_size or not 1 <= max_requests <= 8):
+            raise ValueError("QSA P2 needs page-aligned C4 staging and at most eight leases")
         self.staging_tokens = staging_tokens
         self.page_size = page_size
         self.max_requests = max_requests
