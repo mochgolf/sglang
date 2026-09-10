@@ -3407,6 +3407,8 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
         )
+        # Rebuilt batches bypass prepare_for_extend, which normally sets these rows.
+        batch.multimodal_inputs = [req.multimodal_inputs for req in reqs]
 
         req_pool_indices = [r.kv.req_pool_idx for r in reqs]
         batch.req_pool_indices = torch.tensor(

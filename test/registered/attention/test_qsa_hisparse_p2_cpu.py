@@ -39,6 +39,67 @@ class Event:
 
 
 class TestQSAHiSparseP2(unittest.TestCase):
+    def test_ready_batch_preserves_position_metadata(self):
+        from array import array
+
+        from sglang.srt.managers.schedule_batch import Req
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.sampling.sampling_params import SamplingParams
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        reqs = [Req(str(i), "", array("q", range(n)), SamplingParams(max_new_tokens=4))
+                for i, n in enumerate((7, 10, 13), 1)]
+        for i, req in enumerate(reqs, 1):
+            req.kv.req_pool_idx = i
+            req.output_ids = [42]
+        scheduler = SimpleNamespace(
+            device="cpu", req_to_token_pool=SimpleNamespace(device="cpu"),
+            token_to_kv_pool_allocator=None, tree_cache=None,
+            model_config=SimpleNamespace(vocab_size=128, is_encoder_decoder=False),
+            enable_overlap=False, spec_algorithm=SpeculativeAlgorithm.NONE,
+            future_map=Mock(),
+        )
+
+        def build(rows):
+            # Sampling and token relay are unrelated to metadata propagation.
+            with patch("sglang.srt.managers.scheduler.SamplingBatchInfo.from_schedule_batch",
+                       return_value=Mock()), patch(
+                    "sglang.srt.managers.schedule_batch.get_spec",
+                    return_value=SimpleNamespace(speculative_algorithm=None)):
+                batch = Scheduler._build_hisparse_decode_batch(scheduler, rows)
+            self.assertEqual(len(batch.multimodal_inputs), len(rows))
+            for actual, req in zip(batch.multimodal_inputs, rows):
+                self.assertIs(actual, req.multimodal_inputs)
+            return batch
+
+        def positions(batch, expected):
+            forward = ForwardBatch.__new__(ForwardBatch)
+            # First decode consumes the prefill output at the next sequence length.
+            forward.seq_lens = batch.seq_lens + 1
+            forward.seq_lens_cpu = batch.seq_lens_cpu + 1
+            with patch("sglang.srt.model_executor.forward_batch_info.get_exec",
+                       return_value=SimpleNamespace(
+                           deterministic=SimpleNamespace(rl_on_policy_target=None))):
+                forward._compute_mrope_positions_decode(scheduler, batch)
+            self.assertTrue(torch.equal(
+                forward.mrope_positions, torch.tensor([expected] * 3)))
+
+        positions(build(reqs[:1]), [7])
+        positions(build([reqs[1], reqs[0]]), [10, 7])
+        # Distinct metadata proves row/object preservation, not just None padding.
+        reqs[1].multimodal_inputs = SimpleNamespace(
+            mrope_positions=None, mrope_position_delta=torch.tensor(5))
+        batch = build([reqs[1], reqs[0]])
+        positions(batch, [15, 7])
+        batch.filter_batch(keep_indices=[0])
+        self.assertIs(batch.multimodal_inputs[0], reqs[1].multimodal_inputs)
+        batch.merge_batch(build([reqs[2]]))
+        self.assertEqual(batch.reqs, [reqs[1], reqs[2]])
+        self.assertIs(batch.multimodal_inputs[0], reqs[1].multimodal_inputs)
+        self.assertIsNone(batch.multimodal_inputs[1])
+        positions(batch, [15, 13])
+
     def test_batch_isolation_and_real_postflush(self):
         a = QSAHiSparseP2.__new__(QSAHiSparseP2)
         a.mode, a.device, a.rank, a.strict, a.observe = "p2-offload", "cpu", 0, True, "strict"
