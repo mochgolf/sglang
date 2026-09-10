@@ -5,7 +5,10 @@ this is neither a DMA/kernel check nor live TP2/service acceptance.
 """
 
 from contextlib import nullcontext
+import json
 import os
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import unittest
@@ -39,6 +42,25 @@ class Event:
 
 
 class TestQSAHiSparseP2(unittest.TestCase):
+    def test_light_decode_ledger_uses_only_host_schedule(self):
+        adapter = QSAHiSparseP2.__new__(QSAHiSparseP2)
+        adapter.observe, adapter.mode, adapter.rank = "light", "p2-offload", 0
+        adapter.forward_id = 17
+        # No pools exist in this fixture: entering the inventory path must fail.
+        rows = [{"req_pool_idx": 2, "generation": 3, "rid": "B", "lease_slot": 1,
+                 "seq_len": 2051, "tail": 3, "compressed_len": 512,
+                 "closes_c4": False, "ring_location": 8}]
+        with tempfile.TemporaryDirectory() as directory:
+            adapter.path = Path(directory) / "events.jsonl"
+            with patch.object(torch.cuda, "memory_allocated", side_effect=AssertionError("GPU query")), \
+                    patch.object(adapter, "native_lease_snapshot", side_effect=AssertionError("page query")):
+                adapter.record("decode_batch", batch_size=1, rows=rows)
+            record = json.loads(adapter.path.read_text())
+        self.assertEqual(record["rows"], rows)
+        self.assertEqual(record["forward_id"], 17)
+        self.assertEqual(set(record), {"event", "time_ns", "rank", "mode", "observe",
+                                      "forward_id", "batch_size", "rows"})
+
     def test_ready_batch_preserves_position_metadata(self):
         from array import array
 

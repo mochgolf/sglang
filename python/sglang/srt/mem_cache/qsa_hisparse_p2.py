@@ -165,6 +165,14 @@ class QSAHiSparseP2:
     def record(self, event, lease=None, **extra):
         if self.path is None:
             return
+        if self.observe == "light" and event == "decode_batch":
+            # Keep the ordered schedule without synchronizing GPU page inventories.
+            row = {"event": event, "time_ns": time.time_ns(), "rank": self.rank,
+                   "mode": self.mode, "observe": self.observe,
+                   "forward_id": self.forward_id, **extra}
+            with self.path.open("a") as stream:
+                stream.write(json.dumps(row) + "\n")
+            return
         reserved = 0 if self.host_slabs is None else self.host_slabs.nbytes
         active = sum(0 if s.host is None else s.host.nbytes for s in self.requests.values())
         _, mamba_sizes, _ = self.req_pool.mamba_pool.get_contiguous_buf_infos()
