@@ -42,6 +42,11 @@ class Event:
 
 
 class TestQSAHiSparseP2(unittest.TestCase):
+    def test_capture_environment_is_rejected(self):
+        with patch.dict(os.environ, {"SGLANG_QSA_HISPARSE_V3_CAPTURE": "/tmp/old-trace"}), \
+                self.assertRaisesRegex(ValueError, "does not support V3 capture"):
+            QSAHiSparseP2(None, "p2-offload")
+
     def test_graph_routes_events_and_failed_submission(self):
         from sglang.srt.model_executor.runner.shape_key import ShapeKey
         a = QSAHiSparseP2.__new__(QSAHiSparseP2)

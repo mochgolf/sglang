@@ -2040,9 +2040,6 @@ class ModelRunner:
                     ret = self.eager_runner.execute(
                         forward_batch, pp_proxy_tensors=pp_proxy_tensors
                     )
-                    qsa = getattr(getattr(self, "hisparse_coordinator", None), "adapter", None)
-                    if getattr(qsa, "trace", None) is not None:
-                        qsa.trace.finish(graph=False)
 
             if (
                 forward_batch.global_num_tokens_cpu is not None

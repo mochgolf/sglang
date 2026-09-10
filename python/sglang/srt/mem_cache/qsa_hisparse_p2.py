@@ -82,6 +82,8 @@ class QSAHiSparseP2:
     def __init__(self, runner, mode):
         if mode not in ("p2-offload", "p2-resident"):
             raise ValueError("QSA P2 requires an explicit resident/offload arm")
+        if os.environ.get("SGLANG_QSA_HISPARSE_V3_CAPTURE"):
+            raise ValueError("QSA P2 does not support V3 capture")
         self.runner, self.mode = runner, mode
         self.pool = runner.token_to_kv_pool
         self.full = self.pool.full_kv_pool
@@ -116,9 +118,6 @@ class QSAHiSparseP2:
         if (getattr(runner.server_args, "enable_mixed_chunk", False)
                 or getattr(runner.server_args, "enable_priority_preemption", False)):
             raise ValueError("QSA P2 forbids mixed prefill/decode and preemption")
-        capture = os.environ.get("SGLANG_QSA_HISPARSE_V3_CAPTURE")
-        if capture and (not self.strict or mode != "p2-offload"):
-            raise ValueError("P4 trace requires strict P2 offload")
         self.capacity = 262144
         self.slots = QSAHiSparseSlots(self.capacity, 64, 2)
         self.req_pool = runner.req_to_token_pool
@@ -165,11 +164,6 @@ class QSAHiSparseP2:
             self._allocate_decode_workspace()
             if self.graph_enabled:
                 self._allocate_graph_workspace()
-        self.trace = None
-        if capture:
-            from sglang.srt.mem_cache.qsa_hisparse_trace import QSAHiSparseTrace
-
-            self.trace = QSAHiSparseTrace(self, capture)
         self.record("init", allocation_phase="startup", host_alloc_wall_ms=host_alloc_wall_ms)
 
     def _allocate_decode_workspace(self):
@@ -419,8 +413,6 @@ class QSAHiSparseP2:
                         ordered_leases=[
                             [x.req_pool_idx, x.generation, x.rid, x.slot] for x, _ in saved],
                         close_rows=len(closing), writeback_bytes=len(closing) * len(self.layer_ids) * 2048)
-            if getattr(self, "trace", None) is not None:
-                self.trace.finish(graph=True)
         except BaseException as error:
             # A failed copy/event submission may have no completion event to drain.
             # Retain leases and drain both streams before any scheduler can reuse them.
@@ -632,8 +624,6 @@ class QSAHiSparseP2:
                 "rid": state.lease.rid, "lease_slot": state.lease.slot,
                 "start": state.seq_len - batch.extend_seq_lens_cpu[0], "end": state.seq_len,
             }])
-        if getattr(self, "trace", None) is not None:
-            self.trace.begin(batch)
 
     def write_locations(self, logical_locs):
         if self.mode == "p2-resident":
@@ -799,8 +789,6 @@ class QSAHiSparseP2:
                 self.compact_table, self.row_slots)
 
     def capture_decode(self, *args, **kwargs):
-        if getattr(self, "trace", None) is not None:
-            self.trace.attention(*args, **kwargs)
         if (getattr(self, "graph_enabled", False) and self.graph_audit is not None
                 and (self.graph_capture_size is not None or self.graph_batch is not None)):
             li = self.pool._transfer_full_attention_id(args[0].layer_id)
