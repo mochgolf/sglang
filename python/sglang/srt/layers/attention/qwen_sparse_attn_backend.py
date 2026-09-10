@@ -1795,11 +1795,9 @@ class QwenSparseAttnBackend(AttentionBackend):
                 batch,
                 topk,
             )
-            scratch_capacity = (
-                self._cuda_graph_max_tokens * topk
-                if metadata.is_cuda_graph
-                else batch * topk
-            )
+            # Each graph has a fixed row count. Keep its attention view equal
+            # to eager; _get_fa2_scratch retains the larger backing allocation.
+            scratch_capacity = batch * topk
             scratch_dtype = q.dtype if is_fp8_kv_dtype(k_buffer.dtype) else k_buffer.dtype
             packed_k, packed_v = self._get_fa2_scratch(
                 scratch_capacity,
