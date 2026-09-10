@@ -428,10 +428,9 @@ class QSAHiSparseP2:
     def selected(self, layer, raw_indices):
         from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_mla
 
-        if (not 1 <= len(self.batch_requests) <= 2
+        if (not self.offloaded or not 1 <= len(self.batch_requests) <= 2
                 or raw_indices.shape != (len(self.batch_requests), 2051)
-                or raw_indices.dtype != torch.int32 or raw_indices.device != self.compact.device
-                or not self.offloaded):
+                or raw_indices.dtype != torch.int32 or raw_indices.device != self.compact.device):
             raise RuntimeError("QSA P2 selection rows do not match current decode batch")
         li = self.pool._transfer_full_attention_id(layer.layer_id)
         for state in self.batch_requests:
