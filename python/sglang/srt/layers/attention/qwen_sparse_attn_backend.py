@@ -763,6 +763,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         group_plan_valid = None
         decode_page_table = None
         decode_lengths = None
+        decode_score_width = None
         decode_logical_positions = None
         pending_ring_slots = None
         compress_group_ring_locs = None
@@ -807,6 +808,19 @@ class QwenSparseAttnBackend(AttentionBackend):
                         sequence_lengths=sequence_lengths,
                         token_slot_table=token_slot_table,
                     )
+                    if forward_batch.forward_mode.is_decode() and getattr(
+                        forward_batch, "spec_info", None
+                    ) is None:
+                        # Use the same output width as init_cuda_graph_state.
+                        # Keep the eager page table short: only logits padding
+                        # changes, not the index-K reads or MQA compute domain.
+                        max_blocks = math.ceil(
+                            self.max_context_len / self.compress_ratio
+                        )
+                        page_size = pool.qsa_compressed_page_size
+                        decode_score_width = (
+                            max(1, math.ceil(max_blocks / page_size)) * page_size
+                        )
                 pending_ring_slots = build_pending_ring_slots(
                     token_to_batch_idx=token_to_batch_idx,
                     req_pool_indices=row_req_pool_indices,
@@ -848,6 +862,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             compress_plan_valid=group_plan_valid,
             decode_page_table=decode_page_table,
             decode_lengths=decode_lengths,
+            decode_score_width=decode_score_width,
             decode_logical_positions=decode_logical_positions,
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
