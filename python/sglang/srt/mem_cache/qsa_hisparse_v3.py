@@ -41,7 +41,7 @@ def stage_short_prefix(hot, tokens, records):
         tokens[0, :count] = torch.arange(count, dtype=torch.int32, device=hot.device)
 
 
-def validate_configuration(args, pool, *, p2=False, graph=False):
+def validate_configuration(args, pool, *, p2=False, graph=False, strict=True):
     if graph and not p2:
         raise ValueError("only QSA P2 offload supports the bounded graph path")
     required = {
@@ -55,11 +55,14 @@ def validate_configuration(args, pool, *, p2=False, graph=False):
         "context_length": 262144,
         "max_total_tokens": 524288 if p2 else 262144,
         "skip_server_warmup": True,
-        "enable_deterministic_inference": True,
         "random_seed": 147342228,
         "speculative_algorithm": None,
         "disaggregation_mode": "null",
     }
+    # The strict comparison oracle needs batch-invariant math. P2 light runtime
+    # can use the user's native GEMM path; deterministic GEMM dominates B1 cost.
+    if not p2 or strict:
+        required["enable_deterministic_inference"] = True
     if graph:
         required.update(disable_cuda_graph_padding=True, cuda_graph_bs_decode=[1, 2],
                         cuda_graph_max_bs_decode=2, enable_torch_compile=False)

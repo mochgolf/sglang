@@ -87,7 +87,12 @@ class QSAHiSparseP2:
         self.full = self.pool.full_kv_pool
         self.graph_enabled = (mode == "p2-offload" and
                               runner.server_args.cuda_graph_backend_decode == "full")
-        validate_configuration(runner.server_args, self.pool, p2=True, graph=self.graph_enabled)
+        self.observe = os.environ.get("SGLANG_QSA_HISPARSE_V3_OBSERVE", "strict")
+        if self.observe not in ("strict", "light"):
+            raise ValueError("QSA P2 requires strict/light observation")
+        self.strict = self.observe == "strict"
+        validate_configuration(runner.server_args, self.pool, p2=True,
+                               graph=self.graph_enabled, strict=self.strict)
         from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
         from sglang.srt.model_executor.cuda_graph_config import (
@@ -111,10 +116,6 @@ class QSAHiSparseP2:
         if (getattr(runner.server_args, "enable_mixed_chunk", False)
                 or getattr(runner.server_args, "enable_priority_preemption", False)):
             raise ValueError("QSA P2 forbids mixed prefill/decode and preemption")
-        self.observe = os.environ.get("SGLANG_QSA_HISPARSE_V3_OBSERVE", "strict")
-        if self.observe not in ("strict", "light"):
-            raise ValueError("QSA P2 requires strict/light observation")
-        self.strict = self.observe == "strict"
         capture = os.environ.get("SGLANG_QSA_HISPARSE_V3_CAPTURE")
         if capture and (not self.strict or mode != "p2-offload"):
             raise ValueError("P4 trace requires strict P2 offload")

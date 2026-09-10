@@ -314,6 +314,19 @@ class TestQSAHiSparseV3(unittest.TestCase):
         graph_pool = SimpleNamespace(**vars(pool))
         graph_pool.size = 524288
         validate_configuration(graph_args, graph_pool, p2=True, graph=True)
+        validate_configuration(graph_args, graph_pool, p2=True, graph=True, strict=False)
+        native_args = SimpleNamespace(**vars(graph_args))
+        native_args.enable_deterministic_inference = False
+        validate_configuration(native_args, graph_pool, p2=True, graph=True, strict=False)
+        with self.assertRaisesRegex(ValueError, "enable_deterministic_inference"):
+            validate_configuration(native_args, graph_pool, p2=True, graph=True)
+        legacy_args = SimpleNamespace(**vars(args))
+        legacy_args.enable_deterministic_inference = False
+        with self.assertRaisesRegex(ValueError, "enable_deterministic_inference"):
+            validate_configuration(legacy_args, pool, strict=False)
+        native_args.disable_overlap_schedule = False
+        with self.assertRaisesRegex(ValueError, "disable_overlap_schedule"):
+            validate_configuration(native_args, graph_pool, p2=True, graph=True, strict=False)
         graph_args.chunked_prefill_size = 4096
         validate_configuration(graph_args, graph_pool, p2=True, graph=True)
         eager_args = SimpleNamespace(**vars(graph_args))
