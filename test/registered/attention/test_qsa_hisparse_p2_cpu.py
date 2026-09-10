@@ -18,7 +18,7 @@ import torch
 from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
-from sglang.srt.mem_cache.qsa_hisparse_p2 import QSAHiSparseP2, QSAHiSparseCoordinator
+from sglang.srt.mem_cache.qsa_hisparse_p2 import QSAHiSparseP2, QSAHiSparseCoordinator, _RequestCache
 from sglang.srt.mem_cache.qsa_hisparse_slots import QSAHiSparseSlots
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 
@@ -41,6 +41,149 @@ class Event:
 
 
 class TestQSAHiSparseP2(unittest.TestCase):
+    def test_graph_routes_events_and_failed_submission(self):
+        a = QSAHiSparseP2.__new__(QSAHiSparseP2)
+        a.mode, a.device, a.strict, a.path = "p2-offload", "cpu", False, None
+        a.graph_enabled, a.graph_capture_size, a.graph_batch = True, None, None
+        a.graph_copy_pending, a.forward_id, a.offloaded = False, 0, False
+        a.requests, a.pending_releases, a.batch_requests = {}, [], []
+        a.capacity, a.layer_ids = 2112, [3]
+        a.slots = QSAHiSparseSlots(a.capacity, 64, 2)
+        a.full = SimpleNamespace(**{key: [torch.zeros((a.slots.raw_pool_size + 64, 1, 256),
+                                                      dtype=torch.uint8)] for key in ("k_buffer", "v_buffer")})
+        a.pool = SimpleNamespace(dtype=torch.uint8, _transfer_full_attention_id=lambda lid: 0)
+        a.req_table = torch.zeros((3, a.capacity), dtype=torch.int32)
+        a.req_pool = SimpleNamespace(req_generation=[0, 1, 1], enable_mamba_extra_buffer=False,
+                                    req_index_to_mamba_index_mapping=torch.tensor([0, 7, 9]))
+        a.host_slabs = torch.zeros((2, 1, a.capacity // 4, 2048), dtype=torch.uint8)
+        a.copy_stream, a.producer_stream = Mock(), Mock()
+        a._allocate_decode_workspace()
+        a.record = Mock()
+        with patch.object(torch.cuda, "Event", Event), \
+                patch.object(torch.cuda, "stream", side_effect=lambda _: nullcontext()), \
+                patch.object(torch.cuda, "current_stream", return_value=a.producer_stream):
+            a._allocate_graph_workspace()
+            pointers = [t.data_ptr() for t in a.workspace]
+            coord = QSAHiSparseCoordinator(a, None)
+            self.assertIs(coord.num_real_reqs, a.real)
+            a.runner = SimpleNamespace()
+            with patch("sglang.srt.model_executor.runner.flashinfer_autotune.should_run_flashinfer_autotune",
+                       return_value=False):
+                for count in (1, 2):
+                    before = a.slots.snapshot()
+                    with self.assertRaisesRegex(RuntimeError, "capture fault"):
+                        with a.graph_capture(count):
+                            self.assertEqual(int(coord.num_real_reqs[0]), 0)
+                            self.assertEqual(a.raw_write_locs.tolist(), [0] * count)
+                            raise RuntimeError("capture fault")
+                    self.assertEqual(a.slots.snapshot(), before)
+                    self.assertIsNone(a.graph_capture_size)
+                    self.assertFalse(a.offloaded)
+            for idx, rid in ((1, "A"), (2, "B")):
+                lease = a.slots.acquire(idx, 1, rid)
+                state = _RequestCache(a, lease)
+                a.requests[idx] = state
+                a.slots.begin_handoff(lease)
+                state.states.append(state.make_state())
+                ready = Event(); ready.record()
+                a.slots.finish_handoff(lease, ready)
+                a.slots.admit_decode(lease)
+                state.graph_identity = a.native_lease_snapshot(state)
+
+            def batch(indices, seqs):
+                return SimpleNamespace(batch_size=len(indices), req_pool_indices_cpu=torch.tensor(indices),
+                    req_pool_indices=torch.tensor(indices), seq_lens_cpu=torch.tensor(seqs),
+                    seq_lens=torch.tensor(seqs), rids=[a.requests[i].lease.rid for i in indices],
+                    forward_mode=SimpleNamespace(is_idle=lambda: False, is_decode=lambda: True,
+                                                  is_extend=lambda: False))
+
+            routes = a.batch_slots.clone()
+            a.req_pool.req_generation[2] = 2
+            with a.graph_replay_scope(), self.assertRaises(RuntimeError):
+                a.prepare_graph_replay(batch([1, 2], [2051, 2052]), 2)
+            self.assertEqual(a.forward_id, 0)
+            self.assertTrue(torch.equal(a.batch_slots, routes))
+            self.assertIsNone(a.graph_batch)
+            a.req_pool.req_generation[2] = 1
+            a.requests[2].states[0]["hot"][2048].fill_(73)
+            with a.graph_replay_scope():
+                a.prepare_graph_replay(batch([2, 1], [2052, 2051]), 2)
+                self.assertEqual(a.batch_slots.tolist(), [1, 0])
+                self.assertEqual(a.graph_seq_lens.tolist(), [2052, 2051])
+                a.finish_graph_replay(2)
+            self.assertTrue(torch.all(a.requests[2].host[0, 512] == 73))
+            self.assertEqual(a.requests[1].states[0]["writeback_bytes"], 0)
+            self.assertEqual(a.requests[2].states[0]["writeback_bytes"], 2048)
+            self.assertIs(a.requests[2].states[0]["done"], a.graph_copy_done)
+            with a.graph_replay_scope():
+                a.prepare_graph_replay(batch([1], [2052]), 1)
+                a.producer_stream.wait_event.assert_called_with(a.graph_copy_done)
+                a.finish_graph_replay(1)
+            # All tail/close destinations are host metadata; device correctness
+            # is covered separately by the interpreter and the later CUDA gate.
+            for ta in range(4):
+                for tb in range(4):
+                    with a.graph_replay_scope():
+                        a.prepare_graph_replay(batch([1, 2], [2056 + ta, 2060 + tb]), 2)
+                        a.finish_graph_replay(2)
+            self.assertEqual([t.data_ptr() for t in a.workspace], pointers)
+            good_b = a.requests[2].host.clone()
+            with self.assertRaisesRegex(RuntimeError, "injected"), a.graph_replay_scope():
+                a.prepare_graph_replay(batch([1], [2072]), 1)
+                with patch.object(a.graph_copy_done, "record", side_effect=RuntimeError("injected record failure")):
+                    a.finish_graph_replay(1)
+            self.assertEqual(a.slots.phases, {1: "failed", 2: "decode"})
+            self.assertIsNone(a.graph_batch)
+            self.assertEqual(set(a.requests), {1, 2})
+            self.assertTrue(torch.equal(good_b, a.requests[2].host))
+            a.copy_stream.synchronize.assert_called()
+
+    @unittest.skipUnless(os.environ.get("TRITON_INTERPRET") == "1", "explicit CPU interpreter run only")
+    def test_graph_byte_kernels_cpu_interpreter(self):
+        from sglang.srt.layers.attention.qsa.hisparse_graph import close_c4, finish_compact
+
+        capacity, start = 2112, 2176
+        positions = torch.arange(start + 10, dtype=torch.int32)[:, None]
+        dims = torch.arange(256)[None]
+        k = ((positions >> ((dims % 2) * 8)) + dims * 3).to(torch.uint8)
+        v = (k.int() ^ 137).to(torch.uint8)
+        compact = torch.full((2, 4104, 1, 256), 213, dtype=torch.uint8)
+        table = torch.full((2, capacity), -1, dtype=torch.int32)
+        hot = torch.full((4224, 2048), 91, dtype=torch.uint8)
+        tokens = torch.full((2, 2112), -1, dtype=torch.int32)
+        slots, lengths = torch.tensor([1, 0], dtype=torch.int32), torch.tensor([2052, 2051], dtype=torch.int32)
+        real = torch.tensor([2], dtype=torch.int32)
+        members = k[:2048].view(2048, 1, 256)
+        unpacked = torch.stack((torch.stack((members, members ^ 137)),
+                                torch.stack((members ^ 53, members ^ 197))))
+        raw = torch.full((2, 2051), -1, dtype=torch.int32)
+        raw[:, :2048] = torch.arange(2048)
+        raw[1, 2048:] = torch.arange(2048, 2051)
+        for real_count in (0, 2):
+            real.fill_(real_count)
+            before = [x.clone() for x in (hot, tokens, compact, table)]
+            close_c4[(2,)](k, v, hot, tokens, slots, lengths, real, start)
+            finish_compact[(2, 513)](unpacked, k, v, compact, table, raw, slots,
+                                    lengths, real, capacity, start)
+            if real_count == 0:
+                for actual, expected in zip((hot, tokens, compact, table), before):
+                    self.assertTrue(torch.equal(actual, expected))
+            else:
+                expected = torch.cat((k[start + 6:start + 10].flatten(), v[start + 6:start + 10].flatten()))
+                self.assertTrue(torch.equal(hot[2112 + 2048], expected))
+                self.assertTrue(torch.equal(hot[2112 + 512], expected))
+                self.assertTrue(torch.equal(hot[:2112], before[0][:2112]))
+                self.assertEqual(int(tokens[1, 2048]), 512)
+                for row, slot in enumerate(slots.tolist()):
+                    base, tail = slot * 2052, int(lengths[row]) % 4
+                    self.assertTrue(torch.equal(compact[:, base + 1:base + 2049], unpacked[row]))
+                    for plane, source in enumerate((k, v)):
+                        ring = start + slot * 5 + 1
+                        self.assertTrue(torch.equal(compact[plane, base + 2049:base + 2049 + tail],
+                                                    source[ring:ring + tail].view(tail, 1, 256)))
+                    self.assertTrue(torch.equal(table[slot, raw[row, :2048 + tail].long()],
+                                                torch.arange(base + 1, base + 2049 + tail, dtype=torch.int32)))
+
     def test_light_decode_ledger_uses_only_host_schedule(self):
         adapter = QSAHiSparseP2.__new__(QSAHiSparseP2)
         adapter.observe, adapter.mode, adapter.rank = "light", "p2-offload", 0

@@ -83,6 +83,7 @@ from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import FullCudaGraphBackend
 from sglang.srt.model_executor.runner_backend.utils import resolve_decode_backend
 from sglang.srt.model_executor.runner_backend_utils import (
     CUDA_GRAPH_CAPTURE_FAILED_MSG,
@@ -1179,7 +1180,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
         # that wraps the warmup/capture forward.
-        with forward_context(ForwardContext(attn_backend=attn_backend)):
+        qsa = getattr(self.model_runner.hisparse_coordinator, "adapter", None)
+        if getattr(qsa, "graph_enabled", False) and not isinstance(self.backend, FullCudaGraphBackend):
+            raise RuntimeError("QSA bounded capture requires the native full graph backend")
+        qsa_capture = (qsa.graph_capture(bs) if getattr(qsa, "graph_enabled", False)
+                       else empty_context())
+        with forward_context(ForwardContext(attn_backend=attn_backend)), qsa_capture:
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
             if forward_batch.lora_ids is not None:
@@ -1292,6 +1298,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.deepep_adapter.replay()
 
+        qsa = getattr(self.model_runner.hisparse_coordinator, "adapter", None)
+        if (getattr(qsa, "graph_enabled", False)
+                and not forward_batch.needs_forward_metadata_init()):
+            raise RuntimeError("QSA graph replay does not support external preplanning")
+
         if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
@@ -1357,6 +1368,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens
             )
+
+        if getattr(qsa, "graph_enabled", False):
+            qsa.prepare_graph_replay(forward_batch, bs)
 
         self.buffer_registry.fill_from(
             forward_batch,
@@ -1436,7 +1450,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if is_ragged:
             self._ragged_graph_size = graph_size_key
 
-        if self.model_runner.hisparse_coordinator is not None:
+        if self.model_runner.hisparse_coordinator is not None and not getattr(qsa, "graph_enabled", False):
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
         variant_label = self._resolve_lora_variant(forward_batch)
@@ -1462,7 +1476,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         shared_read_ends = self._resolve_shared_read_ends(
             self._replay_attn_backend(), forward_batch.forward_mode
         )
-        with timer_ctx, self.backend.replay_session():
+        qsa = getattr(self.model_runner.hisparse_coordinator, "adapter", None)
+        qsa_scope = (qsa.graph_replay_scope() if getattr(qsa, "graph_enabled", False)
+                     else empty_context())
+        with timer_ctx, self.backend.replay_session(), qsa_scope:
             self.load_batch(forward_batch, pp_proxy_tensors)
             if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():
                 logger.info(
@@ -1482,6 +1499,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._publish_read_done(in_graph=False)
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
+            if getattr(qsa, "graph_enabled", False):
+                qsa.finish_graph_replay(self.bs)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

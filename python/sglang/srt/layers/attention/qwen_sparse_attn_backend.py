@@ -1711,7 +1711,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         if save_kv_cache:
             self._store_kv(layer, forward_batch.out_cache_loc, k, v)
             if self.hisparse_v3 is not None:
-                self.hisparse_v3.after_store(layer)
+                if (getattr(self.hisparse_v3, "graph_enabled", False)
+                        and self._resolve_metadata(forward_batch).is_cuda_graph):
+                    self.hisparse_v3.after_store(layer, graph=True)
+                else:
+                    self.hisparse_v3.after_store(layer)
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         return self._forward_paged_attention(q, layer, forward_batch, topk_indices)
 
@@ -1751,9 +1755,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             else forward_batch.req_pool_indices
         )
         if self.hisparse_v3 is not None and self.hisparse_v3.offloaded:
+            graph_args = ({"graph": True} if metadata.is_cuda_graph and
+                          getattr(self.hisparse_v3, "graph_enabled", False) else {})
             k_buffer, v_buffer, req_table, row_req_indices = self.hisparse_v3.selected(
-                layer, topk_indices
-            )
+                layer, topk_indices, **graph_args)
         # Both V3 arms use the same FA2 decode implementation.
         trtllm_decode = None if self.hisparse_v3 is not None else _resolve_trtllm_sparse_decode()
         if trtllm_decode is not None:

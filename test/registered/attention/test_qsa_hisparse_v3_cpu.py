@@ -305,6 +305,24 @@ class TestQSAHiSparseV3(unittest.TestCase):
             setattr(changed, name, bad)
             with self.assertRaises(ValueError):
                 validate_configuration(changed, pool)
+        graph_args = SimpleNamespace(**vars(args))
+        graph_args.max_running_requests, graph_args.max_total_tokens = 2, 524288
+        graph_args.cuda_graph_backend_decode = "full"
+        graph_args.disable_cuda_graph_padding = True
+        graph_args.cuda_graph_bs_decode, graph_args.cuda_graph_max_bs_decode = [1, 2], 2
+        graph_args.enable_torch_compile = False
+        graph_pool = SimpleNamespace(**vars(pool))
+        graph_pool.size = 524288
+        validate_configuration(graph_args, graph_pool, p2=True, graph=True)
+        for name, bad in (("disable_cuda_graph_padding", False), ("cuda_graph_bs_decode", [2]),
+                          ("cuda_graph_max_bs_decode", 4), ("enable_torch_compile", True),
+                          ("cuda_graph_backend_decode", "breakable")):
+            changed = SimpleNamespace(**vars(graph_args))
+            setattr(changed, name, bad)
+            with self.assertRaises(ValueError):
+                validate_configuration(changed, graph_pool, p2=True, graph=True)
+        with self.assertRaises(ValueError):
+            validate_configuration(graph_args, graph_pool, graph=True)
 
     def test_stale_release(self):
         adapter = QSAHiSparseV3.__new__(QSAHiSparseV3)

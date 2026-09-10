@@ -3,6 +3,7 @@
 import json
 import os
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -84,18 +85,29 @@ class QSAHiSparseP2:
         self.runner, self.mode = runner, mode
         self.pool = runner.token_to_kv_pool
         self.full = self.pool.full_kv_pool
-        validate_configuration(runner.server_args, self.pool, p2=True)
+        self.graph_enabled = (mode == "p2-offload" and
+                              runner.server_args.cuda_graph_backend_decode == "full")
+        validate_configuration(runner.server_args, self.pool, p2=True, graph=self.graph_enabled)
         from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
         from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-        from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
+        from sglang.srt.model_executor.cuda_graph_config import (
+            check_cuda_graph_backend, cuda_graph_fully_disabled,
+        )
+
+        graph_ok = (check_cuda_graph_backend("decode", "full")
+                    and check_cuda_graph_backend("prefill", "disabled")) if self.graph_enabled else cuda_graph_fully_disabled()
+        if self.graph_enabled:
+            from sglang.srt.runtime_context import get_exec
+            cfg = get_exec().graph.cuda_graph_config.decode
+            graph_ok = graph_ok and cfg.bs == [1, 2] and cfg.max_bs == 2
 
         if (not str(self.pool.device).startswith("cuda")
-                or not cuda_graph_fully_disabled()
+                or not graph_ok
                 or type(self.full) is not MHATokenToKVPool
                 or type(runner.token_to_kv_pool_allocator) is not PagedTokenToKVPoolAllocator
                 or getattr(runner, "_unified_memory_pool", None) is not None
                 or getattr(self.pool, "qsa_hisparse_v3", None) is not None):
-            raise ValueError("QSA P2 needs one eager backend and independent static pools")
+            raise ValueError("QSA P2 needs its bounded backend and independent static pools")
         if (getattr(runner.server_args, "enable_mixed_chunk", False)
                 or getattr(runner.server_args, "enable_priority_preemption", False)):
             raise ValueError("QSA P2 forbids mixed prefill/decode and preemption")
@@ -129,6 +141,9 @@ class QSAHiSparseP2:
         self.offloaded = False
         self.forward_id = 0
         self.raw_write_locs = None
+        self.graph_capture_size = None
+        self.graph_batch = None
+        self.graph_copy_pending = False
         directory = os.environ.get("SGLANG_QSA_HISPARSE_V3_EVENTS")
         self.path = None
         if directory:
@@ -142,6 +157,8 @@ class QSAHiSparseP2:
             self.host_slabs = torch.empty((2, 12, self.capacity // 4, 2048), dtype=torch.uint8, pin_memory=True)
             host_alloc_wall_ms = (time.monotonic() - start) * 1000
             self._allocate_decode_workspace()
+            if self.graph_enabled:
+                self._allocate_graph_workspace()
         self.record("init", allocation_phase="startup", host_alloc_wall_ms=host_alloc_wall_ms)
 
     def _allocate_decode_workspace(self):
@@ -183,6 +200,145 @@ class QSAHiSparseP2:
             self.layer_states.append(shared)
             self.workspace.extend(t for name, t in shared.items() if name != "hot")
 
+    def _allocate_graph_workspace(self):
+        self.graph_seq_lens = torch.zeros(2, dtype=torch.int32, device=self.device)
+        self.graph_row_ids = torch.arange(2, dtype=torch.int32, device=self.device)[:, None]
+        self.workspace.extend((self.graph_seq_lens, self.graph_row_ids))
+        self.graph_producer = torch.cuda.Event()
+        self.graph_copy_done = torch.cuda.Event()
+        self.graph_audit = None
+        if self.strict:
+            layers = len(self.layer_ids)
+            self.graph_audit = {
+                "raw": torch.zeros((layers, 2, 2051), dtype=torch.int32, device=self.device),
+                "compact": torch.zeros((layers, *self.compact.shape), dtype=torch.uint8, device=self.device),
+                "mapping": torch.zeros((layers, 2, 2051), dtype=torch.int32, device=self.device),
+                "miss_count": torch.zeros((layers, 2), dtype=torch.int32, device=self.device),
+                "valid_counts": torch.zeros((layers, 2), dtype=torch.int32, device=self.device),
+            }
+            self.workspace.extend(self.graph_audit.values())
+
+    @contextmanager
+    def graph_capture(self, count):
+        if (not self.graph_enabled or count not in (1, 2) or self.requests
+                or self.slots.active or self.pending_releases or self.graph_batch is not None
+                or self.graph_capture_size is not None):
+            raise RuntimeError("QSA graph capture needs exact B1/B2 and no live leases")
+        from sglang.srt.model_executor.runner.flashinfer_autotune import should_run_flashinfer_autotune
+        if should_run_flashinfer_autotune(self.runner):
+            raise RuntimeError("QSA graph capture does not permit earlier autotune dummy forwards")
+        self.graph_capture_size = count
+        self.offloaded = True
+        self.raw_write_locs = self.batch_write_locs[:count]
+        self.row_slots = self.batch_slots[:count]
+        self.real.zero_()
+        self.batch_write_locs.zero_()  # Reserved raw row zero, never a lease ring.
+        self.batch_slots.zero_()
+        self.batch_lens.zero_()
+        self.graph_seq_lens.zero_()
+        self.compact.zero_()
+        self.compact_table.zero_()
+        self.miss_count.zero_()
+        for shared in self.layer_states:
+            shared["hot"].zero_()
+        try:
+            yield
+        finally:
+            self.graph_capture_size = None
+            self.offloaded = False
+            self.raw_write_locs = None
+            self.real.zero_()
+            if self.requests or self.slots.active or self.pending_releases:
+                raise RuntimeError("QSA graph capture acquired live ownership")
+
+    def prepare_graph_replay(self, batch, count):
+        if (not self.graph_enabled or count != batch.batch_size or count not in (1, 2)
+                or not batch.forward_mode.is_decode() or self.graph_batch is not None
+                or self.graph_capture_size is not None):
+            raise RuntimeError("QSA graph replay requires exact unpadded decode rows")
+        self.begin_batch(batch, graph=True)
+        # One stream wait protects every newest row before a new replay can write.
+        if self.graph_copy_pending:
+            torch.cuda.current_stream(self.device).wait_event(self.graph_copy_done)
+        self.graph_seq_lens[:count].copy_(batch.seq_lens_cpu[:count])
+
+    @contextmanager
+    def graph_replay_scope(self):
+        try:
+            yield
+        except BaseException:
+            self.fail_graph_replay()
+            raise
+
+    def fail_graph_replay(self):
+        saved = self.graph_batch
+        if saved is None:
+            return
+        try:
+            torch.cuda.current_stream(self.device).synchronize()
+            self.copy_stream.synchronize()
+        finally:
+            for lease, _ in saved:
+                if self.slots.active.get(lease.req_pool_idx) == lease:
+                    self.slots.phases[lease.req_pool_idx] = "failed"
+            self.graph_batch = None
+
+    def finish_graph_replay(self, count):
+        saved = self.graph_batch
+        if saved is None or len(saved) != count:
+            raise RuntimeError("QSA graph replay has no matching prepared batch")
+        try:
+            for lease, seq in saved:
+                state = self._request(lease.req_pool_idx, lease.rid)
+                self.slots.require(lease, "decode")
+                if state.lease != lease or state.seq_len != seq:
+                    raise RuntimeError("QSA graph writeback generation/sequence changed")
+            producer = torch.cuda.current_stream(self.device)
+            self.graph_producer.record(producer)
+            closing = [(self.requests[lease.req_pool_idx], seq // 4 - 1)
+                       for lease, seq in saved if seq % 4 == 0]
+            if closing:
+                with torch.cuda.stream(self.copy_stream):
+                    self.copy_stream.wait_event(self.graph_producer)
+                    for state, block in closing:
+                        for li, layer_state in enumerate(state.states):
+                            state.host[li, block].copy_(layer_state["hot"][2048], non_blocking=True)
+                    self.graph_copy_done.record(self.copy_stream)
+                self.graph_copy_pending = True
+                for state, _ in closing:
+                    for layer_state in state.states:
+                        layer_state.update(done=self.graph_copy_done, copy_begin=None)
+                        layer_state["writeback_bytes"] += 2048
+            if self.strict:
+                self.graph_producer.synchronize()
+                if closing:
+                    self.graph_copy_done.synchronize()
+                self._check_graph_selected(saved)
+            self.record("graph_replay", batch_size=count, graph_key=count,
+                        graph_backend="full", ordered_leases=[
+                            [x.req_pool_idx, x.generation, x.rid, x.slot] for x, _ in saved],
+                        close_rows=len(closing), writeback_bytes=len(closing) * len(self.layer_ids) * 2048)
+        except BaseException:
+            # A failed copy/event submission may have no completion event to drain.
+            # Retain leases and drain both streams before any scheduler can reuse them.
+            self.fail_graph_replay()
+            raise
+        finally:
+            self.graph_batch = None
+
+    def _check_graph_selected(self, saved):
+        for row, (lease, seq) in enumerate(saved):
+            state = self.requests[lease.req_pool_idx]
+            for li, lid in enumerate(self.layer_ids):
+                raw = self.graph_audit["raw"][li, row:row + 1]
+                compact = self.graph_audit["compact"][li, :, lease.slot * 2052:(lease.slot + 1) * 2052]
+                state.check_selected(SimpleNamespace(layer_id=lid), raw, raw[:, :2048:4] // 4,
+                                     self.graph_audit["miss_count"][li, row:row + 1],
+                                     compact=compact,
+                                     mapping=self.graph_audit["mapping"][li, row, :2048 + seq % 4])
+                if int(self.graph_audit["valid_counts"][li, row]) != 2048 + seq % 4:
+                    raise AssertionError("QSA graph FA2 valid count differs")
+
     def native_lease_snapshot(self, state, *, include_pages=False):
         lease = state.lease
         self.slots.require(lease)
@@ -211,7 +367,7 @@ class QSAHiSparseP2:
     def record(self, event, lease=None, **extra):
         if self.path is None:
             return
-        if self.observe == "light" and event == "decode_batch":
+        if self.observe == "light" and event in ("decode_batch", "graph_replay"):
             # Keep the ordered schedule without synchronizing GPU page inventories.
             row = {"event": event, "time_ns": time.time_ns(), "rank": self.rank,
                    "mode": self.mode, "observe": self.observe,
@@ -271,7 +427,7 @@ class QSAHiSparseP2:
             raise RuntimeError("QSA P2 request identity/generation changed")
         return state
 
-    def begin_batch(self, batch):
+    def begin_batch(self, batch, *, graph=False):
         if batch.forward_mode.is_idle():
             self.batch_requests = []
             return
@@ -302,8 +458,14 @@ class QSAHiSparseP2:
                 self.record("begin_prefill", lease)
             state = self._request(req_idx, rid)
             self.slots.require(state.lease, "decode" if decode else "prefill")
+            if graph and (len(state.states) != len(self.layer_ids)
+                          or any(s["generation"] != state.generation for s in state.states)
+                          or state.graph_identity != self.native_lease_snapshot(state)):
+                raise RuntimeError("QSA graph native/layer ownership changed")
             states.append(state)
         # Validate the entire batch before advancing either request's decode state.
+        if graph:
+            self.graph_batch = tuple((state.lease, seq) for state, seq in zip(states, seq_lens))
         self.forward_id += 1
         self.batch_requests = states
         for state, seq in zip(states, seq_lens):
@@ -411,6 +573,8 @@ class QSAHiSparseP2:
         done.synchronize()
         state.handoff_event = done
         self.slots.finish_handoff(lease, done)
+        if getattr(self, "graph_enabled", False):
+            state.graph_identity = self.native_lease_snapshot(state)
         if before != self.runner.token_to_kv_pool_allocator.available_size():
             raise AssertionError("QSA P2 handoff changed logical index ownership")
         self.record("handoff_complete", lease, prompt_len=prompt_len,
@@ -418,31 +582,43 @@ class QSAHiSparseP2:
                     host_slab_ptr=None if state.host is None else state.host.data_ptr())
         return lease, done
 
-    def after_store(self, layer):
+    def after_store(self, layer, *, graph=False):
+        if graph:
+            from sglang.srt.layers.attention.qsa.hisparse_graph import close_c4
+            li = self.pool._transfer_full_attention_id(layer.layer_id)
+            count = self.graph_capture_size or len(self.graph_batch or ())
+            if not self.graph_enabled or count not in (1, 2):
+                raise RuntimeError("QSA C4 close has no graph context")
+            close_c4[(count,)](
+                self.full.k_buffer[li].view(torch.uint8), self.full.v_buffer[li].view(torch.uint8),
+                self.layer_states[li]["hot"], self.layer_states[li]["tokens"],
+                self.batch_slots, self.graph_seq_lens, self.real,
+                self.slots.page_size + self.slots.staging_tokens)
+            return
         if self.offloaded:
             for state in self.batch_requests:
                 self.slots.require(state.lease, "decode")
                 state.after_store(layer)
 
     @profile_method("qsa.selected", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
-    def selected(self, layer, raw_indices):
+    def selected(self, layer, raw_indices, *, graph=False):
         from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_mla
 
-        if (not self.offloaded or not 1 <= len(self.batch_requests) <= 2
-                or raw_indices.shape != (len(self.batch_requests), 2051)
+        count = (self.graph_capture_size or len(self.graph_batch or ())) if graph else len(self.batch_requests)
+        if (not self.offloaded or not 1 <= count <= 2
+                or raw_indices.shape != (count, 2051)
                 or raw_indices.dtype != torch.int32 or raw_indices.device != self.compact.device):
             raise RuntimeError("QSA P2 selection rows do not match current decode batch")
         li = self.pool._transfer_full_attention_id(layer.layer_id)
-        for state in self.batch_requests:
+        for state in (() if graph else self.batch_requests):
             self._request(state.lease.req_pool_idx, state.lease.rid)
             self.slots.require(state.lease, "decode")
             if state.states[li]["generation"] != state.generation:
                 raise RuntimeError("stale QSA batched selected state")
-        for state in self.batch_requests:
+        for state in (() if graph else self.batch_requests):
             done = state.states[li]["done"]
             if done is not None:
                 torch.cuda.current_stream(self.device).wait_event(done)
-        count = len(self.batch_requests)
         shared, blocks = self.layer_states[li], self.blocks[:count]
         with operations_nvtx_range("qsa.resolve_refetch"):
             torch.div(raw_indices[:, :2048:4], 4, rounding_mode="floor", out=blocks)
@@ -456,20 +632,39 @@ class QSAHiSparseP2:
         with operations_nvtx_range("qsa.hot_gather"):
             gather_indices = self.gather_indices[:count * 512]
             gather_indices.copy_(self.out[:count].view(-1))
+            if graph:
+                # Preserve native invalid output; mask only inactive capture rows.
+                gather_indices.view(count, 512).masked_fill_(self.graph_row_ids[:count] >= self.real, 0)
             torch.index_select(shared["hot"], 0, gather_indices, out=self.gathered[:count * 512])
         with operations_nvtx_range("qsa.indexed_unpack"):
             torch.index_select(self.gathered.view(-1, 256), 0, self.indices[:count * 4096],
                                out=self.unpacked[:count].view(-1, 256))
-        # ponytail: compact/tail mapping and C4 writeback stay per-row eager until graph work.
-        for row, state in enumerate(self.batch_requests):
-            state.finish_selected(layer, raw_indices[row:row + 1], blocks[row:row + 1],
-                                  self.unpacked[row], self.miss_count[row:row + 1])
+        if graph:
+            from sglang.srt.layers.attention.qsa.hisparse_graph import finish_compact
+            finish_compact[(count, 513)](
+                self.unpacked, self.full.k_buffer[li].view(torch.uint8),
+                self.full.v_buffer[li].view(torch.uint8), self.compact, self.compact_table,
+                raw_indices, self.batch_slots, self.graph_seq_lens, self.real, self.capacity,
+                self.slots.page_size + self.slots.staging_tokens)
+            if self.graph_audit is not None:
+                self.graph_audit["raw"][li, :count].copy_(raw_indices)
+                self.graph_audit["compact"][li].copy_(self.compact)
+                mapping = self.compact_table[self.row_slots[:, None].long(), raw_indices.clamp_min(0).long()]
+                self.graph_audit["mapping"][li, :count].copy_(mapping)
+                self.graph_audit["miss_count"][li, :count].copy_(self.miss_count[:count])
+        else:
+            for row, state in enumerate(self.batch_requests):
+                state.finish_selected(layer, raw_indices[row:row + 1], blocks[row:row + 1],
+                                      self.unpacked[row], self.miss_count[row:row + 1])
         return (self.compact[0].view(self.pool.dtype), self.compact[1].view(self.pool.dtype),
                 self.compact_table, self.row_slots)
 
     def capture_decode(self, *args, **kwargs):
-        # The V3 per-token tensor capture is explicitly rejected at P2 startup.
-        return
+        if (getattr(self, "graph_enabled", False) and self.graph_audit is not None
+                and (self.graph_capture_size is not None or self.graph_batch is not None)):
+            li = self.pool._transfer_full_attention_id(args[0].layer_id)
+            valid_counts = args[8]
+            self.graph_audit["valid_counts"][li, :valid_counts.numel()].copy_(valid_counts)
 
     def release(self, req_idx, rid):
         if req_idx not in self.requests:
@@ -537,7 +732,8 @@ class QSAHiSparseCoordinator:
         # Validation only: hold the first request until both prefills finish so
         # resident/offload controls have identical first-decode membership.
         self.wait_initial_pair = initial_pair == "1"
-        self.num_real_reqs = torch.ones(1, dtype=torch.int32, device=adapter.device)
+        self.num_real_reqs = (adapter.real if adapter.mode == "p2-offload" else
+                              torch.ones(1, dtype=torch.int32, device=adapter.device))
 
     def set_decode_producer_stream(self, stream):
         if stream is None:

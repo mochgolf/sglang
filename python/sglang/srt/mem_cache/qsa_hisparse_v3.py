@@ -41,14 +41,16 @@ def stage_short_prefix(hot, tokens, records):
         tokens[0, :count] = torch.arange(count, dtype=torch.int32, device=hot.device)
 
 
-def validate_configuration(args, pool, *, p2=False):
+def validate_configuration(args, pool, *, p2=False, graph=False):
+    if graph and not p2:
+        raise ValueError("only QSA P2 offload supports the bounded graph path")
     required = {
         "max_running_requests": 2 if p2 else 1,
         "tp_size": 2,
         "pp_size": 1,
         "disable_radix_cache": True,
         "disable_overlap_schedule": True,
-        "cuda_graph_backend_decode": "disabled",
+        "cuda_graph_backend_decode": "full" if graph else "disabled",
         "cuda_graph_backend_prefill": "disabled",
         "context_length": 262144,
         "max_total_tokens": 524288 if p2 else 262144,
@@ -59,6 +61,9 @@ def validate_configuration(args, pool, *, p2=False):
         "speculative_algorithm": None,
         "disaggregation_mode": "null",
     }
+    if graph:
+        required.update(disable_cuda_graph_padding=True, cuda_graph_bs_decode=[1, 2],
+                        cuda_graph_max_bs_decode=2, enable_torch_compile=False)
     for name, value in required.items():
         if getattr(args, name, None) != value:
             raise ValueError(f"QSA V3 requires {name}={value!r}")
@@ -442,8 +447,18 @@ class QSAHiSparseV3:
             valid = raw_indices[0, :2048 + tail].long()
             base = getattr(self, "compact_base", 0)
             self.compact_table[0, valid] = torch.arange(1 + base, 2049 + tail + base, dtype=torch.int32, device=self.device)
+        self.check_selected(layer, raw_indices, blocks, miss_count)
+
+    def check_selected(self, layer, raw_indices, blocks, miss_count, *, compact=None, mapping=None):
+        """Independent host-byte oracle, also callable on post-replay snapshots."""
         check = self.strict and (self.decode_steps in (1, 2, 3, 384, 767) or self.seq_len % 4 == 0)
         if check:
+            li = self.pool._transfer_full_attention_id(layer.layer_id)
+            state = self.states[li]
+            tail, base = self.seq_len % 4, getattr(self, "compact_base", 0)
+            valid = raw_indices[0, :2048 + tail].long()
+            compact = self.compact if compact is None else compact
+            mapping = self.compact_table[0, valid] if mapping is None else mapping
             ids = blocks[0].cpu().long()
             if len(torch.unique(ids)) != 512 or int(ids.min()) < 0 or int(ids.max()) >= self.seq_len // 4:
                 raise AssertionError("invalid selected C4 set")
@@ -454,7 +469,7 @@ class QSAHiSparseV3:
                 state["done"].synchronize()
             expected = self.host[li].index_select(0, ids)
             ek, ev = expected[:, :1024].reshape(-1, 1, 256), expected[:, 1024:].reshape(-1, 1, 256)
-            if not torch.equal(self.compact[0, 1:2049].cpu(), ek) or not torch.equal(self.compact[1, 1:2049].cpu(), ev):
+            if not torch.equal(compact[0, 1:2049].cpu(), ek) or not torch.equal(compact[1, 1:2049].cpu(), ev):
                 raise AssertionError("selected unpack K/V bytes differ")
             if not torch.equal(raw_indices[0, 2048:].cpu(), torch.cat((
                 torch.arange(self.seq_len - tail, self.seq_len, dtype=torch.int32),
@@ -462,14 +477,15 @@ class QSAHiSparseV3:
             ))):
                 raise AssertionError("pending tail indices/mask differ")
             for plane, source in ((0, self.full.k_buffer[li]), (1, self.full.v_buffer[li])):
-                if not torch.equal(self.compact[plane, 2049:2049 + tail].cpu(), source[1:1 + tail].view(torch.uint8).cpu()):
+                if not torch.equal(compact[plane, 2049:2049 + tail].cpu(), source[1:1 + tail].view(torch.uint8).cpu()):
                     raise AssertionError("pending tail bytes differ")
-            if not torch.equal(self.compact_table[0, valid].cpu(), torch.arange(1 + base, 2049 + tail + base, dtype=torch.int32)):
+            if not torch.equal(mapping.cpu(), torch.arange(1 + base, 2049 + tail + base, dtype=torch.int32)):
                 raise AssertionError("compact physical mapping differs")
             self.record("selected_check", layer=layer.layer_id, bytes_checked=2048 * 512,
                         tail=tail, tail_bytes_checked=tail * 512, mapping_checked=True,
                         page_boundary=self.seq_len % 64 == 0,
-                        latest_writeback_event_ms=(state["copy_begin"].elapsed_time(state["done"]) if state["done"] is not None else None),
+                        latest_writeback_event_ms=(state["copy_begin"].elapsed_time(state["done"])
+                                                  if state.get("copy_begin") is not None else None),
                         writeback_bytes=state["writeback_bytes"], miss_count=int(miss_count[0]))
 
     def release(self, req_idx, rid):
