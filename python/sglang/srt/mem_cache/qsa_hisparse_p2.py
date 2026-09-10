@@ -58,6 +58,8 @@ class _RequestCache(QSAHiSparseV3):
         self.handoff_event = None
 
     def make_state(self):
+        self.adapter.slots.require(self.lease, "copying")
+        self.adapter._request(self.lease.req_pool_idx, self.lease.rid)
         shared = self.adapter.layer_states[len(self.states)]
         slot = self.lease.slot
         state = {name: shared[name][slot:slot + 1] for name in ("tokens", "lru")}

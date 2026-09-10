@@ -334,6 +334,7 @@ class TestQSAHiSparseP2(unittest.TestCase):
 
             state_b = a.requests[req_b.kv.req_pool_idx]
             host_b = state_b.host.clone()
+            state_a = a.requests[req_a.kv.req_pool_idx]
             lease_a = a.release(req_a.kv.req_pool_idx, "A")
             logical.free_group_begin()
             logical.free(ar)
@@ -359,6 +360,9 @@ class TestQSAHiSparseP2(unittest.TestCase):
             self.assertEqual(a.requests[req_c.kv.req_pool_idx].generation, lease_a.generation + 1)
             with self.assertRaisesRegex(RuntimeError, "stale"):
                 a.after_release(lease_a)
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                state_a.make_state()
+            self.assertTrue(torch.equal(state_b.states[0]["hot"], b_hot))
             backend._store_kv(layer, cr[:2048], torch.full((2048, 1, 256), 53, dtype=torch.uint8),
                               torch.full((2048, 1, 256), 67, dtype=torch.uint8))
             coord.admit_request_into_staging(req_c)
