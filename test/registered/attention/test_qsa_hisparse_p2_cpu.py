@@ -131,6 +131,22 @@ class TestQSAHiSparseP2(unittest.TestCase):
             self.assertTrue(torch.equal(a.batch_slots, routes))
             self.assertIsNone(a.graph_batch)
             a.req_pool.req_generation[2] = 1
+            row_table = a.req_table
+            a.req_table = row_table.clone()
+            with self.assertRaisesRegex(RuntimeError, "native/layer ownership"):
+                a.prepare_graph_replay(batch([1], [2051]), 1)
+            a.req_table = row_table
+            a.requests[1].states[0]["generation"] += 1
+            with self.assertRaisesRegex(RuntimeError, "native/layer ownership"):
+                a.prepare_graph_replay(batch([1], [2051]), 1)
+            a.requests[1].states[0]["generation"] -= 1
+            # Full device-identity validation remains mandatory for strict mode.
+            a.strict = True
+            a.req_pool.req_index_to_mamba_index_mapping[1] += 1
+            with self.assertRaisesRegex(RuntimeError, "native/layer ownership"):
+                a.prepare_graph_replay(batch([1], [2051]), 1)
+            a.req_pool.req_index_to_mamba_index_mapping[1] -= 1
+            a.strict = False
             state = a.requests[1]
             state.full.k_buffer[0][1:5].fill_(7)
             state.full.v_buffer[0][1:5].fill_(13)
@@ -149,10 +165,14 @@ class TestQSAHiSparseP2(unittest.TestCase):
             state.states[0]["hot"][2048].copy_(expected)
             state.host[0, 512].copy_(expected)
             a.requests[2].states[0]["hot"][2048].fill_(73)
-            with a.graph_replay_scope():
+            with patch.object(a, "native_lease_snapshot", side_effect=AssertionError("light D2H read")), \
+                    a.graph_replay_scope():
                 a.prepare_graph_replay(batch([2, 1], [2052, 2051]), 2)
                 self.assertEqual(a.batch_slots.tolist(), [1, 0])
                 self.assertEqual(a.graph_seq_lens.tolist(), [2052, 2051])
+                self.assertEqual(a.batch_lens.tolist(), [513, 512])
+                self.assertEqual(a.raw_write_locs.tolist(), a.graph_write_locs_cpu.tolist())
+                self.assertEqual(a.graph_metadata_cpu.tolist(), [[1, 0], [513, 512], [2052, 2051]])
                 key = ShapeKey(size=2)
                 backend = SimpleNamespace(_graphs={key: object()})
                 a.finish_graph_replay(2, native_key=key, native_backend=backend)
@@ -164,6 +184,9 @@ class TestQSAHiSparseP2(unittest.TestCase):
             self.assertIs(a.requests[2].states[0]["done"], a.graph_copy_done)
             with a.graph_replay_scope():
                 a.prepare_graph_replay(batch([1], [2052]), 1)
+                self.assertEqual(a.row_slots.tolist(), [0])
+                self.assertEqual(int(a.batch_lens[0]), 513)
+                self.assertEqual(int(a.graph_seq_lens[0]), 2052)
                 a.producer_stream.wait_event.assert_called_with(a.graph_copy_done)
                 a.finish_graph_replay(1)
             # All tail/close destinations are host metadata; device correctness
@@ -189,6 +212,10 @@ class TestQSAHiSparseP2(unittest.TestCase):
             self.assertTrue(caught.exception.__notes__)
             lease = a.requests[1].lease
             self.assertEqual(a.graph_failed_leases, {lease})
+            metadata = a.graph_metadata_cpu.clone()
+            with self.assertRaisesRegex(RuntimeError, "drained prior work"):
+                a.prepare_graph_replay(batch([2], [2073]), 1)
+            self.assertTrue(torch.equal(a.graph_metadata_cpu, metadata))
             with patch.object(a.copy_stream, "synchronize", side_effect=RuntimeError("still pending")), \
                     self.assertRaisesRegex(RuntimeError, "still pending"):
                 a.release(1, "A")

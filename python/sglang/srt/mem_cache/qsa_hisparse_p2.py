@@ -214,7 +214,13 @@ class QSAHiSparseP2:
     def _allocate_graph_workspace(self):
         self.graph_seq_lens = torch.zeros(2, dtype=torch.int32, device=self.device)
         self.graph_row_ids = torch.arange(2, dtype=torch.int32, device=self.device)[:, None]
-        self.workspace.extend((self.graph_seq_lens, self.graph_row_ids))
+        pinned = str(self.device).startswith("cuda")
+        self.graph_write_locs_cpu = torch.empty(2, dtype=torch.int64, pin_memory=pinned)
+        self.graph_metadata_cpu = torch.empty((3, 2), dtype=torch.int32, pin_memory=pinned)
+        self.graph_write_locs_array = self.graph_write_locs_cpu.numpy()
+        self.graph_metadata_array = self.graph_metadata_cpu.numpy()
+        self.workspace.extend((self.graph_seq_lens, self.graph_row_ids,
+                               self.graph_write_locs_cpu, self.graph_metadata_cpu))
         self.graph_producer = torch.cuda.Event()
         self.graph_copy_done = torch.cuda.Event()
         self.graph_audit = None
@@ -302,28 +308,32 @@ class QSAHiSparseP2:
             "host_slabs", "indices", "gathered", "unpacked", "compact", "compact_table",
             "real", "compressed_lens", "batch_lens", "batch_slots", "batch_write_locs",
             "blocks", "out", "gather_indices", "miss_src", "miss_dst", "miss_count",
-            "graph_seq_lens", "graph_row_ids")}
+            "graph_seq_lens", "graph_row_ids", "graph_write_locs_cpu", "graph_metadata_cpu")}
         for li, state in enumerate(self.layer_states):
             tensors.update({f"layer{li}.{name}": value for name, value in state.items()})
             tensors[f"layer{li}.raw_k"] = self.full.k_buffer[li]
             tensors[f"layer{li}.raw_v"] = self.full.v_buffer[li]
         tensors.update({f"audit.{name}": value for name, value in (self.graph_audit or {}).items()})
         return {name: {"ptr": value.data_ptr(), "bytes": value.nbytes,
-                       "shape": list(value.shape), "dtype": str(value.dtype)}
+                       "shape": list(value.shape), "dtype": str(value.dtype),
+                       "device": str(value.device), "pinned": value.is_pinned()}
                 for name, value in tensors.items()}
 
     def prepare_graph_replay(self, batch, count):
         if (not self.graph_enabled or count != batch.batch_size or count not in (1, 2)
                 or not batch.forward_mode.is_decode() or self.graph_batch is not None
-                or self.graph_capture_size is not None):
-            raise RuntimeError("QSA graph replay requires exact unpadded decode rows")
+                or self.graph_capture_size is not None or self.graph_failed_leases):
+            raise RuntimeError("QSA graph replay requires exact rows and drained prior work")
         self.begin_batch(batch, graph=True)
         # One stream wait protects every newest row before a new replay can write.
         if self.graph_copy_pending:
             torch.cuda.current_stream(self.device).wait_event(self.graph_copy_done)
             self.record("graph_copy_wait", copy_epoch=self.graph_copy_epoch,
                         completion_observed=False)
-        self.graph_seq_lens[:count].copy_(batch.seq_lens_cpu[:count])
+        self.raw_write_locs.copy_(self.graph_write_locs_cpu[:count], non_blocking=True)
+        self.row_slots.copy_(self.graph_metadata_cpu[0, :count], non_blocking=True)
+        self.batch_lens[:count].copy_(self.graph_metadata_cpu[1, :count], non_blocking=True)
+        self.graph_seq_lens[:count].copy_(self.graph_metadata_cpu[2, :count], non_blocking=True)
 
     @contextmanager
     def graph_replay_scope(self):
@@ -525,6 +535,9 @@ class QSAHiSparseP2:
             "hot_bytes": sum(t["hot"].nbytes for s in self.requests.values() for t in s.states),
             "hot_reserved_bytes": sum(s["hot"].nbytes for s in getattr(self, "layer_states", [])),
             "workspace_bytes": sum(t.nbytes for t in self.workspace),
+            "graph_metadata_host_reserved_bytes": (
+                self.graph_write_locs_cpu.nbytes + self.graph_metadata_cpu.nbytes
+                if getattr(self, "graph_enabled", False) else 0),
             "mamba_bytes": sum(mamba_sizes),
             "mamba_available": self.req_pool.mamba_allocator.available_size(),
             "leases": [{"req_pool_idx": s.lease.req_pool_idx, "generation": s.lease.generation,
@@ -584,7 +597,11 @@ class QSAHiSparseP2:
             self.slots.require(state.lease, "decode" if decode else "prefill")
             if graph and (len(state.states) != len(self.layer_ids)
                           or any(s["generation"] != state.generation for s in state.states)
-                          or state.graph_identity != self.native_lease_snapshot(state)):
+                          or state.graph_identity["logical_row_ptr"] != self.req_table[req_idx].data_ptr()
+                          # Native Mamba slots stay fixed through this no-radix lease.
+                          # Strict checks still inspect device values; light decode
+                          # keeps host ownership checks without a D2H synchronization.
+                          or (self.strict and state.graph_identity != self.native_lease_snapshot(state))):
                 raise RuntimeError("QSA graph native/layer ownership changed")
             states.append(state)
         # Validate the entire batch before advancing either request's decode state.
@@ -608,9 +625,18 @@ class QSAHiSparseP2:
                 count = len(states)
                 self.raw_write_locs = self.batch_write_locs[:count]
                 self.row_slots = self.batch_slots[:count]
-                self.raw_write_locs.copy_(torch.tensor(locations, dtype=torch.int64))
-                self.row_slots.copy_(torch.tensor([s.lease.slot for s in states], dtype=torch.int32))
-                self.batch_lens[:count].copy_(torch.tensor([seq // 4 for seq in seq_lens], dtype=torch.int32))
+                if graph:
+                    # H2D and replay share the producer stream. With overlap disabled,
+                    # sampling returns to the CPU before the next batch rewrites these
+                    # adapter-owned pinned buffers, including after a B1/B2 transition.
+                    self.graph_write_locs_array[:count] = locations
+                    self.graph_metadata_array[0, :count] = [s.lease.slot for s in states]
+                    self.graph_metadata_array[1, :count] = [seq // 4 for seq in seq_lens]
+                    self.graph_metadata_array[2, :count] = seq_lens
+                else:
+                    self.raw_write_locs.copy_(torch.tensor(locations, dtype=torch.int64))
+                    self.row_slots.copy_(torch.tensor([s.lease.slot for s in states], dtype=torch.int32))
+                    self.batch_lens[:count].copy_(torch.tensor([seq // 4 for seq in seq_lens], dtype=torch.int32))
                 self.real.fill_(count)
             else:
                 state = self.batch_requests[0]
