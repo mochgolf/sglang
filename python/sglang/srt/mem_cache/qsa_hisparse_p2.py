@@ -144,6 +144,8 @@ class QSAHiSparseP2:
         self.graph_capture_size = None
         self.graph_batch = None
         self.graph_copy_pending = False
+        self.graph_failed_leases = set()
+        self.graph_copy_epoch = 0
         directory = os.environ.get("SGLANG_QSA_HISPARSE_V3_EVENTS")
         self.path = None
         if directory:
@@ -190,7 +192,7 @@ class QSAHiSparseP2:
         self.layer_states = []
         for li in range(layers):
             shared = {
-                "hot": torch.empty((2 * 2112, 2048), dtype=torch.uint8, device=device),
+                "hot": torch.zeros((2 * 2112, 2048), dtype=torch.uint8, device=device),
                 "tokens": torch.full((2, 2112), -1, dtype=torch.int32, device=device),
                 "lru": self.initial_lru.repeat(2, 1),
                 "device_locs": torch.arange(2 * 2112, dtype=torch.int32, device=device).view(2, 2112),
@@ -215,11 +217,14 @@ class QSAHiSparseP2:
                 "mapping": torch.zeros((layers, 2, 2051), dtype=torch.int32, device=self.device),
                 "miss_count": torch.zeros((layers, 2), dtype=torch.int32, device=self.device),
                 "valid_counts": torch.zeros((layers, 2), dtype=torch.int32, device=self.device),
+                "resolver_out": torch.zeros((layers, 2, 512), dtype=torch.int32, device=self.device),
+                "miss_src": torch.zeros((layers, 2, 512), dtype=torch.int64, device=self.device),
+                "miss_dst": torch.zeros((layers, 2, 512), dtype=torch.int32, device=self.device),
             }
             self.workspace.extend(self.graph_audit.values())
 
     @contextmanager
-    def graph_capture(self, count):
+    def graph_capture(self, count, *, native_key=None, native_backend=None):
         if (not self.graph_enabled or count not in (1, 2) or self.requests
                 or self.slots.active or self.pending_releases or self.graph_batch is not None
                 or self.graph_capture_size is not None):
@@ -227,29 +232,76 @@ class QSAHiSparseP2:
         from sglang.srt.model_executor.runner.flashinfer_autotune import should_run_flashinfer_autotune
         if should_run_flashinfer_autotune(self.runner):
             raise RuntimeError("QSA graph capture does not permit earlier autotune dummy forwards")
-        self.graph_capture_size = count
-        self.offloaded = True
-        self.raw_write_locs = self.batch_write_locs[:count]
-        self.row_slots = self.batch_slots[:count]
-        self.real.zero_()
-        self.batch_write_locs.zero_()  # Reserved raw row zero, never a lease ring.
-        self.batch_slots.zero_()
-        self.batch_lens.zero_()
-        self.graph_seq_lens.zero_()
-        self.compact.zero_()
-        self.compact_table.zero_()
-        self.miss_count.zero_()
-        for shared in self.layer_states:
-            shared["hot"].zero_()
+        self.graph_warmups = 0
+        info = {"graph_key": None if native_key is None else vars(native_key),
+                "graph_backend": type(native_backend).__name__,
+                "graph_pool": getattr(native_backend, "_pool", None)}
+        capture_error = None
         try:
+            self.graph_capture_size = count
+            self.offloaded = True
+            self.raw_write_locs = self.batch_write_locs[:count]
+            self.row_slots = self.batch_slots[:count]
+            self.real.zero_()
+            self.batch_write_locs.zero_()  # Reserved raw row zero, never a lease ring.
+            self.batch_slots.zero_()
+            self.batch_lens.zero_()
+            self.graph_seq_lens.zero_()
+            self.miss_count.zero_()
+            if self.path is not None:
+                self.record("graph_capture_begin", **info, real_count=int(self.real[0]),
+                            graph_buffers=self.graph_buffer_inventory())
             yield
+            if self.path is not None:
+                self.record("graph_capture_complete", **info, real_count=int(self.real[0]),
+                            warmups=self.graph_warmups, graph_buffers=self.graph_buffer_inventory(),
+                            native_key_present=native_key in getattr(native_backend, "_graphs", {}))
+        except BaseException as error:
+            capture_error = error
+            if self.path is not None:
+                try:
+                    self.record("graph_capture_failed", **info, error=repr(error))
+                except BaseException as observation_error:
+                    error.add_note(f"QSA capture failure ledger: {observation_error!r}")
+            raise
         finally:
             self.graph_capture_size = None
             self.offloaded = False
             self.raw_write_locs = None
-            self.real.zero_()
-            if self.requests or self.slots.active or self.pending_releases:
-                raise RuntimeError("QSA graph capture acquired live ownership")
+            try:
+                self.real.zero_()
+                if self.requests or self.slots.active or self.pending_releases:
+                    raise RuntimeError("QSA graph capture acquired live ownership")
+                if self.path is not None:
+                    self.record("graph_capture_reset", **info, capture_mode=self.graph_capture_size,
+                                real_count=int(self.real[0]))
+            except BaseException as error:
+                if capture_error is None:
+                    raise
+                capture_error.add_note(f"QSA capture cleanup failure: {error!r}")
+
+    def after_graph_warmup(self):
+        if self.graph_capture_size not in (1, 2) or self.requests or self.slots.active:
+            raise RuntimeError("QSA graph warmup changed ownership")
+        self.graph_warmups += 1
+        if self.path is not None:
+            self.record("graph_warmup_complete", capture_size=self.graph_capture_size,
+                        warmup=self.graph_warmups, real_count=int(self.real[0]))
+
+    def graph_buffer_inventory(self):
+        tensors = {name: getattr(self, name) for name in (
+            "host_slabs", "indices", "gathered", "unpacked", "compact", "compact_table",
+            "real", "compressed_lens", "batch_lens", "batch_slots", "batch_write_locs",
+            "blocks", "out", "gather_indices", "miss_src", "miss_dst", "miss_count",
+            "graph_seq_lens", "graph_row_ids")}
+        for li, state in enumerate(self.layer_states):
+            tensors.update({f"layer{li}.{name}": value for name, value in state.items()})
+            tensors[f"layer{li}.raw_k"] = self.full.k_buffer[li]
+            tensors[f"layer{li}.raw_v"] = self.full.v_buffer[li]
+        tensors.update({f"audit.{name}": value for name, value in (self.graph_audit or {}).items()})
+        return {name: {"ptr": value.data_ptr(), "bytes": value.nbytes,
+                       "shape": list(value.shape), "dtype": str(value.dtype)}
+                for name, value in tensors.items()}
 
     def prepare_graph_replay(self, batch, count):
         if (not self.graph_enabled or count != batch.batch_size or count not in (1, 2)
@@ -260,34 +312,58 @@ class QSAHiSparseP2:
         # One stream wait protects every newest row before a new replay can write.
         if self.graph_copy_pending:
             torch.cuda.current_stream(self.device).wait_event(self.graph_copy_done)
+            self.record("graph_copy_wait", copy_epoch=self.graph_copy_epoch,
+                        completion_observed=False)
         self.graph_seq_lens[:count].copy_(batch.seq_lens_cpu[:count])
 
     @contextmanager
     def graph_replay_scope(self):
         try:
             yield
-        except BaseException:
-            self.fail_graph_replay()
+        except BaseException as error:
+            self.fail_graph_replay(error)
             raise
 
-    def fail_graph_replay(self):
+    def _drain_graph_streams(self):
+        errors = []
+        producer = self.producer_stream if self.producer_stream is not None else torch.cuda.current_stream(self.device)
+        for stream in (producer, self.copy_stream):
+            try:
+                stream.synchronize()
+            except BaseException as error:
+                errors.append(error)
+        if errors:
+            for error in errors[1:]:
+                errors[0].add_note(f"Additional QSA graph drain failure: {error!r}")
+            raise errors[0]
+
+    def fail_graph_replay(self, cause=None):
         saved = self.graph_batch
         if saved is None:
             return
+        leases = {lease for lease, _ in saved if self.slots.active.get(lease.req_pool_idx) == lease}
+        self.graph_failed_leases.update(leases)
+        for lease in leases:
+            self.slots.phases[lease.req_pool_idx] = "failed"
         try:
-            torch.cuda.current_stream(self.device).synchronize()
-            self.copy_stream.synchronize()
+            self._drain_graph_streams()
+        except BaseException as error:
+            if cause is None:
+                raise
+            cause.add_note(f"QSA graph leases remain blocked on stream drain: {error!r}")
+        else:
+            self.graph_failed_leases.difference_update(leases)
         finally:
-            for lease, _ in saved:
-                if self.slots.active.get(lease.req_pool_idx) == lease:
-                    self.slots.phases[lease.req_pool_idx] = "failed"
             self.graph_batch = None
 
-    def finish_graph_replay(self, count):
+    def finish_graph_replay(self, count, *, native_key=None, native_backend=None):
         saved = self.graph_batch
         if saved is None or len(saved) != count:
             raise RuntimeError("QSA graph replay has no matching prepared batch")
         try:
+            if native_backend is not None and (
+                    native_key not in native_backend._graphs or native_key.size != count):
+                raise RuntimeError("QSA graph native replay key differs from prepared rows")
             for lease, seq in saved:
                 state = self._request(lease.req_pool_idx, lease.rid)
                 self.slots.require(lease, "decode")
@@ -297,7 +373,11 @@ class QSAHiSparseP2:
             self.graph_producer.record(producer)
             closing = [(self.requests[lease.req_pool_idx], seq // 4 - 1)
                        for lease, seq in saved if seq % 4 == 0]
+            if self.strict:
+                self.graph_producer.synchronize()
+                self._check_graph_close(closing, host=False)
             if closing:
+                self.graph_copy_epoch += 1
                 with torch.cuda.stream(self.copy_stream):
                     self.copy_stream.wait_event(self.graph_producer)
                     for state, block in closing:
@@ -308,23 +388,45 @@ class QSAHiSparseP2:
                 for state, _ in closing:
                     for layer_state in state.states:
                         layer_state.update(done=self.graph_copy_done, copy_begin=None)
+                        layer_state["copy_epoch"] = self.graph_copy_epoch
                         layer_state["writeback_bytes"] += 2048
+                self.record("graph_copy_submit", copy_epoch=self.graph_copy_epoch,
+                            copies=[{"req_pool_idx": s.lease.req_pool_idx, "rid": s.lease.rid,
+                                     "generation": s.lease.generation, "slot": s.lease.slot,
+                                     "seq_len": s.seq_len, "block": block,
+                                     "layer_id": self.layer_ids[li], "bytes": 2048,
+                                     "host_dst_ptr": s.host[li, block].data_ptr()}
+                                    for s, block in closing for li in range(len(s.states))])
             if self.strict:
-                self.graph_producer.synchronize()
                 if closing:
                     self.graph_copy_done.synchronize()
+                    self._check_graph_close(closing, host=True)
+                    self.record("graph_copy_complete", copy_epoch=self.graph_copy_epoch)
                 self._check_graph_selected(saved)
-            self.record("graph_replay", batch_size=count, graph_key=count,
-                        graph_backend="full", ordered_leases=[
+            self.record("graph_replay", batch_size=count,
+                        graph_key=None if native_key is None else vars(native_key),
+                        graph_backend=type(native_backend).__name__,
+                        native_key_present=native_key in getattr(native_backend, "_graphs", {}),
+                        ordered_leases=[
                             [x.req_pool_idx, x.generation, x.rid, x.slot] for x, _ in saved],
                         close_rows=len(closing), writeback_bytes=len(closing) * len(self.layer_ids) * 2048)
-        except BaseException:
+        except BaseException as error:
             # A failed copy/event submission may have no completion event to drain.
             # Retain leases and drain both streams before any scheduler can reuse them.
-            self.fail_graph_replay()
+            self.fail_graph_replay(error)
             raise
         finally:
             self.graph_batch = None
+
+    def _check_graph_close(self, closing, *, host):
+        for state, block in closing:
+            for li in range(len(state.states)):
+                expected = torch.cat((state.full.k_buffer[li][1:5].view(torch.uint8).flatten(),
+                                      state.full.v_buffer[li][1:5].view(torch.uint8).flatten()))
+                actual = (state.host[li, block].to(expected.device) if host else
+                          state.states[li]["hot"][2048])
+                if not torch.equal(actual, expected):
+                    raise AssertionError(f"QSA graph closed C4 differs from raw K/V ring: host={host}")
 
     def _check_graph_selected(self, saved):
         for row, (lease, seq) in enumerate(saved):
@@ -338,6 +440,16 @@ class QSAHiSparseP2:
                                      mapping=self.graph_audit["mapping"][li, row, :2048 + seq % 4])
                 if int(self.graph_audit["valid_counts"][li, row]) != 2048 + seq % 4:
                     raise AssertionError("QSA graph FA2 valid count differs")
+                if state.decode_steps in (1, 2, 3, 384, 767) or seq % 4 == 0:
+                    misses = int(self.graph_audit["miss_count"][li, row])
+                    self.record("graph_selected_check", lease, layer_id=lid, seq_len=seq,
+                                resolver_out=self.graph_audit["resolver_out"][li, row].cpu().tolist(),
+                                selected_blocks=(raw[0, :2048:4] // 4).cpu().tolist(),
+                                miss_count=misses,
+                                miss_src=self.graph_audit["miss_src"][li, row, :misses].cpu().tolist(),
+                                miss_dst=self.graph_audit["miss_dst"][li, row, :misses].cpu().tolist(),
+                                closed_block_selected=bool(seq % 4 == 0 and
+                                    torch.any(raw[0, :2048:4] // 4 == seq // 4 - 1)))
 
     def native_lease_snapshot(self, state, *, include_pages=False):
         lease = state.lease
@@ -367,7 +479,8 @@ class QSAHiSparseP2:
     def record(self, event, lease=None, **extra):
         if self.path is None:
             return
-        if self.observe == "light" and event in ("decode_batch", "graph_replay"):
+        if self.observe == "light" and event in (
+                "decode_batch", "graph_replay", "graph_copy_wait", "graph_copy_submit"):
             # Keep the ordered schedule without synchronizing GPU page inventories.
             row = {"event": event, "time_ns": time.time_ns(), "rank": self.rank,
                    "mode": self.mode, "observe": self.observe,
@@ -464,6 +577,9 @@ class QSAHiSparseP2:
                 raise RuntimeError("QSA graph native/layer ownership changed")
             states.append(state)
         # Validate the entire batch before advancing either request's decode state.
+        if (len({s.lease.slot for s in states}) != len(states)
+                or len(set(batch.rids)) != len(states) or not all(batch.rids)):
+            raise RuntimeError("QSA P2 batch aliases physical slots or request identities")
         if graph:
             self.graph_batch = tuple((state.lease, seq) for state, seq in zip(states, seq_lens))
         self.forward_id += 1
@@ -652,6 +768,9 @@ class QSAHiSparseP2:
                 mapping = self.compact_table[self.row_slots[:, None].long(), raw_indices.clamp_min(0).long()]
                 self.graph_audit["mapping"][li, :count].copy_(mapping)
                 self.graph_audit["miss_count"][li, :count].copy_(self.miss_count[:count])
+                self.graph_audit["resolver_out"][li, :count].copy_(self.out[:count])
+                self.graph_audit["miss_src"][li, :count].copy_(self.miss_src[:count])
+                self.graph_audit["miss_dst"][li, :count].copy_(self.miss_dst[:count])
         else:
             for row, state in enumerate(self.batch_requests):
                 state.finish_selected(layer, raw_indices[row:row + 1], blocks[row:row + 1],
@@ -672,6 +791,10 @@ class QSAHiSparseP2:
                 raise RuntimeError("QSA P2 cannot release a partially initialized lease")
             return None  # Allocated, but no model forward and no physical lease yet.
         state = self._request(req_idx, rid)
+        if state.lease in getattr(self, "graph_failed_leases", ()):
+            # A failed completion record may leave DMA without a usable event.
+            self._drain_graph_streams()
+            self.graph_failed_leases.remove(state.lease)
         self.record("release_begin", state.lease)
         terminal = torch.cuda.Event()
         if self.producer_stream is None:
@@ -681,7 +804,8 @@ class QSAHiSparseP2:
         if state.handoff_event is not None:
             events.append(state.handoff_event)
         self.slots.drain(state.lease, terminal, events)
-        self.record("release_drained", state.lease, pending_events=0)
+        self.record("release_drained", state.lease, pending_events=0,
+                    graph_copy_epochs=sorted({s["copy_epoch"] for s in state.states if "copy_epoch" in s}))
         return state.lease
 
     def after_release(self, lease):

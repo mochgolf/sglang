@@ -1183,7 +1183,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         qsa = getattr(self.model_runner.hisparse_coordinator, "adapter", None)
         if getattr(qsa, "graph_enabled", False) and not isinstance(self.backend, FullCudaGraphBackend):
             raise RuntimeError("QSA bounded capture requires the native full graph backend")
-        qsa_capture = (qsa.graph_capture(bs) if getattr(qsa, "graph_enabled", False)
+        shape_key = self._make_graph_key(
+            self._capture_graph_size(bs=bs, num_tokens=num_tokens),
+            stream_idx, variant_label, dsa_variant)
+        qsa_capture = (qsa.graph_capture(bs, native_key=shape_key, native_backend=self.backend)
+                       if getattr(qsa, "graph_enabled", False)
                        else empty_context())
         with forward_context(ForwardContext(attn_backend=attn_backend)), qsa_capture:
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
@@ -1252,18 +1256,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # wires no buffer here. (SWA write loc rides the `swa_out_cache_loc` rail.)
 
             with canary_ctx:
-                shape_key = self._make_graph_key(
-                    self._capture_graph_size(bs=bs, num_tokens=num_tokens),
-                    stream_idx,
-                    variant_label,
-                    dsa_variant,
-                )
                 # Adaptive runners may own a different backend than model_runner.
                 post_warmup_hook = getattr(
                     attn_backend,
                     "on_after_cuda_graph_warmup",
                     None,
                 )
+                if getattr(qsa, "graph_enabled", False):
+                    attn_warmup_hook = post_warmup_hook
+
+                    def post_warmup_hook():
+                        if attn_warmup_hook is not None:
+                            attn_warmup_hook()
+                        qsa.after_graph_warmup()
                 maybe_flashinfer_autotune_speculative_draft(
                     self,
                     run_once,
@@ -1500,7 +1505,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             output = self.backend.replay(self._replay_graph_key, forward_batch)
             if getattr(qsa, "graph_enabled", False):
-                qsa.finish_graph_replay(self.bs)
+                qsa.finish_graph_replay(self.bs, native_key=self._replay_graph_key,
+                                        native_backend=self.backend)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:
                 self._publish_read_done(in_graph=True)

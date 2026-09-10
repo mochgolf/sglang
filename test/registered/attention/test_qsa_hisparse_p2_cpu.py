@@ -5,6 +5,7 @@ this is neither a DMA/kernel check nor live TP2/service acceptance.
 """
 
 from contextlib import nullcontext
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
@@ -42,10 +43,13 @@ class Event:
 
 class TestQSAHiSparseP2(unittest.TestCase):
     def test_graph_routes_events_and_failed_submission(self):
+        from sglang.srt.model_executor.runner.shape_key import ShapeKey
         a = QSAHiSparseP2.__new__(QSAHiSparseP2)
         a.mode, a.device, a.strict, a.path = "p2-offload", "cpu", False, None
         a.graph_enabled, a.graph_capture_size, a.graph_batch = True, None, None
         a.graph_copy_pending, a.forward_id, a.offloaded = False, 0, False
+        a.graph_failed_leases = set()
+        a.graph_copy_epoch = 0
         a.requests, a.pending_releases, a.batch_requests = {}, [], []
         a.capacity, a.layer_ids = 2112, [3]
         a.slots = QSAHiSparseSlots(a.capacity, 64, 2)
@@ -67,6 +71,11 @@ class TestQSAHiSparseP2(unittest.TestCase):
             coord = QSAHiSparseCoordinator(a, None)
             self.assertIs(coord.num_real_reqs, a.real)
             a.runner = SimpleNamespace()
+            persistent = [a.compact, a.compact_table, a.host_slabs,
+                          *(t for s in a.layer_states for n, t in s.items() if n in ("hot", "tokens", "lru"))]
+            for tensor in persistent:
+                tensor.fill_(17)
+            preserved = [t.clone() for t in persistent]
             with patch("sglang.srt.model_executor.runner.flashinfer_autotune.should_run_flashinfer_autotune",
                        return_value=False):
                 for count in (1, 2):
@@ -79,6 +88,14 @@ class TestQSAHiSparseP2(unittest.TestCase):
                     self.assertEqual(a.slots.snapshot(), before)
                     self.assertIsNone(a.graph_capture_size)
                     self.assertFalse(a.offloaded)
+                with patch.object(a.batch_write_locs, "zero_", side_effect=RuntimeError("reset fault")), \
+                        self.assertRaisesRegex(RuntimeError, "reset fault"):
+                    with a.graph_capture(1):
+                        self.fail("failed capture setup must not yield")
+                self.assertIsNone(a.graph_capture_size)
+                self.assertFalse(a.offloaded)
+            for actual, expected in zip(persistent, preserved):
+                self.assertTrue(torch.equal(actual, expected))
             for idx, rid in ((1, "A"), (2, "B")):
                 lease = a.slots.acquire(idx, 1, rid)
                 state = _RequestCache(a, lease)
@@ -98,6 +115,15 @@ class TestQSAHiSparseP2(unittest.TestCase):
                                                   is_extend=lambda: False))
 
             routes = a.batch_slots.clone()
+            original = a.requests[2].lease
+            alias = replace(original, slot=a.requests[1].lease.slot)
+            a.requests[2].lease = a.slots.active[2] = alias
+            with self.assertRaisesRegex(RuntimeError, "aliases physical slots"), a.graph_replay_scope():
+                a.prepare_graph_replay(batch([1, 2], [2051, 2052]), 2)
+            self.assertEqual(a.forward_id, 0)
+            self.assertEqual([s.decode_steps for s in a.requests.values()], [0, 0])
+            self.assertTrue(torch.equal(a.batch_slots, routes))
+            a.requests[2].lease = a.slots.active[2] = original
             a.req_pool.req_generation[2] = 2
             with a.graph_replay_scope(), self.assertRaises(RuntimeError):
                 a.prepare_graph_replay(batch([1, 2], [2051, 2052]), 2)
@@ -105,12 +131,33 @@ class TestQSAHiSparseP2(unittest.TestCase):
             self.assertTrue(torch.equal(a.batch_slots, routes))
             self.assertIsNone(a.graph_batch)
             a.req_pool.req_generation[2] = 1
+            state = a.requests[1]
+            state.full.k_buffer[0][1:5].fill_(7)
+            state.full.v_buffer[0][1:5].fill_(13)
+            expected = torch.cat((state.full.k_buffer[0][1:5].flatten(),
+                                  state.full.v_buffer[0][1:5].flatten()))
+            state.states[0]["hot"][2048].copy_(expected)
+            state.host[0, 512].copy_(expected)
+            a._check_graph_close([(state, 512)], host=False)
+            a._check_graph_close([(state, 512)], host=True)
+            # A corrupted close cannot make its own expected host bytes pass.
+            state.states[0]["hot"][2048].fill_(99)
+            state.host[0, 512].fill_(99)
+            for host in (False, True):
+                with self.assertRaisesRegex(AssertionError, "raw K/V ring"):
+                    a._check_graph_close([(state, 512)], host=host)
+            state.states[0]["hot"][2048].copy_(expected)
+            state.host[0, 512].copy_(expected)
             a.requests[2].states[0]["hot"][2048].fill_(73)
             with a.graph_replay_scope():
                 a.prepare_graph_replay(batch([2, 1], [2052, 2051]), 2)
                 self.assertEqual(a.batch_slots.tolist(), [1, 0])
                 self.assertEqual(a.graph_seq_lens.tolist(), [2052, 2051])
-                a.finish_graph_replay(2)
+                key = ShapeKey(size=2)
+                backend = SimpleNamespace(_graphs={key: object()})
+                a.finish_graph_replay(2, native_key=key, native_backend=backend)
+                self.assertEqual(a.record.call_args.kwargs["graph_key"], vars(key))
+                self.assertTrue(a.record.call_args.kwargs["native_key_present"])
             self.assertTrue(torch.all(a.requests[2].host[0, 512] == 73))
             self.assertEqual(a.requests[1].states[0]["writeback_bytes"], 0)
             self.assertEqual(a.requests[2].states[0]["writeback_bytes"], 2048)
@@ -128,15 +175,33 @@ class TestQSAHiSparseP2(unittest.TestCase):
                         a.finish_graph_replay(2)
             self.assertEqual([t.data_ptr() for t in a.workspace], pointers)
             good_b = a.requests[2].host.clone()
-            with self.assertRaisesRegex(RuntimeError, "injected"), a.graph_replay_scope():
+            with self.assertRaisesRegex(RuntimeError, "injected") as caught, a.graph_replay_scope():
                 a.prepare_graph_replay(batch([1], [2072]), 1)
-                with patch.object(a.graph_copy_done, "record", side_effect=RuntimeError("injected record failure")):
+                with patch.object(a.graph_copy_done, "record", side_effect=RuntimeError("injected record failure")), \
+                        patch.object(a.producer_stream, "synchronize", side_effect=RuntimeError("producer drain")), \
+                        patch.object(a.copy_stream, "synchronize", side_effect=RuntimeError("copy drain")) as copy_drain:
                     a.finish_graph_replay(1)
             self.assertEqual(a.slots.phases, {1: "failed", 2: "decode"})
             self.assertIsNone(a.graph_batch)
             self.assertEqual(set(a.requests), {1, 2})
             self.assertTrue(torch.equal(good_b, a.requests[2].host))
-            a.copy_stream.synchronize.assert_called()
+            copy_drain.assert_called_once()
+            self.assertTrue(caught.exception.__notes__)
+            lease = a.requests[1].lease
+            self.assertEqual(a.graph_failed_leases, {lease})
+            with patch.object(a.copy_stream, "synchronize", side_effect=RuntimeError("still pending")), \
+                    self.assertRaisesRegex(RuntimeError, "still pending"):
+                a.release(1, "A")
+            self.assertEqual(a.slots.phases[1], "failed")
+            self.assertIn(lease, a.graph_failed_leases)
+            # Release retry must drain the registered producer, regardless of
+            # the caller's current stream after the failed forward unwinds.
+            other_stream = Mock()
+            with patch.object(torch.cuda, "current_stream", return_value=other_stream):
+                self.assertEqual(a.release(1, "A"), lease)
+            other_stream.synchronize.assert_not_called()
+            self.assertNotIn(lease, a.graph_failed_leases)
+            self.assertEqual(a.slots.phases[1], "drained")
 
     @unittest.skipUnless(os.environ.get("TRITON_INTERPRET") == "1", "explicit CPU interpreter run only")
     def test_graph_byte_kernels_cpu_interpreter(self):
@@ -267,6 +332,7 @@ class TestQSAHiSparseP2(unittest.TestCase):
     def test_batch_isolation_and_real_postflush(self):
         a = QSAHiSparseP2.__new__(QSAHiSparseP2)
         a.mode, a.device, a.rank, a.strict, a.observe = "p2-offload", "cpu", 0, True, "strict"
+        a.graph_failed_leases = set()
         a.capacity = 2112
         a.slots = QSAHiSparseSlots(a.capacity, 64, 2)
         a.full = MHATokenToKVPool(
