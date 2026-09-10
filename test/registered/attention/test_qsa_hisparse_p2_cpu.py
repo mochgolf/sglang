@@ -21,7 +21,6 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.qsa_hisparse_p2 import QSAHiSparseP2, QSAHiSparseCoordinator
 from sglang.srt.mem_cache.qsa_hisparse_slots import QSAHiSparseSlots
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-from sglang.srt.mem_cache.qsa_hisparse_v3 import unpack_index
 
 
 class Event:
@@ -152,13 +151,9 @@ class TestQSAHiSparseP2(unittest.TestCase):
         a.offloaded, a.forward_id, a.raw_write_locs = False, 0, None
         a.path, a.layer_ids = None, [3]
         a.host_slabs = torch.empty((2, 1, a.capacity // 4, 2048), dtype=torch.uint8)
-        a.indices = unpack_index("cpu")
-        a.gathered = torch.empty((512, 2048), dtype=torch.uint8)
-        a.unpacked = torch.empty((2, 2048, 1, 256), dtype=torch.uint8)
-        a.compact = torch.zeros((2, 4104, 1, 256), dtype=torch.uint8)
-        a.compact_table = torch.zeros((2, a.capacity), dtype=torch.int32)
-        a.zero_req, a.real = torch.zeros(1, dtype=torch.int32), torch.ones(1, dtype=torch.int32)
-        a.compressed_lens = torch.zeros(2, dtype=torch.int32)
+        a._allocate_decode_workspace()
+        backing = a.workspace + [s["hot"] for s in a.layer_states]
+        backing_ptrs = [t.data_ptr() for t in backing]
         backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
         backend.hisparse_v3, backend.token_to_kv_pool = a, a.pool
         layer = SimpleNamespace(layer_id=3)
@@ -191,11 +186,21 @@ class TestQSAHiSparseP2(unittest.TestCase):
         def votes(out, vote, **kwargs):
             out[:] = [vote, vote]
 
+        resolver_calls = []
         def resolver(*args):
             # Only the short fully resident prefix path is modeled on CPU.
             blocks, tokens, host_locs, device_locs, host, hot, out = args[:7]
-            assert torch.equal(tokens[0, blocks[0].long()], blocks[0])
-            out.copy_(blocks)
+            slots, lengths = args[7:9]
+            self.assertEqual(int(args[15][0]), len(blocks))
+            self.assertEqual(lengths.tolist(), [s.seq_len // 4 for s in a.batch_requests])
+            for row, slot in enumerate(slots.tolist()):
+                ids = blocks[row].long()
+                self.assertTrue(torch.equal(tokens[slot, ids], blocks[row]))
+                self.assertTrue(torch.equal(host[host_locs[slot, ids]],
+                                           a.host_slabs[slot, 0, ids]))
+                out[row].copy_(device_locs[slot, ids])
+            args[18].zero_()
+            resolver_calls.append(len(blocks))
 
         with patch.object(torch.cuda, "Event", Event), \
                 patch.object(torch.cuda, "stream", side_effect=lambda _: nullcontext()), \
@@ -325,6 +330,7 @@ class TestQSAHiSparseP2(unittest.TestCase):
                     self.assertTrue(torch.all(k.view(torch.uint8)[locs] == kb))
                     self.assertTrue(torch.all(v.view(torch.uint8)[locs] == vb))
                 self.assertNotEqual(int(physical_rows[0]), int(physical_rows[1]))
+            self.assertEqual(resolver_calls, [2] * 4)
 
             state_b = a.requests[req_b.kv.req_pool_idx]
             host_b = state_b.host.clone()
@@ -339,12 +345,27 @@ class TestQSAHiSparseP2(unittest.TestCase):
             self.assertEqual(len(a.slots.free_slots), 1)
             self.assertIs(a.requests[req_b.kv.req_pool_idx], state_b)
             self.assertTrue(torch.equal(state_b.host, host_b))
+            # B1 in slot 1 must neither read nor write the released slot 0.
+            inactive = a.layer_states[0]["hot"].view(2, 2112, 2048)[lease_a.slot]
+            inactive.fill_(173)
+            a.begin_batch(batch([row(req_b, 2054)], True))
+            a.selected(layer, topk[:1])
+            self.assertEqual(resolver_calls[-1], 1)
+            self.assertTrue(torch.all(inactive == 173))
+            b_hot = state_b.states[0]["hot"].clone()
             req_c, cr = claim("C")
             a.begin_batch(batch([row(req_c, 2048)], False, 2048))
             self.assertEqual(req_c.kv.req_pool_idx, req_a.kv.req_pool_idx)
             self.assertEqual(a.requests[req_c.kv.req_pool_idx].generation, lease_a.generation + 1)
             with self.assertRaisesRegex(RuntimeError, "stale"):
                 a.after_release(lease_a)
+            backend._store_kv(layer, cr[:2048], torch.full((2048, 1, 256), 53, dtype=torch.uint8),
+                              torch.full((2048, 1, 256), 67, dtype=torch.uint8))
+            coord.admit_request_into_staging(req_c)
+            self.assertEqual(coord.collect_ready_reqs(), [req_c])
+            self.assertEqual(a.requests[req_c.kv.req_pool_idx].states[0]["hot"].data_ptr(), inactive.data_ptr())
+            self.assertTrue(torch.equal(state_b.states[0]["hot"], b_hot))
+            self.assertEqual([t.data_ptr() for t in backing], backing_ptrs)
             logical.free_group_begin()
             for req, rows in ((req_c, cr), (req_b, br)):
                 lease = a.release(req.kv.req_pool_idx, req.rid)

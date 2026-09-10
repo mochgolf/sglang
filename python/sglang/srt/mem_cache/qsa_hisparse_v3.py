@@ -426,8 +426,15 @@ class QSAHiSparseV3:
         with operations_nvtx_range("qsa.indexed_unpack"):
             torch.index_select(self.gathered.view(-1, 256), 0, self.indices,
                                out=self.unpacked.view(-1, 256))
+        self.finish_selected(layer, raw_indices, blocks, self.unpacked, state["miss_count"])
+        return self.compact[0].view(self.pool.dtype), self.compact[1].view(self.pool.dtype), self.compact_table, self.zero_req
+
+    def finish_selected(self, layer, raw_indices, blocks, unpacked, miss_count):
+        """Shared compact/tail mapping and independent host-byte oracle."""
+        li = self.pool._transfer_full_attention_id(layer.layer_id)
+        state = self.states[li]
         with operations_nvtx_range("qsa.compact_mapping"):
-            self.compact[:, 1:2049].copy_(self.unpacked)
+            self.compact[:, 1:2049].copy_(unpacked)
             tail = self.seq_len % 4
             if tail:
                 self.compact[0, 2049:2049 + tail].copy_(self.full.k_buffer[li][1:1 + tail].view(torch.uint8))
@@ -463,8 +470,7 @@ class QSAHiSparseV3:
                         tail=tail, tail_bytes_checked=tail * 512, mapping_checked=True,
                         page_boundary=self.seq_len % 64 == 0,
                         latest_writeback_event_ms=(state["copy_begin"].elapsed_time(state["done"]) if state["done"] is not None else None),
-                        writeback_bytes=state["writeback_bytes"], miss_count=int(state["miss_count"][0]))
-        return self.compact[0].view(self.pool.dtype), self.compact[1].view(self.pool.dtype), self.compact_table, self.zero_req
+                        writeback_bytes=state["writeback_bytes"], miss_count=int(miss_count[0]))
 
     def release(self, req_idx, rid):
         if self.owner is None:

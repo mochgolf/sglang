@@ -16,10 +16,15 @@ from sglang.srt.mem_cache.qsa_hisparse_v3 import (
     unpack_index,
     validate_configuration,
 )
+from sglang.srt.utils.nvtx_utils import (
+    NVTX_OPERATIONS_ENABLED,
+    operations_nvtx_range,
+    profile_method,
+)
 
 
 class _RequestCache(QSAHiSparseV3):
-    """Reuse V3's selected/refetch/writeback algorithms on request-private views.
+    """Reuse V3's writeback and compact/byte oracle on request-private views.
 
     Construction, handoff, batch metadata and release belong to the P2 adapter.
     The inherited single-owner lifecycle methods are never used here.
@@ -44,8 +49,6 @@ class _RequestCache(QSAHiSparseV3):
             self.compact_base = lease.slot * 2052
             self.compact = adapter.compact[:, self.compact_base:self.compact_base + 2052]
             self.compact_table = adapter.compact_table[lease.slot:lease.slot + 1]
-            self.indices, self.gathered, self.unpacked = adapter.indices, adapter.gathered, adapter.unpacked
-            self.zero_req, self.real = adapter.zero_req, adapter.real
             self.compressed_len = adapter.compressed_lens[lease.slot:lease.slot + 1]
             self.compact.zero_()
             self.compact_table.zero_()
@@ -53,6 +56,17 @@ class _RequestCache(QSAHiSparseV3):
                 ring_k.zero_()
                 ring_v.zero_()
         self.handoff_event = None
+
+    def make_state(self):
+        shared = self.adapter.layer_states[len(self.states)]
+        slot = self.lease.slot
+        state = {name: shared[name][slot:slot + 1] for name in ("tokens", "lru")}
+        state["hot"] = shared["hot"].view(2, 2112, 2048)[slot]
+        state["hot"].zero_()
+        state["tokens"].fill_(-1)
+        state["lru"].copy_(self.adapter.initial_lru)
+        state.update(done=None, generation=self.generation, writeback_bytes=0)
+        return state
 
     def record(self, event, **extra):
         self.adapter.record(event, self.lease, seq_len=self.seq_len,
@@ -125,17 +139,47 @@ class QSAHiSparseP2:
         if mode == "p2-offload":
             self.host_slabs = torch.empty((2, 12, self.capacity // 4, 2048), dtype=torch.uint8, pin_memory=True)
             host_alloc_wall_ms = (time.monotonic() - start) * 1000
-            self.indices = unpack_index(self.device)
-            self.gathered = torch.empty((512, 2048), dtype=torch.uint8, device=self.device)
-            self.unpacked = torch.empty((2, 2048, 1, 256), dtype=torch.uint8, device=self.device)
-            self.compact = torch.zeros((2, 2 * 2052, 1, 256), dtype=torch.uint8, device=self.device)
-            self.compact_table = torch.zeros((2, self.capacity), dtype=torch.int32, device=self.device)
-            self.zero_req = torch.zeros(1, dtype=torch.int32, device=self.device)
-            self.real = torch.ones(1, dtype=torch.int32, device=self.device)
-            self.compressed_lens = torch.zeros(2, dtype=torch.int32, device=self.device)
-            self.workspace = [self.indices, self.gathered, self.unpacked, self.compact,
-                              self.compact_table, self.zero_req, self.real, self.compressed_lens]
+            self._allocate_decode_workspace()
         self.record("init", allocation_phase="startup", host_alloc_wall_ms=host_alloc_wall_ms)
+
+    def _allocate_decode_workspace(self):
+        """Fixed B2 backing; persistent rows are lease slots, scratch rows are batch order."""
+        device, layers, blocks = self.device, len(self.layer_ids), self.capacity // 4
+        self.indices = (unpack_index(device)[None] +
+                        torch.arange(2, device=device)[:, None] * 4096).flatten()
+        self.gathered = torch.empty((2 * 512, 2048), dtype=torch.uint8, device=device)
+        self.unpacked = torch.empty((2, 2, 2048, 1, 256), dtype=torch.uint8, device=device)
+        self.compact = torch.zeros((2, 2 * 2052, 1, 256), dtype=torch.uint8, device=device)
+        self.compact_table = torch.zeros((2, self.capacity), dtype=torch.int32, device=device)
+        self.real = torch.zeros(1, dtype=torch.int32, device=device)
+        self.compressed_lens = torch.zeros(2, dtype=torch.int32, device=device)
+        self.batch_lens = torch.zeros(2, dtype=torch.int32, device=device)
+        self.batch_slots = torch.zeros(2, dtype=torch.int32, device=device)
+        self.batch_write_locs = torch.zeros(2, dtype=torch.int64, device=device)
+        self.blocks = torch.empty((2, 512), dtype=torch.int32, device=device)
+        self.out = torch.empty((2, 512), dtype=torch.int32, device=device)
+        self.gather_indices = torch.empty(2 * 512, dtype=torch.int64, device=device)
+        self.miss_src = torch.empty((2, 512), dtype=torch.int64, device=device)
+        self.miss_dst = torch.empty((2, 512), dtype=torch.int32, device=device)
+        self.miss_count = torch.zeros(2, dtype=torch.int32, device=device)
+        self.initial_lru = torch.arange(2048, dtype=torch.int16, device=device)[None]
+        self.workspace = [self.indices, self.gathered, self.unpacked, self.compact,
+                          self.compact_table, self.real, self.compressed_lens, self.batch_lens,
+                          self.batch_slots, self.batch_write_locs, self.blocks, self.out,
+                          self.gather_indices, self.miss_src, self.miss_dst, self.miss_count,
+                          self.initial_lru]
+        self.layer_states = []
+        for li in range(layers):
+            shared = {
+                "hot": torch.empty((2 * 2112, 2048), dtype=torch.uint8, device=device),
+                "tokens": torch.full((2, 2112), -1, dtype=torch.int32, device=device),
+                "lru": self.initial_lru.repeat(2, 1),
+                "device_locs": torch.arange(2 * 2112, dtype=torch.int32, device=device).view(2, 2112),
+                "host_locs": (torch.arange(blocks, dtype=torch.int64, device=device)[None] +
+                              (torch.arange(2, device=device)[:, None] * layers + li) * blocks),
+            }
+            self.layer_states.append(shared)
+            self.workspace.extend(t for name, t in shared.items() if name != "hot")
 
     def native_lease_snapshot(self, state, *, include_pages=False):
         lease = state.lease
@@ -197,6 +241,7 @@ class QSAHiSparseP2:
             "pending_release_count": sum(self.slots.active.get(x.req_pool_idx) == x
                                          for x in self.pending_releases),
             "hot_bytes": sum(t["hot"].nbytes for s in self.requests.values() for t in s.states),
+            "hot_reserved_bytes": sum(s["hot"].nbytes for s in getattr(self, "layer_states", [])),
             "workspace_bytes": sum(t.nbytes for t in self.workspace),
             "mamba_bytes": sum(mamba_sizes),
             "mamba_available": self.req_pool.mamba_allocator.available_size(),
@@ -269,8 +314,13 @@ class QSAHiSparseP2:
         if self.mode == "p2-offload":
             if decode:
                 locations = [self.slots.ring_write_location(s.lease, s.seq_len) for s in self.batch_requests]
-                self.raw_write_locs = torch.tensor(locations, dtype=torch.int64, device=self.device)
-                self.row_slots = torch.tensor([s.lease.slot for s in self.batch_requests], dtype=torch.int32, device=self.device)
+                count = len(states)
+                self.raw_write_locs = self.batch_write_locs[:count]
+                self.row_slots = self.batch_slots[:count]
+                self.raw_write_locs.copy_(torch.tensor(locations, dtype=torch.int64))
+                self.row_slots.copy_(torch.tensor([s.lease.slot for s in states], dtype=torch.int32))
+                self.batch_lens[:count].copy_(torch.tensor([seq // 4 for seq in seq_lens], dtype=torch.int32))
+                self.real.fill_(count)
             else:
                 state = self.batch_requests[0]
                 extend = batch.extend_seq_lens_cpu[0]
@@ -372,13 +422,47 @@ class QSAHiSparseP2:
                 self.slots.require(state.lease, "decode")
                 state.after_store(layer)
 
+    @profile_method("qsa.selected", nvtx_enabled=NVTX_OPERATIONS_ENABLED)
     def selected(self, layer, raw_indices):
-        if raw_indices.shape != (len(self.batch_requests), 2051) or not self.offloaded:
+        from sglang.kernels.ops.kvcache.hisparse import load_cache_to_device_buffer_mla
+
+        if (not 1 <= len(self.batch_requests) <= 2
+                or raw_indices.shape != (len(self.batch_requests), 2051)
+                or raw_indices.dtype != torch.int32 or raw_indices.device != self.compact.device
+                or not self.offloaded):
             raise RuntimeError("QSA P2 selection rows do not match current decode batch")
-        # ponytail: B2 eager resolves rows serially; measure before batching launches in P3.
-        for row, state in enumerate(self.batch_requests):
+        li = self.pool._transfer_full_attention_id(layer.layer_id)
+        for state in self.batch_requests:
+            self._request(state.lease.req_pool_idx, state.lease.rid)
             self.slots.require(state.lease, "decode")
-            state.selected(layer, raw_indices[row:row + 1])
+            if state.states[li]["generation"] != state.generation:
+                raise RuntimeError("stale QSA batched selected state")
+        for state in self.batch_requests:
+            done = state.states[li]["done"]
+            if done is not None:
+                torch.cuda.current_stream(self.device).wait_event(done)
+        count = len(self.batch_requests)
+        shared, blocks = self.layer_states[li], self.blocks[:count]
+        with operations_nvtx_range("qsa.resolve_refetch"):
+            torch.div(raw_indices[:, :2048:4], 4, rounding_mode="floor", out=blocks)
+            load_cache_to_device_buffer_mla(
+                blocks, shared["tokens"], shared["host_locs"], shared["device_locs"],
+                self.host_slabs.view(-1, 2048), shared["hot"], self.out[:count],
+                self.row_slots, self.batch_lens[:count], shared["lru"],
+                2048, 512, 2048, 64, 1024, self.real,
+                self.miss_src[:count], self.miss_dst[:count], self.miss_count[:count],
+            )
+        with operations_nvtx_range("qsa.hot_gather"):
+            gather_indices = self.gather_indices[:count * 512]
+            gather_indices.copy_(self.out[:count].view(-1))
+            torch.index_select(shared["hot"], 0, gather_indices, out=self.gathered[:count * 512])
+        with operations_nvtx_range("qsa.indexed_unpack"):
+            torch.index_select(self.gathered.view(-1, 256), 0, self.indices[:count * 4096],
+                               out=self.unpacked[:count].view(-1, 256))
+        # ponytail: compact/tail mapping and C4 writeback stay per-row eager until graph work.
+        for row, state in enumerate(self.batch_requests):
+            state.finish_selected(layer, raw_indices[row:row + 1], blocks[row:row + 1],
+                                  self.unpacked[row], self.miss_count[row:row + 1])
         return (self.compact[0].view(self.pool.dtype), self.compact[1].view(self.pool.dtype),
                 self.compact_table, self.row_slots)
 
