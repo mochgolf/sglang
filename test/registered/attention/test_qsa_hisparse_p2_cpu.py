@@ -261,12 +261,15 @@ class TestQSAHiSparseP2(unittest.TestCase):
             adapter.path = Path(directory) / "events.jsonl"
             with patch.object(torch.cuda, "memory_allocated", side_effect=AssertionError("GPU query")), \
                     patch.object(adapter, "native_lease_snapshot", side_effect=AssertionError("page query")):
-                adapter.record("decode_batch", batch_size=1, rows=rows)
-            record = json.loads(adapter.path.read_text())
-        self.assertEqual(record["rows"], rows)
-        self.assertEqual(record["forward_id"], 17)
-        self.assertEqual(set(record), {"event", "time_ns", "rank", "mode", "observe",
-                                      "forward_id", "batch_size", "rows"})
+                for event in ("decode_batch", "prefill_chunk"):
+                    adapter.record(event, batch_size=1, rows=rows)
+            records = [json.loads(line) for line in adapter.path.read_text().splitlines()]
+        self.assertEqual([r["event"] for r in records], ["decode_batch", "prefill_chunk"])
+        for record in records:
+            self.assertEqual(record["rows"], rows)
+            self.assertEqual(record["forward_id"], 17)
+            self.assertEqual(set(record), {"event", "time_ns", "rank", "mode", "observe",
+                                          "forward_id", "batch_size", "rows"})
 
     def test_ready_batch_preserves_position_metadata(self):
         from array import array

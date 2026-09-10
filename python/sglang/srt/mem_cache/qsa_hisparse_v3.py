@@ -54,7 +54,6 @@ def validate_configuration(args, pool, *, p2=False, graph=False):
         "cuda_graph_backend_prefill": "disabled",
         "context_length": 262144,
         "max_total_tokens": 524288 if p2 else 262144,
-        "chunked_prefill_size": 2048,
         "skip_server_warmup": True,
         "enable_deterministic_inference": True,
         "random_seed": 147342228,
@@ -67,6 +66,9 @@ def validate_configuration(args, pool, *, p2=False, graph=False):
     for name, value in required.items():
         if getattr(args, name, None) != value:
             raise ValueError(f"QSA V3 requires {name}={value!r}")
+    chunks = (2048, 4096) if p2 else (2048,)
+    if getattr(args, "chunked_prefill_size", None) not in chunks:
+        raise ValueError(f"QSA requires chunked_prefill_size in {chunks}")
     if getattr(args, "enable_hisparse", False):
         raise ValueError("QSA V3 cannot use the MLA HiSparse coordinator")
     if any(getattr(args, x, False) for x in (

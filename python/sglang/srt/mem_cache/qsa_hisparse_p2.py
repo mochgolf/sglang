@@ -480,7 +480,7 @@ class QSAHiSparseP2:
         if self.path is None:
             return
         if self.observe == "light" and event in (
-                "decode_batch", "graph_replay", "graph_copy_wait", "graph_copy_submit"):
+                "prefill_chunk", "decode_batch", "graph_replay", "graph_copy_wait", "graph_copy_submit"):
             # Keep the ordered schedule without synchronizing GPU page inventories.
             row = {"event": event, "time_ns": time.time_ns(), "rank": self.rank,
                    "mode": self.mode, "observe": self.observe,
@@ -519,7 +519,7 @@ class QSAHiSparseP2:
             "leases": [{"req_pool_idx": s.lease.req_pool_idx, "generation": s.lease.generation,
                         "rid": s.lease.rid, "slot": s.lease.slot,
                         "phase": self.slots.phases[s.lease.req_pool_idx],
-                        **self.native_lease_snapshot(s, include_pages=event in ("handoff_complete", "decode_batch")),
+                        **self.native_lease_snapshot(s, include_pages=event in ("handoff_complete", "prefill_chunk", "decode_batch")),
                         "host_ptr": None if s.host is None else s.host.data_ptr(),
                         "hot_ptrs": [x["hot"].data_ptr() for x in s.states],
                         "ring_k_ptrs": [x.data_ptr() for x in s.full.k_buffer],
@@ -614,6 +614,13 @@ class QSAHiSparseP2:
                 "compressed_len": s.seq_len // 4, "closes_c4": s.seq_len % 4 == 0,
                 "ring_location": self.slots.ring_write_location(s.lease, s.seq_len),
             } for s in self.batch_requests])
+        else:
+            state = self.batch_requests[0]
+            self.record("prefill_chunk", batch_size=1, rows=[{
+                "req_pool_idx": state.lease.req_pool_idx, "generation": state.lease.generation,
+                "rid": state.lease.rid, "lease_slot": state.lease.slot,
+                "start": state.seq_len - batch.extend_seq_lens_cpu[0], "end": state.seq_len,
+            }])
 
     def write_locations(self, logical_locs):
         if self.mode == "p2-resident":

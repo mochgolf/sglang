@@ -314,6 +314,16 @@ class TestQSAHiSparseV3(unittest.TestCase):
         graph_pool = SimpleNamespace(**vars(pool))
         graph_pool.size = 524288
         validate_configuration(graph_args, graph_pool, p2=True, graph=True)
+        graph_args.chunked_prefill_size = 4096
+        validate_configuration(graph_args, graph_pool, p2=True, graph=True)
+        eager_args = SimpleNamespace(**vars(graph_args))
+        eager_args.cuda_graph_backend_decode = "disabled"
+        validate_configuration(eager_args, graph_pool, p2=True)
+        for chunk in (None, 0, 4095, 8192):
+            changed = SimpleNamespace(**vars(graph_args))
+            changed.chunked_prefill_size = chunk
+            with self.assertRaises(ValueError):
+                validate_configuration(changed, graph_pool, p2=True, graph=True)
         for name, bad in (("disable_cuda_graph_padding", False), ("cuda_graph_bs_decode", [2]),
                           ("cuda_graph_max_bs_decode", 4), ("enable_torch_compile", True),
                           ("cuda_graph_backend_decode", "breakable")):
