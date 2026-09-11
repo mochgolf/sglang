@@ -28,16 +28,27 @@ class Experts(torch.nn.Module):
         return hidden_states + 2
 
 
+class TopK(torch.nn.Module):
+    def forward(self, _hidden_states, logits):
+        return SimpleNamespace(
+            topk_weights=torch.softmax(logits.float(), dim=-1)[:, -10:],
+            topk_ids=torch.arange(502, 512, dtype=torch.int32)[None].repeat(
+                logits.shape[0], 1
+            ),
+        )
+
+
 class MLP(torch.nn.Module):
     def __init__(self):
         super().__init__()
         self.gate = Gate()
+        self.topk = TopK()
         self.experts = Experts()
         self.shared_expert = None
 
     def forward(self, hidden_states, _batch):
         logits, _ = self.gate(hidden_states)
-        return self.experts(hidden_states, logits[:, :10])
+        return self.experts(hidden_states, self.topk(hidden_states, logits))
 
 
 class Layer(torch.nn.Module):
@@ -216,6 +227,7 @@ class TestTraceProtocol(unittest.TestCase):
             self.assertEqual(b8["tensors"]["input_ids"].item(), 103)
             self.assertEqual(b1["tensors"]["input_ids"].item(), 200)
             self.assertEqual(b8["tensors"]["router.0"].shape, (1, 512))
+            self.assertEqual(b8["tensors"]["topk.0.ids"].shape, (1, 10))
             self.assertEqual(b8["tensors"]["qsa.3.indices"].shape, (1, 2051))
             trace.buffers["input_ids"].zero_()
             self.assertEqual(b8["tensors"]["input_ids"].item(), 103)

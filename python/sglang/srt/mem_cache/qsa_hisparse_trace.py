@@ -54,6 +54,8 @@ class QSAHiSparseTrace:
             add(f"attention.{index}.output", (self.MAX_BATCH, hidden))
             add(f"mlp.{index}.input", (self.MAX_BATCH, hidden))
             add(f"router.{index}", (self.MAX_BATCH, experts))
+            add(f"topk.{index}.weights", (self.MAX_BATCH, 10), torch.float32)
+            add(f"topk.{index}.ids", (self.MAX_BATCH, 10), torch.int32)
             add(f"experts.{index}.output", (self.MAX_BATCH, hidden))
             shared = getattr(layer.mlp, "shared_expert", None)
             if shared is not None:
@@ -99,6 +101,7 @@ class QSAHiSparseTrace:
                     self._input_hook(f"mlp.{index}.input"), with_kwargs=True
                 ),
                 layer.mlp.gate.register_forward_hook(self._output_hook(f"router.{index}")),
+                layer.mlp.topk.register_forward_hook(self._topk_hook(index)),
                 layer.mlp.experts.register_forward_hook(
                     self._output_hook(f"experts.{index}.output")
                 ),
@@ -169,6 +172,13 @@ class QSAHiSparseTrace:
         if self._active():
             self._stage("final_mix", output)
             self._stage("final_hc", module.last_hc_hidden_states)
+
+    def _topk_hook(self, index):
+        def hook(_module, _args, output):
+            if self._active():
+                self._stage(f"topk.{index}.weights", output.topk_weights)
+                self._stage(f"topk.{index}.ids", output.topk_ids.to(torch.int32))
+        return hook
 
     def _layer_output_hook(self, index):
         def hook(_module, _args, output):
