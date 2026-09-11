@@ -68,7 +68,7 @@ from sglang.srt.models.qwen4_exp_refusal import (
     capture_writer_output as _capture_refusal_writer_output,
     refusal_control as _refusal_control,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import logger
 
 # Decode/verify-sized batches only: at prefill sizes both chains are compute
@@ -84,7 +84,13 @@ def _get_ple_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
 
 def _stable_prefill_hc(forward_batch: ForwardBatch) -> bool:
     del forward_batch
-    return has_forward_context() and get_forward_context().stable_prefill
+    try:
+        deterministic = get_exec().deterministic.enable_deterministic_inference
+    except ValueError:
+        deterministic = False
+    return deterministic or (
+        has_forward_context() and get_forward_context().stable_prefill
+    )
 
 
 def _get_processed_token_count(

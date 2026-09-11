@@ -246,6 +246,7 @@ class GatedResidual(HyperConnectionBase):
             hyper_input_normed,
             self.input_mix_weight_down.weight,
             self.input_mix_weight_up.weight,
+            stable=True,
         ):
             mixed_input = fused_hc_mix(
                 hyper_input_normed,

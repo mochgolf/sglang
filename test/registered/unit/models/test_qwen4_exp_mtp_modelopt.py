@@ -110,10 +110,18 @@ class TestQwen4ExpMtpModelOpt(CustomTestCase):
 
     def test_stable_prefill_uses_forward_scope(self):
         batch = SimpleNamespace()
-        self.assertFalse(qwen4_exp._stable_prefill_hc(batch))
-        with forward_context(
-            ForwardContext(attn_backend=SimpleNamespace(), stable_prefill=True)
-        ):
+        deterministic = SimpleNamespace(
+            deterministic=SimpleNamespace(enable_deterministic_inference=False)
+        )
+        with patch.object(qwen4_exp, "get_exec", return_value=deterministic):
+            self.assertFalse(qwen4_exp._stable_prefill_hc(batch))
+            with forward_context(
+                ForwardContext(attn_backend=SimpleNamespace(), stable_prefill=True)
+            ):
+                self.assertTrue(qwen4_exp._stable_prefill_hc(batch))
+
+        deterministic.deterministic.enable_deterministic_inference = True
+        with patch.object(qwen4_exp, "get_exec", return_value=deterministic):
             self.assertTrue(qwen4_exp._stable_prefill_hc(batch))
 
     def test_stable_prefill_uses_original_target_mode(self):

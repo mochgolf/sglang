@@ -324,11 +324,15 @@ def _deterministic_inference() -> bool:
 
 
 def fused_hc_mix_supported(
-    hyper_input_normed: torch.Tensor, w_down: torch.Tensor, w_up: torch.Tensor
+    hyper_input_normed: torch.Tensor,
+    w_down: torch.Tensor,
+    w_up: torch.Tensor,
+    *,
+    stable: bool = False,
 ) -> bool:
-    # The persistent kernel accumulates the down projection with
-    # device-scope atomics, so summation order varies across replays.
-    if _deterministic_inference():
+    # Only the ordinary path uses floating-point atomics. The stable path
+    # writes fixed split-K partials and is safe for batch-invariant inference.
+    if _deterministic_inference() and not stable:
         return False
     return (
         hyper_input_normed.is_cuda

@@ -91,6 +91,13 @@ def test_stable_fused_hc_mix_is_exact_across_replays():
     )
 
 
+def test_stable_fused_hc_mix_is_exact_across_batch_sizes():
+    x, w_down, w_up = _make_inputs(8, torch.bfloat16)
+    one = fused_hc_mix(x[:1], w_down, w_up, HC_COUNT, HIDDEN_SIZE, stable=True)
+    eight = fused_hc_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE, stable=True)
+    assert torch.equal(one, eight[:1])
+
+
 def test_fused_hc_mix_gate_rejects_prefill_rows():
     x, w_down, w_up = _make_inputs(_FUSED_MIX_MAX_ROWS + 1, torch.bfloat16)
     assert not fused_hc_mix_supported(x, w_down, w_up)
